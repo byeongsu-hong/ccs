@@ -22,8 +22,18 @@ account instead, launch it with its own `CLAUDE_CONFIG_DIR`.
 ## Setup
 
 ```sh
-cargo install --path .
+make install
 ```
+
+That builds and puts `ccs` on your `PATH` under `$CARGO_HOME/bin`. Point it
+somewhere else with `PREFIX`:
+
+```sh
+sudo make install PREFIX=/usr/local
+```
+
+`make help` lists the rest: `make check` runs formatting, clippy and the
+tests; `make uninstall` takes it back off.
 
 Capture the account you are already on, then log in to the rest:
 

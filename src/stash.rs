@@ -34,7 +34,8 @@ impl Stash {
         fs::create_dir_all(&accounts)
             .with_context(|| format!("creating {}", accounts.display()))?;
         for dir in [&root, &accounts] {
-            let _ = fs::set_permissions(dir, Permissions::from_mode(DIR_MODE));
+            fs::set_permissions(dir, Permissions::from_mode(DIR_MODE))
+                .with_context(|| format!("securing {}", dir.display()))?;
         }
         Ok(Self { state: root.join("state.json"), accounts, root })
     }
@@ -175,36 +176,36 @@ mod tests {
 
     fn two() -> Vec<Stashed> {
         vec![
-            stashed("jesse_at_soob.co", "jesse@soob.co"),
-            stashed("work_at_acme.com", "work@acme.com"),
+            stashed("work_at_example.org", "work@example.org"),
+            stashed("you_at_example.com", "you@example.com"),
         ]
     }
 
     #[test]
     fn slugify_keeps_an_email_readable() {
-        assert_eq!(slugify("jesse@soob.co"), "jesse_at_soob.co");
+        assert_eq!(slugify("you@example.com"), "you_at_example.com");
     }
 
     #[test]
     fn slugify_normalises_case_and_awkward_characters() {
-        assert_eq!(slugify("Jesse+CC@Soob.co"), "jesse-cc_at_soob.co");
+        assert_eq!(slugify("You+CC@Example.CO"), "you-cc_at_example.co");
     }
 
     #[test]
     fn resolve_matches_a_slug_or_an_email_exactly() {
         let accounts = two();
-        assert_eq!(resolve(&accounts, "jesse_at_soob.co").unwrap().slug, "jesse_at_soob.co");
-        assert_eq!(resolve(&accounts, "work@acme.com").unwrap().slug, "work_at_acme.com");
+        assert_eq!(resolve(&accounts, "work_at_example.org").unwrap().slug, "work_at_example.org");
+        assert_eq!(resolve(&accounts, "you@example.com").unwrap().slug, "you_at_example.com");
     }
 
     #[test]
     fn resolve_is_case_insensitive() {
-        assert_eq!(resolve(&two(), "WORK@ACME.COM").unwrap().slug, "work_at_acme.com");
+        assert_eq!(resolve(&two(), "YOU@EXAMPLE.COM").unwrap().slug, "you_at_example.com");
     }
 
     #[test]
     fn resolve_accepts_the_index_the_table_prints() {
-        assert_eq!(resolve(&two(), "2").unwrap().slug, "work_at_acme.com");
+        assert_eq!(resolve(&two(), "2").unwrap().slug, "you_at_example.com");
     }
 
     #[test]
@@ -214,7 +215,7 @@ mod tests {
 
     #[test]
     fn resolve_accepts_an_unambiguous_prefix() {
-        assert_eq!(resolve(&two(), "wo").unwrap().slug, "work_at_acme.com");
+        assert_eq!(resolve(&two(), "wo").unwrap().slug, "work_at_example.org");
     }
 
     #[test]

@@ -21,11 +21,6 @@ const SCRATCH: &str = ".login-";
 
 const SCRATCH_MODE: u32 = 0o700;
 
-/// Which Claude Code to drive, overridable for a non-standard install.
-pub fn binary() -> String {
-    std::env::var("CCS_CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string())
-}
-
 /// How the login page should be reached.
 #[derive(Debug, Clone, Default)]
 pub struct Options {

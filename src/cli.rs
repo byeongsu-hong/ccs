@@ -147,19 +147,19 @@ mod tests {
 
     #[test]
     fn use_takes_a_target_and_an_optional_force() {
-        let Cmd::Use { target, force } = parsed(&["use", "jesse"]) else { panic!("not a use") };
-        assert_eq!((target.as_str(), force), ("jesse", false));
+        let Cmd::Use { target, force } = parsed(&["use", "work"]) else { panic!("not a use") };
+        assert_eq!((target.as_str(), force), ("work", false));
 
-        let Cmd::Use { force, .. } = parsed(&["use", "jesse", "-f"]) else { panic!("not a use") };
+        let Cmd::Use { force, .. } = parsed(&["use", "work", "-f"]) else { panic!("not a use") };
         assert!(force);
     }
 
     #[test]
     fn a_flag_before_the_target_does_not_become_the_target() {
-        let Cmd::Use { target, force } = parsed(&["use", "--force", "jesse"]) else {
+        let Cmd::Use { target, force } = parsed(&["use", "--force", "work"]) else {
             panic!("not a use")
         };
-        assert_eq!((target.as_str(), force), ("jesse", true));
+        assert_eq!((target.as_str(), force), ("work", true));
     }
 
     #[test]

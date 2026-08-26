@@ -16,7 +16,7 @@ use crate::api::{Api, refreshed_oauth};
 use crate::creds::{self, CredStore, FileStore};
 use crate::lock;
 use crate::login;
-use crate::model::{Account, CredsFile, Limit, Oauth, Stashed};
+use crate::model::{Account, CredsFile, Limit, Oauth, Stashed, plan_label};
 use crate::pen;
 use crate::picker::{self, Outcome};
 use crate::render::{self, Entry, Style, Table, Verb};
@@ -26,11 +26,9 @@ pub struct Ctx<'a> {
     pub creds: &'a dyn CredStore,
     pub stash: &'a Stash,
     pub api: &'a Api,
-    /// Directory whose lock guards credential writes, and whose credentials a
-    /// switch replaces.
-    pub config_dir: &'a Path,
     /// The real configuration: where the stash lives and what pens are cut
-    /// from. The same as `config_dir` unless this process is itself in a pen.
+    /// from. The same directory `creds` reads, unless this process is itself
+    /// in a pen.
     pub home: &'a pen::Home,
 }
 
@@ -76,21 +74,29 @@ fn freshen(api: &Api, oauth: &Oauth) -> Result<Option<Oauth>> {
     Ok(Some(refreshed_oauth(oauth, &next)))
 }
 
-/// Write back every token a probe refreshed.
+/// Write back every token a probe refreshed: into the stash, into `accounts`
+/// itself, and into the live credentials when the account is the installed one.
 ///
-/// When the refreshed account is the one currently installed, the live
-/// credentials are updated too: the refresh rotated the token running sessions
-/// are holding, and leaving them behind would break them.
-fn persist(ctx: &Ctx, accounts: &[Stashed], probes: &[Probe], live: Option<&str>) -> Result<()> {
+/// Updating `accounts` in place is what stops a later step installing the copy
+/// that was read before the probe. A refresh can rotate the refresh token, and
+/// the superseded one no longer buys anything — handing it to a session costs
+/// that session an interactive re-login.
+fn persist(
+    ctx: &Ctx,
+    accounts: &mut [Stashed],
+    probes: &[Probe],
+    live: Option<&str>,
+) -> Result<()> {
     for probe in probes {
         let Some(oauth) = &probe.refreshed else { continue };
-        let Some(entry) = accounts.iter().find(|a| a.slug == probe.slug) else { continue };
-        ctx.stash.save(&probe.slug, &Account { oauth: oauth.clone(), ..entry.account.clone() })?;
+        let Some(entry) = accounts.iter_mut().find(|a| a.slug == probe.slug) else { continue };
+        entry.account.oauth = oauth.clone();
+        ctx.stash.save(&probe.slug, &entry.account)?;
 
+        // The refresh rotated the token running sessions are holding, so they
+        // cannot be left behind on it.
         if live == Some(probe.slug.as_str()) {
-            let _guard = lock::acquire(ctx.config_dir)?;
-            let current = ctx.creds.read()?;
-            ctx.creds.write(&merged(current, oauth))?;
+            install(ctx.creds, oauth)?;
         }
     }
     Ok(())
@@ -113,8 +119,8 @@ fn identify(ctx: &Ctx, accounts: &[Stashed], live: Option<&CredsFile>) -> Option
     accounts.iter().any(|a| a.slug == recorded).then_some(recorded)
 }
 
-/// Put `oauth` into the live credentials, keeping every unrelated field the
-/// existing file carries.
+/// Put `oauth` into a credentials file, keeping every unrelated field the
+/// existing one carries.
 fn merged(current: Option<CredsFile>, oauth: &Oauth) -> CredsFile {
     match current {
         Some(file) => CredsFile { oauth: oauth.clone(), ..file },
@@ -122,11 +128,42 @@ fn merged(current: Option<CredsFile>, oauth: &Oauth) -> CredsFile {
     }
 }
 
+/// The directory whose lock guards writes to a store's credentials, which is
+/// the one it keeps them in.
+fn guarded(store: &dyn CredStore) -> Result<&Path> {
+    store.path().parent().context("credentials path has no directory")
+}
+
+/// Install `oauth` into a credential store, under that lock.
+fn install(store: &dyn CredStore, oauth: &Oauth) -> Result<()> {
+    let _guard = lock::acquire(guarded(store)?)?;
+    let current = store.read()?;
+    store.write(&merged(current, oauth))
+}
+
+/// The credentials in use, together with their freshest access token.
+///
+/// The file comes back as it was read rather than as it now stands, because
+/// working out which stashed account it is has to match against the tokens the
+/// stash still holds. A refresh here rotates the token running sessions are
+/// holding, so it is mirrored back to them before anything else happens.
+fn in_use(ctx: &Ctx, hint: &str) -> Result<(CredsFile, Oauth)> {
+    let Some(file) = ctx.creds.read()? else {
+        bail!("no credentials at {}; {hint}", ctx.creds.path().display());
+    };
+    let Some(oauth) = freshen(ctx.api, &file.oauth)? else {
+        let oauth = file.oauth.clone();
+        return Ok((file, oauth));
+    };
+    install(ctx.creds, &oauth)?;
+    Ok((file, oauth))
+}
+
 // ── commands ────────────────────────────────────────────────────────────────
 
 pub fn list(ctx: &Ctx, json: bool) -> Result<()> {
-    let accounts = stashed(ctx)?;
-    let (table, _) = survey(ctx, &accounts, Style::detect())?;
+    let mut accounts = stashed(ctx)?;
+    let (table, _) = survey(ctx, &mut accounts, Style::detect())?;
     if json {
         return emit_json(&table);
     }
@@ -138,29 +175,20 @@ pub fn list(ctx: &Ctx, json: bool) -> Result<()> {
 }
 
 pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
-    let Some(live) = ctx.creds.read()? else {
-        bail!("no credentials at {}; run `claude` and sign in first", ctx.creds.path().display());
-    };
     let style = Style::detect();
+    warn_overridden();
 
-    let refreshed = freshen(ctx.api, &live.oauth)?;
-    if let Some(oauth) = &refreshed {
-        let _guard = lock::acquire(ctx.config_dir)?;
-        ctx.creds.write(&merged(Some(live.clone()), oauth))?;
-    }
-    // Identify against what was on disk, before the refreshed token replaces it.
+    let (file, oauth) = in_use(ctx, "run `claude` and sign in first")?;
     let accounts = ctx.stash.list()?;
-    let slug = identify(ctx, &accounts, Some(&live)).unwrap_or_default();
-    let oauth = refreshed.unwrap_or(live.oauth);
+    let slug = identify(ctx, &accounts, Some(&file)).unwrap_or_default();
 
     let profile = ctx.api.profile(&oauth.access_token)?;
     let limits = ctx.api.usage(&oauth.access_token)?.limits;
-    let plan = profile
-        .organization
-        .as_ref()
-        .and_then(|o| o.rate_limit_tier.clone())
-        .map(|t| t.trim_start_matches("default_claude_").replace('_', ""))
-        .unwrap_or_else(|| "?".to_string());
+    let organization = profile.organization.as_ref();
+    let plan = plan_label(
+        organization.and_then(|o| o.rate_limit_tier.as_deref()),
+        organization.and_then(|o| o.organization_type.as_deref()),
+    );
 
     let entry =
         Entry { slug, email: profile.account.email, plan, active: true, limits: Ok(limits) };
@@ -179,10 +207,10 @@ pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
 /// account in use, or capture whichever account is in use right now.
 pub fn add(ctx: &Ctx, name: Option<&str>, current: bool, options: &login::Options) -> Result<()> {
     let oauth = match current {
-        true => capture_live(ctx)?,
+        true => in_use(ctx, "sign in with `claude` before `ccs add --current`")?.1,
         false => {
             println!("logging in to another account; the one in use is not affected");
-            login::run(ctx.stash.root(), &login::binary(), options)?
+            login::run(ctx.stash.root(), &claude_binary(), options)?
         }
     };
     let recorded = record(ctx, oauth, name, Installed::from(current))?;
@@ -223,22 +251,11 @@ struct Recorded {
     replaced: bool,
 }
 
-/// The credentials in use, refreshed if they were spent.
-fn capture_live(ctx: &Ctx) -> Result<Oauth> {
-    let Some(live) = ctx.creds.read()? else {
-        bail!(
-            "no credentials at {}; sign in with `claude` before `ccs add --current`",
-            ctx.creds.path().display()
-        );
-    };
-    // A refresh here rotates the token running sessions hold, so mirror it back
-    // before doing anything else with it.
-    let refreshed = freshen(ctx.api, &live.oauth)?;
-    if let Some(oauth) = &refreshed {
-        let _guard = lock::acquire(ctx.config_dir)?;
-        ctx.creds.write(&merged(Some(live.clone()), oauth))?;
-    }
-    Ok(refreshed.unwrap_or(live.oauth))
+/// Which Claude Code to drive, overridable for a non-standard install. Held by
+/// the orchestrator because both the login and the pinned session are launched
+/// from here.
+fn claude_binary() -> String {
+    std::env::var("CCS_CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string())
 }
 
 /// Ask who some credentials belong to, then write them into the stash.
@@ -275,20 +292,24 @@ pub fn remove(ctx: &Ctx, needle: &str) -> Result<()> {
 }
 
 pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
-    let accounts = ctx.stash.list()?;
-    let target = stash::resolve(&accounts, needle)?.clone();
+    let mut accounts = ctx.stash.list()?;
+    let slug = stash::resolve(&accounts, needle)?.slug.clone();
 
     let live = identify_live(ctx, &accounts)?;
-    let probe = probe(ctx.api, &target);
-    persist(ctx, &accounts, std::slice::from_ref(&probe), live.as_deref())?;
+    let probe = probe(ctx.api, stash::resolve(&accounts, &slug)?);
+    persist(ctx, &mut accounts, std::slice::from_ref(&probe), live.as_deref())?;
 
+    // Read after the probe has been folded back in, never before it: the probe
+    // may have refreshed this very account, and the copy taken beforehand
+    // carries the tokens that refresh superseded.
+    let target = stash::resolve(&accounts, &slug)?.clone();
     guard_exhausted(&entry_of(&target, &probe, false), force)?;
     switch_to(ctx, &accounts, &target)
 }
 
 pub fn pick(ctx: &Ctx) -> Result<()> {
-    let accounts = stashed(ctx)?;
-    let Some(target) = choose(ctx, &accounts, Verb::Switch)? else { return Ok(()) };
+    let mut accounts = stashed(ctx)?;
+    let Some(target) = choose(ctx, &mut accounts, Verb::Switch)? else { return Ok(()) };
     switch_to(ctx, &accounts, &target)
 }
 
@@ -298,14 +319,14 @@ pub fn pick(ctx: &Ctx) -> Result<()> {
 /// Nothing outside the pen is touched, so every other session stays on the
 /// account in use and a later `ccs use` leaves this one where it is.
 pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
-    let accounts = stashed(ctx)?;
+    let mut accounts = stashed(ctx)?;
 
     // Named outright, the account is taken at its word and the session starts
     // without a round trip; the picker is where usage is shopped for.
     let target = match needle {
         Some(needle) => stash::resolve(&accounts, needle)?.clone(),
         None => {
-            let Some(chosen) = choose(ctx, &accounts, Verb::Launch)? else { return Ok(()) };
+            let Some(chosen) = choose(ctx, &mut accounts, Verb::Launch)? else { return Ok(()) };
             chosen
         }
     };
@@ -313,7 +334,7 @@ pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
     let pen = pen_for(ctx, &target)?;
     warn_overridden();
     println!("{} is pinned to this session only", target.account.email);
-    pen::launch(&pen, &login::binary(), &labelled(args, &target.account.email))
+    pen::launch(&pen, &claude_binary(), &labelled(args, &target.account.email))
 }
 
 /// Have the session say which account it is confined to, where Claude Code
@@ -339,15 +360,13 @@ fn pen_for(ctx: &Ctx, target: &Stashed) -> Result<PathBuf> {
     };
 
     let pen = pen::prepare(ctx.home, ctx.stash.root(), &target.slug)?;
-    let store = FileStore::new(&pen);
-    let _guard = lock::acquire(&pen)?;
-    let current = store.read()?;
-    store.write(&merged(current, &oauth))?;
+    install(&FileStore::new(&pen), &oauth)?;
     Ok(pen)
 }
 
 /// Say so when the environment answers for the credentials, because it decides
-/// the account whatever a pen holds.
+/// the account whatever any credentials file holds — the live one and a pen's
+/// alike.
 fn warn_overridden() {
     let set: Vec<&str> =
         creds::OVERRIDING.iter().copied().filter(|k| std::env::var_os(k).is_some()).collect();
@@ -355,16 +374,18 @@ fn warn_overridden() {
         return;
     }
     eprintln!(
-        "ccs: {} takes precedence over any account; the session may not use this one",
+        "ccs: {} takes precedence over the credentials file; a session that inherits it uses \
+         that account instead",
         set.join(", ")
     );
 }
 
 /// Put the accounts on screen and wait for one to be picked. The picker owns
 /// the whole screen while it is up, so it is always drawn in colour.
-fn choose(ctx: &Ctx, accounts: &[Stashed], verb: Verb) -> Result<Option<Stashed>> {
-    let poll = || survey(ctx, accounts, Style::colored()).map(|(table, _)| table);
-    let Outcome::Chose(slug) = picker::run(poll, verb)? else { return Ok(None) };
+fn choose(ctx: &Ctx, accounts: &mut [Stashed], verb: Verb) -> Result<Option<Stashed>> {
+    let outcome =
+        picker::run(|| survey(ctx, accounts, Style::colored()).map(|(table, _)| table), verb)?;
+    let Outcome::Chose(slug) = outcome else { return Ok(None) };
     Ok(accounts.iter().find(|a| a.slug == slug).cloned())
 }
 
@@ -381,7 +402,7 @@ fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
 
 /// Probe every account, write back anything that got refreshed, and lay the
 /// results out as a table.
-fn survey(ctx: &Ctx, accounts: &[Stashed], style: Style) -> Result<(Table, Option<String>)> {
+fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, Option<String>)> {
     let live = identify_live(ctx, accounts)?;
     let probes = probe_all(ctx.api, accounts);
     persist(ctx, accounts, &probes, live.as_deref())?;
@@ -408,7 +429,7 @@ fn identify_live(ctx: &Ctx, accounts: &[Stashed]) -> Result<Option<String>> {
 /// account is used. Capturing it on the way out is what keeps a stashed account
 /// usable without a fresh login.
 fn switch_to(ctx: &Ctx, accounts: &[Stashed], target: &Stashed) -> Result<()> {
-    let _guard = lock::acquire(ctx.config_dir)?;
+    let _guard = lock::acquire(guarded(ctx.creds)?)?;
     let live = ctx.creds.read()?;
     if let Some(live) = &live {
         capture_outgoing(ctx, accounts, live, &target.slug)?;
@@ -417,6 +438,7 @@ fn switch_to(ctx: &Ctx, accounts: &[Stashed], target: &Stashed) -> Result<()> {
     ctx.stash.set_active(&target.slug)?;
     println!("switched to {} ({})", target.account.email, target.slug);
     println!("running sessions pick this up on their next request");
+    warn_overridden();
     Ok(())
 }
 
@@ -508,20 +530,102 @@ fn describe(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::fs;
 
     fn words(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
     }
 
+    /// Credentials held in memory rather than on disk, so a test can see what
+    /// a command installed.
+    struct Recorder {
+        path: PathBuf,
+        held: RefCell<Option<CredsFile>>,
+    }
+
+    impl CredStore for Recorder {
+        fn read(&self) -> Result<Option<CredsFile>> {
+            Ok(self.held.borrow().clone())
+        }
+
+        fn write(&self, creds: &CredsFile) -> Result<()> {
+            *self.held.borrow_mut() = Some(creds.clone());
+            Ok(())
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    fn oauth(refresh_token: &str) -> Oauth {
+        Oauth {
+            access_token: format!("access-{refresh_token}"),
+            refresh_token: refresh_token.to_string(),
+            expires_at: 0,
+            scopes: vec![],
+            subscription_type: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn stashed(slug: &str, oauth: Oauth) -> Stashed {
+        Stashed {
+            slug: slug.into(),
+            account: Account {
+                email: format!("{slug}@example.com"),
+                uuid: "u".into(),
+                plan: None,
+                rate_limit_tier: None,
+                added_at: "2026-01-01T00:00:00Z".into(),
+                oauth,
+            },
+        }
+    }
+
+    /// A rotated refresh token has to reach every copy at once: the stash, the
+    /// live credentials, and the in-memory list the caller goes on to install
+    /// from. A copy left on the superseded token buys nothing, and a session
+    /// handed one is a session that has to log in again.
+    #[test]
+    fn a_refresh_reaches_every_copy_of_the_account_it_refreshed() {
+        let dir = std::env::temp_dir().join(format!("ccs-cmd-persist-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("config directory");
+
+        let creds = Recorder { path: dir.join(".credentials.json"), held: RefCell::new(None) };
+        let stash = Stash::open(&dir).expect("stash");
+        let api = Api::new();
+        let home = pen::Home { config: dir.clone(), global: dir.join(".claude.json") };
+        let ctx = Ctx { creds: &creds, stash: &stash, api: &api, home: &home };
+
+        let mut accounts = vec![stashed("work", oauth("superseded"))];
+        let probes = vec![Probe {
+            slug: "work".into(),
+            refreshed: Some(oauth("rotated")),
+            limits: Ok(vec![]),
+        }];
+        persist(&ctx, &mut accounts, &probes, Some("work")).expect("persist");
+
+        assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
+        let live = creds.read().expect("read").expect("credentials were installed");
+        assert_eq!(live.oauth.refresh_token, "rotated", "the live credentials");
+        let saved = stash.list().expect("list");
+        assert_eq!(saved[0].account.oauth.refresh_token, "rotated", "the stash");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_pinned_session_names_the_account_it_is_confined_to() {
-        let args = labelled(&[], "work@acme.com");
-        assert_eq!(args, ["--name", "pinned by ccs: work@acme.com"]);
+        let args = labelled(&[], "work@example.com");
+        assert_eq!(args, ["--name", "pinned by ccs: work@example.com"]);
     }
 
     #[test]
     fn the_label_goes_in_front_of_what_was_forwarded() {
-        let args = labelled(&words(&["--continue"]), "work@acme.com");
+        let args = labelled(&words(&["--continue"]), "work@example.com");
         assert_eq!(args.last().map(String::as_str), Some("--continue"));
     }
 
@@ -529,7 +633,7 @@ mod tests {
     fn a_launch_that_named_itself_keeps_its_own_name() {
         for flag in ["--name", "-n"] {
             let given = words(&[flag, "mine"]);
-            assert_eq!(labelled(&given, "work@acme.com"), given, "{flag} should win");
+            assert_eq!(labelled(&given, "work@example.com"), given, "{flag} should win");
         }
     }
 }

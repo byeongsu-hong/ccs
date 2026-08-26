@@ -50,8 +50,7 @@ fn run() -> Result<()> {
     let creds = FileStore::new(&config_dir);
     let stash = Stash::open(&home.config)?;
     let api = Api::new();
-    let ctx =
-        cmd::Ctx { creds: &creds, stash: &stash, api: &api, config_dir: &config_dir, home: &home };
+    let ctx = cmd::Ctx { creds: &creds, stash: &stash, api: &api, home: &home };
 
     match command {
         Cmd::Pick => cmd::pick(&ctx),

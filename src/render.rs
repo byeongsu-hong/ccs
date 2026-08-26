@@ -242,16 +242,7 @@ fn seconds_until(rfc3339: &str) -> Option<i64> {
 /// A duration with the spaces squeezed out, for somewhere a column of them has
 /// to line up.
 pub fn compact(seconds: i64) -> String {
-    if seconds <= 0 {
-        return "now".to_string();
-    }
-    let (hours, minutes) = (seconds / 3600, (seconds % 3600) / 60);
-    match (hours, minutes) {
-        (0, 0) => format!("{seconds}s"),
-        (0, m) => format!("{m}m"),
-        (h, m) if h < 24 => format!("{h}h{m:02}m"),
-        (h, _) => format!("{}d{}h", h / 24, h % 24),
-    }
+    phrase(seconds, "")
 }
 
 /// What acting on an account is about to do, so the picker names it.
@@ -288,6 +279,12 @@ pub fn question(entry: &Entry, verb: Verb) -> String {
 }
 
 fn human(seconds: i64) -> String {
+    phrase(seconds, " ")
+}
+
+/// A duration in the largest two units that say anything, `gap` between them.
+/// Prose has room for the space; a column of these has to line up without it.
+fn phrase(seconds: i64, gap: &str) -> String {
     if seconds <= 0 {
         return "now".to_string();
     }
@@ -295,8 +292,8 @@ fn human(seconds: i64) -> String {
     match (hours, minutes) {
         (0, 0) => format!("{seconds}s"),
         (0, m) => format!("{m}m"),
-        (h, m) if h < 24 => format!("{h}h {m:02}m"),
-        (h, _) => format!("{}d {}h", h / 24, h % 24),
+        (h, m) if h < 24 => format!("{h}h{gap}{m:02}m"),
+        (h, _) => format!("{}d{gap}{}h", h / 24, h % 24),
     }
 }
 

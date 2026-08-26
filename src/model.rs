@@ -90,14 +90,19 @@ pub struct Account {
 }
 
 impl Account {
-    /// Short plan label for the table: the rate limit tier reads better than
-    /// the subscription type ("max20x" over "max"), so prefer it.
     pub fn plan_label(&self) -> String {
         let tier = self.rate_limit_tier.as_deref().or_else(|| self.oauth.rate_limit_tier());
-        match tier {
-            Some(t) => t.trim_start_matches("default_claude_").replace('_', ""),
-            None => self.plan.clone().unwrap_or_else(|| "?".to_string()),
-        }
+        plan_label(tier, self.plan.as_deref())
+    }
+}
+
+/// Short plan label for a column of them: the rate limit tier reads better than
+/// the subscription type ("max20x" over "max"), so prefer it, and fall back to
+/// whatever names the plan at all.
+pub fn plan_label(tier: Option<&str>, plan: Option<&str>) -> String {
+    match tier {
+        Some(t) => t.trim_start_matches("default_claude_").replace('_', ""),
+        None => plan.unwrap_or("?").to_string(),
     }
 }
 
@@ -299,6 +304,17 @@ mod tests {
         assert!(oauth(now_ms() + 5_000).needs_refresh());
         assert!(oauth(now_ms() - 1).needs_refresh());
         assert!(!oauth(now_ms() + 10 * 60 * 1000).needs_refresh());
+    }
+
+    #[test]
+    fn a_plan_label_prefers_the_tier_and_reads_it_short() {
+        assert_eq!(plan_label(Some("default_claude_max_20x"), Some("max")), "max20x");
+    }
+
+    #[test]
+    fn a_plan_label_falls_back_to_the_plan_then_to_a_question_mark() {
+        assert_eq!(plan_label(None, Some("pro")), "pro");
+        assert_eq!(plan_label(None, None), "?");
     }
 
     #[test]

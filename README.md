@@ -6,7 +6,7 @@ before you commit to it.
 ![the ccs picker](docs/picker.svg)
 
 If you run more than one Claude subscription you know the shape of this problem.
-You are deep in something, the weekly Opus limit lands, and the only road to your
+You are deep in something, the weekly limit lands, and the only road to your
 other account is `/login` — which signs you out everywhere, drops whatever
 sessions you had going, and tells you nothing about whether the account you are
 moving to has any room left either. An hour later you do the whole thing again in
@@ -81,15 +81,14 @@ directly.
 Run `ccs` with no arguments and you get the picker:
 
 ```
-     ACCOUNT              PLAN    SESSION           WEEKLY            FABLE             OPUS
->  1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   █░░░  12% 6h24m   ████ 100% 6h24m   <- active
-   2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░   4% 2d11h   █░░░  22% 2d11h
-   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   —                 ███░  70% 5d19h
+     ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
+>  1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m   <- active
+   2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h
+   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   ███░  70% 5d19h
 
   session          █░░░  10%   resets in 3h 54m
   weekly           ███░  55%   resets in 6h 24m
-  Fable            █░░░  12%   resets in 6h 24m
-  Opus             ████ 100%   resets in 6h 24m   spent
+  Fable            ████ 100%   resets in 6h 24m   spent
 
   up/down select   enter switch   esc unselect   r refresh   q quit      updated just now
 ```
@@ -99,7 +98,7 @@ table details whichever account you are sitting on. `enter` asks before it does
 anything, and says what is spent if anything is:
 
 ```
-  you@example.com has no Opus left. Switch anyway? [y/n]
+  you@example.com has no Fable left. Switch anyway? [y/n]
 ```
 
 `esc` backs out one step at a time. From a question it takes you back to the list;
@@ -107,10 +106,10 @@ from the list it puts the selection away entirely, which leaves `enter` with
 nothing to act on:
 
 ```
-     ACCOUNT              PLAN    SESSION           WEEKLY            FABLE             OPUS
-   1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   █░░░  12% 6h24m   ████ 100% 6h24m   <- active
-   2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░   4% 2d11h   █░░░  22% 2d11h
-   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   —                 ███░  70% 5d19h
+     ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
+   1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m   <- active
+   2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h
+   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   ███░  70% 5d19h
 
   up/down select   r refresh   q quit      updated just now
 ```
@@ -234,16 +233,21 @@ and `status` gives you the same data for scripts and status lines.
 
 ## Limits
 
-Columns come from whatever the API reports, so this list is a description rather
-than a schema:
+Columns are built from whatever the usage endpoint reports rather than from a
+list in the code, so this describes what it returns today and is not a schema.
+On a Max plan that is three:
 
 - **session** — the rolling five-hour window
 - **weekly** — the all-models weekly window
-- one column per model with its own weekly limit (Fable, Opus, …)
+- **Fable** — the weekly window scoped to that model
+
+A model-scoped limit is drawn under the model's own name, so if the endpoint
+starts scoping another one it gets a column without a change here.
 
 Green is fine, yellow is worth knowing about, red is spent. An account with any
 limit at 100% is dimmed in the table, and `ccs` asks twice before walking into it.
-A `—` means that account has no limit of that kind at all.
+A `—` means that account has no limit of that kind at all, which is how an
+account on a different plan reads beside the others.
 
 ## Where things live
 

@@ -273,3 +273,7 @@ at a `claude` that isn't on `PATH`. `NO_COLOR` does what you expect.
 precedence over the credentials file for any session that inherits them — so a
 session with one of those set ignores whatever account you switched to. `ccs` says
 so rather than letting you wonder.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

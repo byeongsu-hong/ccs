@@ -3,6 +3,8 @@ name = "ccs"
 version = "0.1.0"
 edition = "2024"
 description = "Claude Code account switcher with subscription usage tracking"
+license = "MIT"
+repository = "https://github.com/orthory/ccs"
 
 [dependencies]
 anyhow = "1"

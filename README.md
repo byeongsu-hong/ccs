@@ -4,11 +4,14 @@ Switch Claude Code accounts — including sessions that are already running — 
 see what each account has left before you commit to it.
 
 ```
-   ACCOUNT              PLAN    SESSION    WEEKLY     FABLE      OPUS
- 1 jesse@soob.co        max20x  █░░░   6%  ███░  54%  ████ 100%  █░░░  12%  <- active
- 2 jesse+alt@soob.co    max5x   ░░░░   0%  █░░░  18%  █░░░  22%  █░░░   4%
- 3 work@acme.com        pro     ███░  61%  ████  88%  —          ███░  70%
+   ACCOUNT              PLAN    SESSION           WEEKLY            FABLE             OPUS
+ 1 jesse@soob.co        max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m   █░░░  12% 6h24m   <- active
+ 2 jesse+alt@soob.co    max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h   ░░░░   4% 2d11h
+ 3 work@acme.com        pro     ███░  61% 1h44m   ████  88% 5d19h   —                 ███░  70% 5d19h
 ```
+
+Each cell carries how much of that limit is gone and how long until it comes
+back.
 
 ## Why it works on live sessions
 
@@ -58,7 +61,7 @@ directly.
 
 | command | what it does |
 | --- | --- |
-| `ccs` | interactive picker: arrows to move, `enter` to switch, `r` to re-poll, `q` to quit |
+| `ccs` | interactive picker: arrows to move, `enter` then `y` to switch, `r` to re-poll, `q` to quit |
 | `ccs ls` | every stashed account with its session, weekly, and per-model limits |
 | `ccs use <account>` | switch to an account; running sessions follow |
 | `ccs add` | log in to another account and stash it, without disturbing the one in use |
@@ -70,8 +73,13 @@ directly.
 from `ccs ls`. `ccs ls --json` and `ccs status --json` emit the same data for
 scripts and status lines.
 
-Switching to an account with a limit already at 100% asks first; `--force`
-skips the question.
+The picker always asks before switching, and says what is spent if anything is.
+On the command line `ccs use` switches straight away, asking only when the
+target has a limit already at 100%; `--force` skips that question.
+
+Polling happens with the picker on screen — both the first load and every `r` —
+so the list never drops away while usage is fetched. A refresh that fails says
+so in the footer and leaves the last good reading standing.
 
 ## Limits
 

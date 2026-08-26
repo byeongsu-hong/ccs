@@ -286,23 +286,12 @@ pub fn pick(ctx: &Ctx) -> Result<()> {
     if accounts.is_empty() {
         bail!("no accounts stashed yet; log in with `claude` then run `ccs add`");
     }
-    let mut cursor = 0;
-    loop {
-        let (table, _) = survey(ctx, &accounts, Style::colored())?;
-        cursor = cursor.min(table.len().saturating_sub(1));
-        match picker::run(&table, cursor)? {
-            Outcome::Quit => return Ok(()),
-            Outcome::Refresh(at) => cursor = at,
-            Outcome::Switch(at) => {
-                let Some(entry) = table.entries().get(at) else { return Ok(()) };
-                let Some(target) = accounts.iter().find(|a| a.slug == entry.slug) else {
-                    return Ok(());
-                };
-                guard_exhausted(entry, false)?;
-                return switch_to(ctx, &accounts, target);
-            }
-        }
-    }
+    let style = Style::colored();
+    let poll = || survey(ctx, &accounts, style).map(|(table, _)| table);
+
+    let Outcome::Switch(slug) = picker::run(poll)? else { return Ok(()) };
+    let Some(target) = accounts.iter().find(|a| a.slug == slug) else { return Ok(()) };
+    switch_to(ctx, &accounts, target)
 }
 
 // ── shared steps ────────────────────────────────────────────────────────────
@@ -367,12 +356,10 @@ fn guard_exhausted(entry: &Entry, force: bool) -> Result<()> {
     if force {
         return Ok(());
     }
-    let spent = entry.exhausted();
-    if spent.is_empty() {
+    if entry.exhausted().is_empty() {
         return Ok(());
     }
-    let spent = spent.join(", ");
-    if !confirm(&format!("{} has no {spent} left. Switch anyway?", entry.email))? {
+    if !confirm(&render::switch_question(entry))? {
         bail!("not switching; `ccs use <account> --force` overrides");
     }
     Ok(())

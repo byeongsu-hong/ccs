@@ -216,7 +216,8 @@ impl Limit {
 #[cfg(test)]
 #[macro_export]
 macro_rules! limit {
-    ($kind:expr, $percent:expr $(, model = $model:expr)? $(, severity = $severity:expr)?) => {{
+    ($kind:expr, $percent:expr $(, model = $model:expr)? $(, severity = $severity:expr)?
+        $(, resets = $resets:expr)?) => {{
         #[allow(unused_mut)]
         let mut built = $crate::model::Limit {
             kind: $kind.to_string(),
@@ -233,6 +234,7 @@ macro_rules! limit {
             });
         )?
         $( built.severity = Some($severity.to_string()); )?
+        $( built.resets_at = Some($resets.to_string()); )?
         built
     }};
 }

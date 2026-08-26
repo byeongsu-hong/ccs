@@ -14,9 +14,13 @@ use crate::model::{Health, Limit};
 /// Width of a usage bar, in cells.
 const BAR: usize = 4;
 
-/// Rendered width of a populated cell: the bar, a space, and a right-aligned
-/// percentage.
-const CELL: usize = BAR + 5;
+/// Rendered width of a reset countdown. The longest a limit can be away is a
+/// week, so `23h59m` is the widest this gets.
+const COUNTDOWN: usize = 6;
+
+/// Rendered width of a populated cell: the bar, a right-aligned percentage, and
+/// the countdown to that limit coming back.
+const CELL: usize = BAR + 1 + 4 + 1 + COUNTDOWN;
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -80,7 +84,7 @@ impl Style {
         format!("{code}{text}{RESET}")
     }
 
-    fn health(&self, text: &str, health: Health) -> String {
+    pub fn health(&self, text: &str, health: Health) -> String {
         self.paint(
             text,
             match health {
@@ -177,7 +181,12 @@ impl Table {
         let Some(limit) = entry.known().iter().find(|l| l.column() == column) else {
             return self.style.dim(&format!("{:<width$}", "—", width = CELL));
         };
-        let text = format!("{} {:>3.0}%", bar(limit.percent), limit.percent.clamp(0.0, 100.0));
+        let reset = limit.resets_at.as_deref().and_then(until_compact).unwrap_or_default();
+        let text = format!(
+            "{} {:>3.0}% {reset:<COUNTDOWN$}",
+            bar(limit.percent),
+            limit.percent.clamp(0.0, 100.0)
+        );
         self.style.health(&format!("{text:<CELL$}"), limit.health())
     }
 }
@@ -217,8 +226,42 @@ fn bar(percent: f64) -> String {
 
 /// Time until an RFC 3339 instant, phrased for a glance.
 pub fn until(rfc3339: &str) -> Option<String> {
+    seconds_until(rfc3339).map(human)
+}
+
+/// The same countdown narrowed to fit a table cell.
+fn until_compact(rfc3339: &str) -> Option<String> {
+    seconds_until(rfc3339).map(compact)
+}
+
+fn seconds_until(rfc3339: &str) -> Option<i64> {
     let target: Timestamp = rfc3339.parse().ok()?;
-    Some(human(target.as_second() - Timestamp::now().as_second()))
+    Some(target.as_second() - Timestamp::now().as_second())
+}
+
+/// A duration with the spaces squeezed out, for somewhere a column of them has
+/// to line up.
+fn compact(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "now".to_string();
+    }
+    let (hours, minutes) = (seconds / 3600, (seconds % 3600) / 60);
+    match (hours, minutes) {
+        (0, 0) => format!("{seconds}s"),
+        (0, m) => format!("{m}m"),
+        (h, m) if h < 24 => format!("{h}h{m:02}m"),
+        (h, _) => format!("{}d{}h", h / 24, h % 24),
+    }
+}
+
+/// The question to put before a switch, naming what is spent when something is.
+/// Shared so the picker and the command line ask it the same way.
+pub fn switch_question(entry: &Entry) -> String {
+    let spent = entry.exhausted();
+    match spent.is_empty() {
+        true => format!("Switch to {}?", entry.email),
+        false => format!("{} has no {} left. Switch anyway?", entry.email, spent.join(", ")),
+    }
 }
 
 fn human(seconds: i64) -> String {
@@ -378,6 +421,42 @@ mod tests {
     #[test]
     fn a_reset_already_past_reads_as_now() {
         assert_eq!(until("2020-01-01T00:00:00+00:00").as_deref(), Some("now"));
+    }
+
+    #[test]
+    fn compact_durations_squeeze_out_the_spaces_to_fit_a_column() {
+        assert_eq!(compact(-5), "now");
+        assert_eq!(compact(45), "45s");
+        assert_eq!(compact(9 * 60), "9m");
+        assert_eq!(compact(4 * 3600 + 12 * 60), "4h12m");
+        assert_eq!(compact(50 * 3600), "2d2h");
+    }
+
+    #[test]
+    fn a_compact_duration_never_outgrows_its_column() {
+        let widest = [0, 59, 60, 3599, 3600, 23 * 3600 + 59 * 60, 6 * 86400 + 23 * 3600];
+        for seconds in widest {
+            let rendered = compact(seconds);
+            assert!(rendered.chars().count() <= COUNTDOWN, "{seconds}s renders as {rendered}");
+        }
+    }
+
+    #[test]
+    fn a_cell_carries_the_countdown_beside_the_percentage() {
+        let past = "2020-01-01T00:00:00+00:00";
+        let entries = vec![entry("a@x.com", vec![limit!("session", 50.0, resets = past)])];
+        let row = Table::build(entries, plain()).row(0);
+        assert!(row.contains("50%"), "{row}");
+        assert!(row.contains("now"), "{row}");
+    }
+
+    #[test]
+    fn the_switch_question_names_what_is_spent() {
+        let fine = entry("a@x.com", vec![limit!("session", 3.0)]);
+        assert_eq!(switch_question(&fine), "Switch to a@x.com?");
+
+        let spent = entry("a@x.com", vec![limit!("weekly_scoped", 100.0, model = "Fable")]);
+        assert!(switch_question(&spent).contains("no Fable left"), "{}", switch_question(&spent));
     }
 
     #[test]

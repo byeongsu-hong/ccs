@@ -9,7 +9,9 @@ USAGE
     ccs                      pick an account interactively
     ccs ls                   every stashed account and what it has left
     ccs use <account>        switch to an account; running sessions follow
-    ccs add [--name <slug>]  stash the account that is logged in right now
+    ccs add                  log in to another account and stash it, without
+                             disturbing the account in use
+    ccs add --current        stash the account that is logged in right now
     ccs rm <account>         forget a stashed account
     ccs status               limits for the account currently in use
 
@@ -19,6 +21,10 @@ USAGE
 OPTIONS
     -f, --force              switch even to an account with no headroom left
         --json               machine-readable output (ls, status)
+        --name <slug>        stash under this name instead of the email (add)
+        --email <address>    pre-fill the login page (add)
+        --console            log in with Console billing, not a subscription (add)
+        --sso                force the SSO login flow (add)
     -h, --help               this text
     -V, --version            version
 ";
@@ -28,7 +34,7 @@ pub enum Cmd {
     Pick,
     List { json: bool },
     Use { target: String, force: bool },
-    Add { name: Option<String> },
+    Add { name: Option<String>, current: bool, email: Option<String>, console: bool, sso: bool },
     Remove { target: String },
     Status { json: bool },
     Help,
@@ -51,7 +57,16 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
             };
             Ok(Cmd::Use { target, force: has(rest, "--force") || has(rest, "-f") })
         }
-        "add" | "capture" => Ok(Cmd::Add { name: value(&args[1..], "--name") }),
+        "add" | "capture" => {
+            let rest = &args[1..];
+            Ok(Cmd::Add {
+                name: value(rest, "--name"),
+                current: has(rest, "--current"),
+                email: value(rest, "--email"),
+                console: has(rest, "--console"),
+                sso: has(rest, "--sso"),
+            })
+        }
         "rm" | "remove" | "forget" => {
             let Some(target) = positional(&args[1..]) else {
                 bail!("`ccs rm` needs an account; `ccs ls` lists them");
@@ -72,7 +87,10 @@ fn value(args: &[String], flag: &str) -> Option<String> {
     args.get(at + 1).cloned()
 }
 
-/// The first argument that is not a flag or a flag's value.
+/// Flags that consume the argument after them.
+const VALUE_FLAGS: [&str; 2] = ["--name", "--email"];
+
+/// The first argument that is neither a flag nor a flag's value.
 fn positional(args: &[String]) -> Option<String> {
     let mut skip_next = false;
     for arg in args {
@@ -80,7 +98,7 @@ fn positional(args: &[String]) -> Option<String> {
             skip_next = false;
             continue;
         }
-        if arg == "--name" {
+        if VALUE_FLAGS.contains(&arg.as_str()) {
             skip_next = true;
             continue;
         }
@@ -129,10 +147,37 @@ mod tests {
     }
 
     #[test]
+    fn add_logs_in_by_default_and_captures_the_live_account_only_on_request() {
+        assert!(matches!(parsed(&["add"]), Cmd::Add { current: false, .. }));
+        assert!(matches!(parsed(&["add", "--current"]), Cmd::Add { current: true, .. }));
+    }
+
+    #[test]
     fn add_reads_the_name_flag_without_treating_it_as_a_target() {
-        let Cmd::Add { name } = parsed(&["add", "--name", "work"]) else { panic!("not an add") };
+        let Cmd::Add { name, .. } = parsed(&["add", "--name", "work"]) else {
+            panic!("not an add")
+        };
         assert_eq!(name.as_deref(), Some("work"));
-        assert!(matches!(parsed(&["add"]), Cmd::Add { name: None }));
+        assert!(matches!(parsed(&["add"]), Cmd::Add { name: None, .. }));
+    }
+
+    #[test]
+    fn add_forwards_the_flags_that_steer_the_login_page() {
+        let Cmd::Add { email, console, sso, .. } =
+            parsed(&["add", "--email", "me@x.com", "--console", "--sso"])
+        else {
+            panic!("not an add")
+        };
+        assert_eq!(email.as_deref(), Some("me@x.com"));
+        assert!(console && sso);
+    }
+
+    #[test]
+    fn a_value_carrying_flag_does_not_donate_its_value_as_a_target() {
+        let Cmd::Remove { target } = parsed(&["rm", "--name", "notthetarget", "work"]) else {
+            panic!("not a remove")
+        };
+        assert_eq!(target, "work");
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod cmd;
 mod creds;
 mod fsx;
 mod lock;
+mod login;
 mod model;
 mod picker;
 mod render;
@@ -50,7 +51,10 @@ fn run() -> Result<()> {
         Cmd::Pick => cmd::pick(&ctx),
         Cmd::List { json } => cmd::list(&ctx, json),
         Cmd::Use { target, force } => cmd::use_account(&ctx, &target, force),
-        Cmd::Add { name } => cmd::add(&ctx, name.as_deref()),
+        Cmd::Add { name, current, email, console, sso } => {
+            let options = login::Options { email, console, sso };
+            cmd::add(&ctx, name.as_deref(), current, &options)
+        }
         Cmd::Remove { target } => cmd::remove(&ctx, &target),
         Cmd::Status { json } => cmd::status(&ctx, json),
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),

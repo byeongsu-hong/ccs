@@ -25,15 +25,21 @@ account instead, launch it with its own `CLAUDE_CONFIG_DIR`.
 cargo install --path .
 ```
 
-Stash each account once, by logging into it and capturing it:
+Capture the account you are already on, then log in to the rest:
 
 ```sh
-claude          # /login as the first account
-ccs add         # -> stashed jesse@soob.co as jesse_at_soob.co
-
-claude          # /logout, then /login as the next account
-ccs add         # -> stashed work@acme.com as work_at_acme.com
+ccs add --current    # stash whoever is logged in right now
+ccs add              # log in to another account
+ccs add              # ...and another
 ```
+
+`ccs add` runs `claude auth login` against a throwaway config directory, keeps
+the credentials it mints, and destroys the directory. The account you are using
+is never signed out and never touched — no logout, no re-login, and running
+sessions carry on through it.
+
+Steer the login page with `--email <address>`, `--console`, or `--sso`; stash
+under a chosen name with `--name <slug>`.
 
 After that you never log in again — `ccs use` moves between stashed accounts
 directly.
@@ -45,7 +51,8 @@ directly.
 | `ccs` | interactive picker: arrows to move, `enter` to switch, `r` to re-poll, `q` to quit |
 | `ccs ls` | every stashed account with its session, weekly, and per-model limits |
 | `ccs use <account>` | switch to an account; running sessions follow |
-| `ccs add [--name <slug>]` | stash whichever account is logged in right now |
+| `ccs add` | log in to another account and stash it, without disturbing the one in use |
+| `ccs add --current` | stash whichever account is logged in right now |
 | `ccs rm <account>` | forget a stashed account |
 | `ccs status` | limits for the account currently in use, with reset times |
 
@@ -71,13 +78,19 @@ newly scoped model appears on its own:
 ~/.claude/.credentials.json     the live account, as Claude Code reads it
 ~/.claude/ccs/accounts/*.json   one stashed account each, mode 0600
 ~/.claude/ccs/state.json        which slug is currently installed
+~/.claude/ccs/.login-<pid>/     a login in progress, destroyed when it ends
 ```
 
 Stash files hold OAuth refresh tokens. They are written `0600` inside a `0700`
 directory, and they are worth exactly as much as a login — do not sync them
 anywhere you would not sync a password.
 
-`CLAUDE_CONFIG_DIR` is honoured, the same way Claude Code honours it.
+`CLAUDE_CONFIG_DIR` is honoured, the same way Claude Code honours it, and
+`CCS_CLAUDE_BINARY` points at a `claude` that is not on `PATH`.
+
+A login directory left behind by an interrupted run is swept on the next `ccs
+add` — each is named after the process that owns it, so a run still in flight
+is never swept out from under itself.
 
 ## Keeping tokens alive
 

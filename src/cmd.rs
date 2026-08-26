@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::api::{Api, refreshed_oauth};
 use crate::creds::CredStore;
 use crate::lock;
+use crate::login;
 use crate::model::{Account, CredsFile, Limit, Oauth, Stashed};
 use crate::picker::{self, Outcome};
 use crate::render::{self, Entry, Style, Table};
@@ -177,11 +178,62 @@ pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn add(ctx: &Ctx, name: Option<&str>) -> Result<()> {
-    let Some(live) = ctx.creds.read()? else {
-        bail!("no credentials at {}; sign in with `claude` before `ccs add`", ctx.creds.path().display());
+/// Stash an account. Two ways in: log in to another one without disturbing the
+/// account in use, or capture whichever account is in use right now.
+pub fn add(ctx: &Ctx, name: Option<&str>, current: bool, options: &login::Options) -> Result<()> {
+    let oauth = match current {
+        true => capture_live(ctx)?,
+        false => {
+            println!("logging in to another account; the one in use is not affected");
+            login::run(ctx.stash.root(), &login::binary(), options)?
+        }
     };
+    let recorded = record(ctx, oauth, name, Installed::from(current))?;
+    let verb = if recorded.replaced { "refreshed" } else { "stashed" };
+    let (email, slug) = (&recorded.stashed.account.email, &recorded.stashed.slug);
 
+    match current {
+        true => println!("{verb} the account in use, {email}, as {slug}"),
+        false => println!("{verb} {email} as {slug}; `ccs use {slug}` to switch to it"),
+    }
+    Ok(())
+}
+
+/// Whether the credentials being stashed are the ones currently installed.
+///
+/// A login mints an account that is stashed but *not* in use. Recording it as
+/// the installed one would make the next switch fold the live tokens into the
+/// wrong entry, so the two paths have to stay distinguishable.
+#[derive(PartialEq)]
+enum Installed {
+    Yes,
+    No,
+}
+
+impl From<bool> for Installed {
+    fn from(current: bool) -> Self {
+        match current {
+            true => Self::Yes,
+            false => Self::No,
+        }
+    }
+}
+
+struct Recorded {
+    stashed: Stashed,
+    /// The slug already held an account, so this refreshed it in place rather
+    /// than adding one.
+    replaced: bool,
+}
+
+/// The credentials in use, refreshed if they were spent.
+fn capture_live(ctx: &Ctx) -> Result<Oauth> {
+    let Some(live) = ctx.creds.read()? else {
+        bail!(
+            "no credentials at {}; sign in with `claude` before `ccs add --current`",
+            ctx.creds.path().display()
+        );
+    };
     // A refresh here rotates the token running sessions hold, so mirror it back
     // before doing anything else with it.
     let refreshed = freshen(ctx.api, &live.oauth)?;
@@ -189,14 +241,18 @@ pub fn add(ctx: &Ctx, name: Option<&str>) -> Result<()> {
         let _guard = lock::acquire(ctx.config_dir)?;
         ctx.creds.write(&merged(Some(live.clone()), oauth))?;
     }
-    let oauth = refreshed.unwrap_or(live.oauth);
+    Ok(refreshed.unwrap_or(live.oauth))
+}
 
+/// Ask who some credentials belong to, then write them into the stash.
+fn record(ctx: &Ctx, oauth: Oauth, name: Option<&str>, installed: Installed) -> Result<Recorded> {
     let profile = ctx.api.profile(&oauth.access_token)?;
     let slug = name.map(str::to_string).unwrap_or_else(|| stash::slugify(&profile.account.email));
+    let replaced = ctx.stash.list()?.iter().any(|s| s.slug == slug);
     let organization = profile.organization.as_ref();
 
     let account = Account {
-        email: profile.account.email.clone(),
+        email: profile.account.email,
         uuid: profile.account.uuid,
         plan: organization.and_then(|o| o.organization_type.clone()),
         rate_limit_tier: organization.and_then(|o| o.rate_limit_tier.clone()),
@@ -204,9 +260,10 @@ pub fn add(ctx: &Ctx, name: Option<&str>) -> Result<()> {
         oauth,
     };
     ctx.stash.save(&slug, &account)?;
-    ctx.stash.set_active(&slug)?;
-    println!("stashed {} as {slug}", profile.account.email);
-    Ok(())
+    if installed == Installed::Yes {
+        ctx.stash.set_active(&slug)?;
+    }
+    Ok(Recorded { stashed: Stashed { slug, account }, replaced })
 }
 
 pub fn remove(ctx: &Ctx, needle: &str) -> Result<()> {

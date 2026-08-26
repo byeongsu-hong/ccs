@@ -22,6 +22,7 @@ struct State {
 }
 
 pub struct Stash {
+    root: PathBuf,
     accounts: PathBuf,
     state: PathBuf,
 }
@@ -34,7 +35,13 @@ impl Stash {
         for dir in [&root, &accounts] {
             let _ = fs::set_permissions(dir, Permissions::from_mode(DIR_MODE));
         }
-        Ok(Self { accounts, state: root.join("state.json") })
+        Ok(Self { state: root.join("state.json"), accounts, root })
+    }
+
+    /// The directory the stash owns. A login's throwaway config directory is
+    /// made here, alongside the accounts rather than inside them.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Every stashed account, ordered by email so the table is stable run to run.

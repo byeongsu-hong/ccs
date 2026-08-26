@@ -1,0 +1,206 @@
+//! Logging in to an account without disturbing the one in use.
+//!
+//! Claude Code keeps its whole state under `CLAUDE_CONFIG_DIR`, so pointing a
+//! child `claude auth login` at a throwaway directory mints credentials for
+//! another account while the live ones sit untouched. Whatever lands there is
+//! taken for the stash and the directory is destroyed.
+
+use std::fs::{self, Permissions};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+
+use crate::creds::{CredStore, FileStore};
+use crate::model::Oauth;
+
+/// Prefix marking a throwaway login directory, so one left behind by an
+/// interrupted run can be recognised later and swept.
+const SCRATCH: &str = ".login-";
+
+const SCRATCH_MODE: u32 = 0o700;
+
+/// Environment that would let the child satisfy itself without a real login,
+/// leaving nothing to capture.
+const PREEMPTING: [&str; 5] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_HOST_CREDS_FILE",
+];
+
+/// Which Claude Code to drive, overridable for a non-standard install.
+pub fn binary() -> String {
+    std::env::var("CCS_CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string())
+}
+
+/// How the login page should be reached.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    pub email: Option<String>,
+    pub console: bool,
+    pub sso: bool,
+}
+
+/// A throwaway config directory, destroyed on drop.
+struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn new(root: &Path) -> Result<Self> {
+        let path = root.join(format!("{SCRATCH}{}", std::process::id()));
+        fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+        fs::set_permissions(&path, Permissions::from_mode(SCRATCH_MODE))
+            .with_context(|| format!("securing {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Run an interactive login in a throwaway directory and hand back what it
+/// minted. The terminal belongs to the child for the duration.
+pub fn run(root: &Path, binary: &str, options: &Options) -> Result<Oauth> {
+    sweep(root);
+    let scratch = Scratch::new(root)?;
+
+    let mut command = Command::new(binary);
+    command.args(["auth", "login"]).env("CLAUDE_CONFIG_DIR", &scratch.path);
+    for key in PREEMPTING {
+        command.env_remove(key);
+    }
+    if let Some(email) = &options.email {
+        command.args(["--email", email]);
+    }
+    if options.console {
+        command.arg("--console");
+    }
+    if options.sso {
+        command.arg("--sso");
+    }
+
+    let status = command.status().with_context(|| {
+        format!("running `{binary} auth login`; set CCS_CLAUDE_BINARY if it is not on PATH")
+    })?;
+    if !status.success() {
+        bail!("`{binary} auth login` did not complete; nothing was stashed");
+    }
+
+    let Some(file) = FileStore::new(&scratch.path).read()? else {
+        bail!("the login finished but left no credentials behind; nothing was stashed");
+    };
+    Ok(file.oauth)
+}
+
+/// Remove throwaway directories belonging to runs that are over. They can hold
+/// a credentials file, so they do not get to linger.
+fn sweep(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if abandoned(name) {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// A scratch directory whose owning process is gone has been abandoned. Naming
+/// each one after its process is what makes that answerable, and keeps a
+/// concurrent run's directory from being swept out from under it.
+fn abandoned(name: &str) -> bool {
+    let Some(pid) = name.strip_prefix(SCRATCH) else { return false };
+    !Path::new("/proc").join(pid).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A private root per test, so concurrently running tests never share a
+    /// scratch path.
+    fn temp_root(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("ccs-login-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("root");
+        path
+    }
+
+    #[test]
+    fn a_directory_owned_by_this_very_process_is_not_abandoned() {
+        assert!(!abandoned(&format!("{SCRATCH}{}", std::process::id())));
+    }
+
+    #[test]
+    fn a_directory_owned_by_a_departed_process_is_abandoned() {
+        // Beyond any pid the kernel will hand out, so nothing can own it.
+        assert!(abandoned(&format!("{SCRATCH}999999999")));
+    }
+
+    #[test]
+    fn unrelated_neighbours_are_left_alone() {
+        assert!(!abandoned("accounts"));
+        assert!(!abandoned("state.json"));
+    }
+
+    #[test]
+    fn a_login_that_exits_non_zero_stashes_nothing() {
+        let root = temp_root("nonzero");
+        let error = run(&root, "false", &Options::default()).unwrap_err().to_string();
+        assert!(error.contains("did not complete"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_login_that_mints_nothing_is_reported_rather_than_passing_silently() {
+        let root = temp_root("nothing");
+        let error = run(&root, "true", &Options::default()).unwrap_err().to_string();
+        assert!(error.contains("no credentials"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_binary_names_itself_and_the_override() {
+        let root = temp_root("missing");
+        let error = run(&root, "/nonexistent/claude", &Options::default()).unwrap_err().to_string();
+        assert!(error.contains("/nonexistent/claude"), "{error}");
+        assert!(error.contains("CCS_CLAUDE_BINARY"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_login_leaves_no_scratch_directory_behind() {
+        let root = temp_root("cleanup");
+        let _ = run(&root, "false", &Options::default());
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .expect("read root")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(SCRATCH))
+            .collect();
+        assert!(leftovers.is_empty(), "a failed login must not leave credentials lying around");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_scratch_directory_is_private_and_removed_on_drop() {
+        let root = temp_root("scratch");
+
+        let path = {
+            let scratch = Scratch::new(&root).expect("scratch");
+            let mode = fs::metadata(&scratch.path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, SCRATCH_MODE);
+            scratch.path.clone()
+        };
+        assert!(!path.exists(), "scratch directory should not outlive its guard");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}

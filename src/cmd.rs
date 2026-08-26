@@ -160,13 +160,8 @@ pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
         .map(|t| t.trim_start_matches("default_claude_").replace('_', ""))
         .unwrap_or_else(|| "?".to_string());
 
-    let entry = Entry {
-        slug,
-        email: profile.account.email,
-        plan,
-        active: true,
-        limits: Ok(limits),
-    };
+    let entry =
+        Entry { slug, email: profile.account.email, plan, active: true, limits: Ok(limits) };
     if json {
         println!("{}", serde_json::to_string_pretty(&view(&entry))?);
         return Ok(());

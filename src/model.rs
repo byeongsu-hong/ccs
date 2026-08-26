@@ -17,10 +17,7 @@ const EXHAUSTED_PCT: f64 = 100.0;
 const WARN_PCT: f64 = 80.0;
 
 pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 // ── credentials on disk ──────────────────────────────────────────────────────

@@ -108,7 +108,9 @@ impl Api {
 
         let status = resp.status().as_u16();
         if status == 401 {
-            bail!("token rejected (401); this account needs a fresh `claude /login` then `ccs add`");
+            bail!(
+                "token rejected (401); this account needs a fresh `claude /login` then `ccs add`"
+            );
         }
         if status != 200 {
             let detail = resp.body_mut().read_to_string().unwrap_or_default();
@@ -170,8 +172,11 @@ mod tests {
 
     #[test]
     fn an_unrotated_refresh_token_is_kept_rather_than_blanked() {
-        let next =
-            Refreshed { access_token: "new-access".into(), refresh_token: None, expires_in: Some(60) };
+        let next = Refreshed {
+            access_token: "new-access".into(),
+            refresh_token: None,
+            expires_in: Some(60),
+        };
         assert_eq!(refreshed_oauth(&previous(), &next).refresh_token, "old-refresh");
     }
 

@@ -49,10 +49,7 @@ pub fn acquire(dir: &Path) -> Result<Guard> {
             Err(e) => return Err(e).with_context(|| format!("taking lock {}", path.display())),
         }
         if SystemTime::now() >= deadline {
-            bail!(
-                "another process holds the credential lock at {}; retry shortly",
-                path.display()
-            );
+            bail!("another process holds the credential lock at {}; retry shortly", path.display());
         }
         if stale(&path) {
             let _ = fs::remove_dir(&path);

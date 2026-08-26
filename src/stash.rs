@@ -31,7 +31,8 @@ impl Stash {
     pub fn open(config_dir: &Path) -> Result<Self> {
         let root = config_dir.join("ccs");
         let accounts = root.join("accounts");
-        fs::create_dir_all(&accounts).with_context(|| format!("creating {}", accounts.display()))?;
+        fs::create_dir_all(&accounts)
+            .with_context(|| format!("creating {}", accounts.display()))?;
         for dir in [&root, &accounts] {
             let _ = fs::set_permissions(dir, Permissions::from_mode(DIR_MODE));
         }
@@ -116,9 +117,8 @@ pub fn resolve<'a>(accounts: &'a [Stashed], needle: &str) -> Result<&'a Stashed>
     }
     let lowered = needle.to_lowercase();
 
-    let exact = accounts
-        .iter()
-        .find(|s| s.slug == lowered || s.account.email.to_lowercase() == lowered);
+    let exact =
+        accounts.iter().find(|s| s.slug == lowered || s.account.email.to_lowercase() == lowered);
     if let Some(hit) = exact {
         return Ok(hit);
     }
@@ -132,7 +132,9 @@ pub fn resolve<'a>(accounts: &'a [Stashed], needle: &str) -> Result<&'a Stashed>
 
     let matches: Vec<&Stashed> = accounts
         .iter()
-        .filter(|s| s.slug.starts_with(&lowered) || s.account.email.to_lowercase().starts_with(&lowered))
+        .filter(|s| {
+            s.slug.starts_with(&lowered) || s.account.email.to_lowercase().starts_with(&lowered)
+        })
         .collect();
     match matches.as_slice() {
         [one] => Ok(one),
@@ -172,7 +174,10 @@ mod tests {
     }
 
     fn two() -> Vec<Stashed> {
-        vec![stashed("jesse_at_soob.co", "jesse@soob.co"), stashed("work_at_acme.com", "work@acme.com")]
+        vec![
+            stashed("jesse_at_soob.co", "jesse@soob.co"),
+            stashed("work_at_acme.com", "work@acme.com"),
+        ]
     }
 
     #[test]

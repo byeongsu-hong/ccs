@@ -81,11 +81,14 @@ impl Style {
     }
 
     fn health(&self, text: &str, health: Health) -> String {
-        self.paint(text, match health {
-            Health::Ok => "\x1b[32m",
-            Health::Warn => "\x1b[33m",
-            Health::Critical => "\x1b[31m",
-        })
+        self.paint(
+            text,
+            match health {
+                Health::Ok => "\x1b[32m",
+                Health::Warn => "\x1b[33m",
+                Health::Critical => "\x1b[31m",
+            },
+        )
     }
 
     pub fn dim(&self, text: &str) -> String {
@@ -108,7 +111,8 @@ pub struct Table {
 impl Table {
     pub fn build(entries: Vec<Entry>, style: Style) -> Self {
         let columns = columns_of(&entries);
-        let email_width = entries.iter().map(|e| e.email.len()).max().unwrap_or(0).max("ACCOUNT".len());
+        let email_width =
+            entries.iter().map(|e| e.email.len()).max().unwrap_or(0).max("ACCOUNT".len());
         let plan_width = entries.iter().map(|e| e.plan.len()).max().unwrap_or(0).max("PLAN".len());
         Self { columns, entries, email_width, plan_width, style }
     }
@@ -312,7 +316,10 @@ mod tests {
 
     #[test]
     fn an_account_is_as_healthy_as_its_worst_limit() {
-        let spent = entry("a@x.com", vec![limit!("session", 3.0), limit!("weekly_scoped", 100.0, model = "Fable")]);
+        let spent = entry(
+            "a@x.com",
+            vec![limit!("session", 3.0), limit!("weekly_scoped", 100.0, model = "Fable")],
+        );
         assert_eq!(spent.health(), Health::Critical);
         assert_eq!(spent.exhausted(), ["Fable"]);
     }
@@ -352,7 +359,10 @@ mod tests {
 
         let first = table.row(0);
         assert!(first.contains("<- active"), "{first}");
-        assert!(first.contains("—"), "row should dash the Fable column it has no limit for: {first}");
+        assert!(
+            first.contains("—"),
+            "row should dash the Fable column it has no limit for: {first}"
+        );
         assert!(!table.row(1).contains("<- active"));
     }
 

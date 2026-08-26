@@ -127,8 +127,7 @@ mod tests {
     /// A private root per test, so concurrently running tests never share a
     /// scratch path.
     fn temp_root(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("ccs-login-{}-{name}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ccs-login-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("root");
         path

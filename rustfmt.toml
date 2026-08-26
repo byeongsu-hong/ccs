@@ -1,0 +1,4 @@
+max_width = 100
+# Keep struct literals, calls and chains on one line up to the full width;
+# rustfmt's defaults break them far earlier than this code is written for.
+use_small_heuristics = "Max"

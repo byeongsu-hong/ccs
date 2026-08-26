@@ -354,27 +354,30 @@ mod tests {
         assert_eq!(bar(220.0), "████");
     }
 
+    /// Which models carry a scoped limit is the endpoint's to decide and no
+    /// part of this is fixed to a roster, so the names here are arbitrary: what
+    /// is under test is where a scoped column lands, not what it is called.
     #[test]
     fn columns_lead_with_the_two_families_that_always_exist() {
         let entries = vec![entry(
             "a@x.com",
             vec![
-                limit!("weekly_scoped", 10.0, model = "Opus"),
+                limit!("weekly_scoped", 10.0, model = "Zephyr"),
                 limit!("weekly_all", 53.0),
                 limit!("session", 3.0),
                 limit!("weekly_scoped", 100.0, model = "Fable"),
             ],
         )];
-        assert_eq!(columns_of(&entries), ["session", "weekly", "Fable", "Opus"]);
+        assert_eq!(columns_of(&entries), ["session", "weekly", "Fable", "Zephyr"]);
     }
 
     #[test]
     fn columns_are_the_union_across_accounts() {
         let entries = vec![
             entry("a@x.com", vec![limit!("weekly_scoped", 1.0, model = "Fable")]),
-            entry("b@x.com", vec![limit!("weekly_scoped", 2.0, model = "Opus")]),
+            entry("b@x.com", vec![limit!("weekly_scoped", 2.0, model = "Zephyr")]),
         ];
-        assert_eq!(columns_of(&entries), ["Fable", "Opus"]);
+        assert_eq!(columns_of(&entries), ["Fable", "Zephyr"]);
     }
 
     #[test]

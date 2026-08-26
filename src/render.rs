@@ -241,7 +241,7 @@ fn seconds_until(rfc3339: &str) -> Option<i64> {
 
 /// A duration with the spaces squeezed out, for somewhere a column of them has
 /// to line up.
-fn compact(seconds: i64) -> String {
+pub fn compact(seconds: i64) -> String {
     if seconds <= 0 {
         return "now".to_string();
     }

@@ -15,9 +15,10 @@ back.
 
 ## Why it works on live sessions
 
-Claude Code polls the mtime of its credentials file and drops its in-memory auth
-when it changes. `ccs` replaces that file atomically, so every running session
-picks up the new account within a few seconds — no restart, no re-login.
+Claude Code compares the mtime of its credentials file every time it resolves
+credentials, and drops its in-memory auth when it has moved. `ccs` replaces that
+file atomically, so a running session picks up the new account on its next
+request — no restart, no re-login.
 
 The switch is global: all sessions follow. To pin a single session to one
 account instead, launch it with its own `CLAUDE_CONFIG_DIR`.
@@ -77,9 +78,11 @@ The picker always asks before switching, and says what is spent if anything is.
 On the command line `ccs use` switches straight away, asking only when the
 target has a limit already at 100%; `--force` skips that question.
 
-Polling happens with the picker on screen — both the first load and every `r` —
-so the list never drops away while usage is fetched. A refresh that fails says
-so in the footer and leaves the last good reading standing.
+Polling happens with the picker on screen — the first load, every `r`, and once
+a minute on its own — so the list is never taken away to fetch. An unattended
+poll waits for a lull rather than freezing the list under you, the footer says
+how old the reading is, and a poll that fails says so there and leaves the last
+good reading standing.
 
 ## Limits
 

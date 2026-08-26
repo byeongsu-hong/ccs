@@ -333,7 +333,7 @@ fn switch_to(ctx: &Ctx, accounts: &[Stashed], target: &Stashed) -> Result<()> {
     ctx.creds.write(&merged(live, &target.account.oauth))?;
     ctx.stash.set_active(&target.slug)?;
     println!("switched to {} ({})", target.account.email, target.slug);
-    println!("running sessions pick this up within a few seconds");
+    println!("running sessions pick this up on their next request");
     Ok(())
 }
 

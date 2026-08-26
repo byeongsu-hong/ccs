@@ -5,6 +5,7 @@
 //! the list stays up while usage is re-polled.
 
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -52,9 +53,20 @@ impl Drop for Screen {
     }
 }
 
+/// How often the list re-polls on its own.
+const AUTO_REFRESH: Duration = Duration::from_secs(60);
+
+/// How long after a keypress an unattended poll holds off. Polling blocks for
+/// as long as the network takes, so it waits for a lull rather than freezing
+/// the list under someone mid-navigation.
+const IDLE_GRACE: Duration = Duration::from_secs(2);
+
+/// How long to wait on a key before looking at the clock again.
+const TICK: Duration = Duration::from_millis(200);
+
 /// Show the accounts and let one be chosen. Usage is polled through `refresh`,
-/// with the screen already up — including the first poll, so the wait is
-/// visible instead of being a blank terminal.
+/// with the screen already up — the first load, every minute after that, and
+/// any time `r` is pressed — so the list is never taken away to fetch.
 pub fn run(refresh: impl Fn() -> Result<Table>) -> Result<Outcome> {
     let _screen = Screen::enter()?;
     let style = Style::colored();
@@ -64,54 +76,98 @@ pub fn run(refresh: impl Fn() -> Result<Table>) -> Result<Outcome> {
     if table.entries().is_empty() {
         return Ok(Outcome::Quit);
     }
+
     let mut at = 0;
     let mut mode = Mode::Browsing;
+    let mut polled = Instant::now();
+    let mut attempted = Instant::now();
+    let mut last_key = Instant::now();
+    let mut painted = String::new();
 
     loop {
-        draw(&table, at, &mode, style)?;
-        let Event::Key(key) = event::read().context("reading key")? else { continue };
-        if key.kind != KeyEventKind::Press {
-            continue;
+        // Repaint only on a real change, so the ticking age in the footer costs
+        // one frame a second and nothing else costs any.
+        let current = frame(&table, at, &mode, style, polled);
+        if current != painted {
+            paint(&current)?;
+            painted = current;
         }
 
-        // A confirmation is modal: nothing else is listening until it is answered.
-        if let Mode::Confirming(target) = mode {
-            match answer(key) {
-                Answer::Yes => {
-                    let Some(entry) = table.entries().get(target) else {
-                        return Ok(Outcome::Quit);
-                    };
-                    return Ok(Outcome::Switch(entry.slug.clone()));
-                }
-                Answer::No => mode = Mode::Browsing,
-                Answer::Ignore => {}
+        let mut poll_now = false;
+        if event::poll(TICK).context("waiting for a key")? {
+            let Event::Key(key) = event::read().context("reading key")? else { continue };
+            if key.kind != KeyEventKind::Press {
+                continue;
             }
-            continue;
-        }
+            last_key = Instant::now();
 
-        match decide(key, at, table.len()) {
-            Step::Move(next) => {
-                at = next;
-                mode = Mode::Browsing;
-            }
-            Step::Confirm => mode = Mode::Confirming(at),
-            Step::Refresh => {
-                mode = Mode::Note("refreshing…".to_string());
-                draw(&table, at, &mode, style)?;
-                mode = match refresh() {
-                    Ok(next) => {
-                        at = at.min(next.len().saturating_sub(1));
-                        table = next;
-                        Mode::Browsing
+            // A confirmation is modal: nothing else is listening until it is answered.
+            if let Mode::Confirming(target) = mode {
+                match answer(key) {
+                    Answer::Yes => {
+                        let Some(entry) = table.entries().get(target) else {
+                            return Ok(Outcome::Quit);
+                        };
+                        return Ok(Outcome::Switch(entry.slug.clone()));
                     }
-                    // The list still holds the last good reading, so say what
-                    // went wrong and leave it standing.
-                    Err(e) => Mode::Note(format!("refresh failed: {e}")),
-                };
+                    Answer::No => mode = Mode::Browsing,
+                    Answer::Ignore => {}
+                }
+                continue;
             }
-            Step::Quit => return Ok(Outcome::Quit),
-            Step::Ignore => mode = Mode::Browsing,
+
+            match decide(key, at, table.len()) {
+                Step::Move(next) => {
+                    at = next;
+                    mode = Mode::Browsing;
+                }
+                Step::Confirm => mode = Mode::Confirming(at),
+                Step::Refresh => poll_now = true,
+                Step::Quit => return Ok(Outcome::Quit),
+                Step::Ignore => mode = Mode::Browsing,
+            }
+        } else if due(&mode, attempted.elapsed(), last_key.elapsed()) {
+            poll_now = true;
         }
+
+        if poll_now {
+            mode = Mode::Note("refreshing…".to_string());
+            let pending = frame(&table, at, &mode, style, polled);
+            paint(&pending)?;
+            painted = pending;
+            mode = repoll(&refresh, &mut table, &mut at, &mut polled, &mut attempted);
+        }
+    }
+}
+
+/// Whether an unattended poll is due: never while a question is on screen,
+/// never inside the grace period after a keypress, and not before the interval
+/// has run out.
+fn due(mode: &Mode, since_attempt: Duration, since_key: Duration) -> bool {
+    !matches!(mode, Mode::Confirming(_)) && since_attempt >= AUTO_REFRESH && since_key >= IDLE_GRACE
+}
+
+/// Re-poll, keeping the last good reading when it fails.
+///
+/// `attempted` moves either way so a failing endpoint is retried on the usual
+/// interval rather than on every tick; `polled` only moves on success, because
+/// it is what the footer reports as the age of what is on screen.
+fn repoll<F: Fn() -> Result<Table>>(
+    refresh: &F,
+    table: &mut Table,
+    at: &mut usize,
+    polled: &mut Instant,
+    attempted: &mut Instant,
+) -> Mode {
+    *attempted = Instant::now();
+    match refresh() {
+        Ok(next) => {
+            *at = (*at).min(next.len().saturating_sub(1));
+            *table = next;
+            *polled = Instant::now();
+            Mode::Browsing
+        }
+        Err(e) => Mode::Note(format!("refresh failed: {e}")),
     }
 }
 
@@ -161,35 +217,47 @@ fn answer(key: KeyEvent) -> Answer {
 /// A bare message on an otherwise empty screen, for before there is a table to
 /// put under it.
 fn note(style: Style, text: &str) -> Result<()> {
-    let mut out = io::stdout();
-    queue!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
-    write!(out, "\r\n  {}\r\n", style.dim(text))?;
-    out.flush()?;
-    Ok(())
+    paint(&format!("\n  {}", style.dim(text)))
 }
 
-fn draw(table: &Table, at: usize, mode: &Mode, style: Style) -> Result<()> {
-    let mut out = io::stdout();
-    queue!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
-    write!(out, "  {}\r\n", table.header())?;
+/// The whole screen as text, so the loop can tell whether anything moved before
+/// spending a repaint on it.
+fn frame(table: &Table, at: usize, mode: &Mode, style: Style, polled: Instant) -> String {
+    let mut lines = vec![format!("  {}", table.header())];
     for index in 0..table.len() {
         let marker = if index == at { "> " } else { "  " };
-        write!(out, "{marker}{}\r\n", table.row(index))?;
+        lines.push(format!("{marker}{}", table.row(index)));
     }
     if let Some(entry) = table.entries().get(at) {
-        write!(out, "\r\n")?;
-        for line in render::detail(entry, style) {
-            write!(out, "{line}\r\n")?;
-        }
+        lines.push(String::new());
+        lines.extend(render::detail(entry, style));
     }
-    write!(out, "\r\n{}\r\n", footer(table, mode, style))?;
+    lines.push(String::new());
+    lines.push(footer(table, mode, style, polled));
+    lines.join("\n")
+}
+
+/// Clears line by line rather than clearing the screen up front, so a repaint
+/// never shows an empty frame on the way through.
+fn paint(frame: &str) -> Result<()> {
+    let mut out = io::stdout().lock();
+    queue!(out, cursor::MoveTo(0, 0))?;
+    for line in frame.split('\n') {
+        write!(out, "{line}")?;
+        queue!(out, terminal::Clear(ClearType::UntilNewLine))?;
+        write!(out, "\r\n")?;
+    }
+    queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
     out.flush()?;
     Ok(())
 }
 
-fn footer(table: &Table, mode: &Mode, style: Style) -> String {
+fn footer(table: &Table, mode: &Mode, style: Style, polled: Instant) -> String {
     match mode {
-        Mode::Browsing => style.dim("  up/down select   enter switch   r refresh   q quit"),
+        Mode::Browsing => style.dim(&format!(
+            "  up/down select   enter switch   r refresh   q quit      updated {}",
+            age(polled.elapsed())
+        )),
         Mode::Note(text) => style.bold(&format!("  {text}")),
         Mode::Confirming(target) => {
             let Some(entry) = table.entries().get(*target) else { return String::new() };
@@ -199,6 +267,15 @@ fn footer(table: &Table, mode: &Mode, style: Style) -> String {
                 false => style.health(&question, Health::Critical),
             }
         }
+    }
+}
+
+/// How old what is on screen is, in the fewest words that say it.
+fn age(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds < 2 {
+        true => "just now".to_string(),
+        false => format!("{} ago", render::compact(seconds as i64)),
     }
 }
 
@@ -245,6 +322,37 @@ mod tests {
         assert!(matches!(answer(press(KeyCode::Char('q'))), Answer::No));
         let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(answer(interrupt), Answer::No));
+    }
+
+    #[test]
+    fn an_unattended_poll_waits_for_the_interval() {
+        assert!(!due(&Mode::Browsing, Duration::from_secs(30), Duration::from_secs(60)));
+        assert!(due(&Mode::Browsing, AUTO_REFRESH, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn an_unattended_poll_never_interrupts_a_question() {
+        assert!(!due(&Mode::Confirming(0), AUTO_REFRESH, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn an_unattended_poll_holds_off_right_after_a_keypress() {
+        assert!(!due(&Mode::Browsing, AUTO_REFRESH, Duration::from_millis(200)));
+        assert!(due(&Mode::Browsing, AUTO_REFRESH, IDLE_GRACE));
+    }
+
+    #[test]
+    fn a_failed_poll_does_not_stop_the_next_one() {
+        let noted = Mode::Note("refresh failed: offline".to_string());
+        assert!(due(&noted, AUTO_REFRESH, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn the_age_label_reads_plainly() {
+        assert_eq!(age(Duration::from_secs(0)), "just now");
+        assert_eq!(age(Duration::from_secs(1)), "just now");
+        assert_eq!(age(Duration::from_secs(45)), "45s ago");
+        assert_eq!(age(Duration::from_secs(90)), "1m ago");
     }
 
     #[test]

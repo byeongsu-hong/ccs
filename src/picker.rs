@@ -76,7 +76,7 @@ const TICK: Duration = Duration::from_millis(200);
 ///
 /// `verb` is what choosing will do, which the confirmation and the key list
 /// both have to say plainly: a switch moves every session, a launch moves none.
-pub fn run(refresh: impl Fn() -> Result<Table>, verb: Verb) -> Result<Outcome> {
+pub fn run(mut refresh: impl FnMut() -> Result<Table>, verb: Verb) -> Result<Outcome> {
     let _screen = Screen::enter()?;
     let style = Style::colored();
 
@@ -86,7 +86,7 @@ pub fn run(refresh: impl Fn() -> Result<Table>, verb: Verb) -> Result<Outcome> {
         return Ok(Outcome::Quit);
     }
 
-    let mut at = 0;
+    let mut at = Some(0);
     let mut mode = Mode::Browsing;
     let mut polled = Instant::now();
     let mut attempted = Instant::now();
@@ -127,10 +127,14 @@ pub fn run(refresh: impl Fn() -> Result<Table>, verb: Verb) -> Result<Outcome> {
 
             match decide(key, at, table.len()) {
                 Step::Move(next) => {
-                    at = next;
+                    at = Some(next);
                     mode = Mode::Browsing;
                 }
-                Step::Confirm => mode = Mode::Confirming(at),
+                Step::Unselect => {
+                    at = None;
+                    mode = Mode::Browsing;
+                }
+                Step::Confirm(target) => mode = Mode::Confirming(target),
                 Step::Refresh => poll_now = true,
                 Step::Quit => return Ok(Outcome::Quit),
                 Step::Ignore => mode = Mode::Browsing,
@@ -144,7 +148,7 @@ pub fn run(refresh: impl Fn() -> Result<Table>, verb: Verb) -> Result<Outcome> {
             let pending = frame(&table, at, &mode, style, polled, verb);
             paint(&pending)?;
             painted = pending;
-            mode = repoll(&refresh, &mut table, &mut at, &mut polled, &mut attempted);
+            mode = repoll(&mut refresh, &mut table, &mut at, &mut polled, &mut attempted);
         }
     }
 }
@@ -161,17 +165,17 @@ fn due(mode: &Mode, since_attempt: Duration, since_key: Duration) -> bool {
 /// `attempted` moves either way so a failing endpoint is retried on the usual
 /// interval rather than on every tick; `polled` only moves on success, because
 /// it is what the footer reports as the age of what is on screen.
-fn repoll<F: Fn() -> Result<Table>>(
-    refresh: &F,
+fn repoll<F: FnMut() -> Result<Table>>(
+    refresh: &mut F,
     table: &mut Table,
-    at: &mut usize,
+    at: &mut Option<usize>,
     polled: &mut Instant,
     attempted: &mut Instant,
 ) -> Mode {
     *attempted = Instant::now();
     match refresh() {
         Ok(next) => {
-            *at = (*at).min(next.len().saturating_sub(1));
+            *at = at.map(|at| at.min(next.len().saturating_sub(1)));
             *table = next;
             *polled = Instant::now();
             Mode::Browsing
@@ -182,7 +186,9 @@ fn repoll<F: Fn() -> Result<Table>>(
 
 enum Step {
     Move(usize),
-    Confirm,
+    /// Put the selection away, leaving no row under the cursor.
+    Unselect,
+    Confirm(usize),
     Refresh,
     Quit,
     Ignore,
@@ -195,17 +201,35 @@ enum Answer {
 }
 
 /// Key handling as a pure decision, leaving the loop above about drawing.
-fn decide(key: KeyEvent, at: usize, len: usize) -> Step {
+///
+/// Nothing selected is a resting state rather than an impossible one: it is
+/// what `esc` backs out to, and with no row under the cursor `enter` has
+/// nothing to act on. That is the point — the key that acts is one keystroke
+/// from the key that moves, so there has to be a way to disarm it.
+fn decide(key: KeyEvent, at: Option<usize>, len: usize) -> Step {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let last = len.saturating_sub(1);
     match key.code {
         KeyCode::Char('c') if ctrl => Step::Quit,
-        KeyCode::Char('q') | KeyCode::Esc => Step::Quit,
-        KeyCode::Enter => Step::Confirm,
+        KeyCode::Char('q') => Step::Quit,
+        // One step out at a time: off the selection first, out of the picker
+        // only once there is nothing left to back out of.
+        KeyCode::Esc => match at {
+            Some(_) => Step::Unselect,
+            None => Step::Quit,
+        },
+        KeyCode::Enter => match at {
+            Some(at) => Step::Confirm(at),
+            None => Step::Ignore,
+        },
         KeyCode::Char('r') => Step::Refresh,
-        KeyCode::Up | KeyCode::Char('k') => Step::Move(at.saturating_sub(1)),
-        KeyCode::Down | KeyCode::Char('j') => Step::Move((at + 1).min(len - 1)),
+        // Moving is what brings the selection back, so putting it away never
+        // strands the list. From nowhere, down lands on the first row and up
+        // on the last, the way a menu opens from either end.
+        KeyCode::Up | KeyCode::Char('k') => Step::Move(at.map_or(last, |at| at.saturating_sub(1))),
+        KeyCode::Down | KeyCode::Char('j') => Step::Move(at.map_or(0, |at| (at + 1).min(last))),
         KeyCode::Home => Step::Move(0),
-        KeyCode::End => Step::Move(len - 1),
+        KeyCode::End => Step::Move(last),
         _ => Step::Ignore,
     }
 }
@@ -233,7 +257,7 @@ fn note(style: Style, text: &str) -> Result<()> {
 /// spending a repaint on it.
 fn frame(
     table: &Table,
-    at: usize,
+    at: Option<usize>,
     mode: &Mode,
     style: Style,
     polled: Instant,
@@ -241,15 +265,17 @@ fn frame(
 ) -> String {
     let mut lines = vec![format!("  {}", table.header())];
     for index in 0..table.len() {
-        let marker = if index == at { "> " } else { "  " };
+        let marker = if at == Some(index) { "> " } else { "  " };
         lines.push(format!("{marker}{}", table.row(index)));
     }
-    if let Some(entry) = table.entries().get(at) {
+    // With no row selected there is nothing to detail, and the gap it leaves
+    // is the plainest signal that `enter` has nothing to act on.
+    if let Some(entry) = at.and_then(|at| table.entries().get(at)) {
         lines.push(String::new());
         lines.extend(render::detail(entry, style));
     }
     lines.push(String::new());
-    lines.push(footer(table, mode, style, polled, verb));
+    lines.push(footer(table, at, mode, style, polled, verb));
     lines.join("\n")
 }
 
@@ -268,13 +294,26 @@ fn paint(frame: &str) -> Result<()> {
     Ok(())
 }
 
-fn footer(table: &Table, mode: &Mode, style: Style, polled: Instant, verb: Verb) -> String {
+fn footer(
+    table: &Table,
+    at: Option<usize>,
+    mode: &Mode,
+    style: Style,
+    polled: Instant,
+    verb: Verb,
+) -> String {
     match mode {
-        Mode::Browsing => style.dim(&format!(
-            "  up/down select   enter {}   r refresh   q quit      updated {}",
-            verb.word(),
-            age(polled.elapsed())
-        )),
+        Mode::Browsing => {
+            // Only offer the keys that do something: with nothing selected
+            // there is no account to act on and nothing to put away.
+            let keys = match at {
+                Some(_) => {
+                    format!("enter {}   esc unselect   r refresh   q quit", verb.word())
+                }
+                None => "r refresh   q quit".to_string(),
+            };
+            style.dim(&format!("  up/down select   {keys}      updated {}", age(polled.elapsed())))
+        }
         Mode::Note(text) => style.bold(&format!("  {text}")),
         Mode::Confirming(target) => {
             let Some(entry) = table.entries().get(*target) else { return String::new() };
@@ -306,23 +345,52 @@ mod tests {
 
     #[test]
     fn enter_asks_rather_than_switching_outright() {
-        assert!(matches!(decide(press(KeyCode::Enter), 0, 3), Step::Confirm));
+        assert!(matches!(decide(press(KeyCode::Enter), Some(0), 3), Step::Confirm(0)));
     }
 
     #[test]
     fn movement_stays_inside_the_list() {
-        assert!(matches!(decide(press(KeyCode::Up), 0, 3), Step::Move(0)));
-        assert!(matches!(decide(press(KeyCode::Down), 2, 3), Step::Move(2)));
-        assert!(matches!(decide(press(KeyCode::Down), 0, 3), Step::Move(1)));
-        assert!(matches!(decide(press(KeyCode::End), 0, 3), Step::Move(2)));
+        assert!(matches!(decide(press(KeyCode::Up), Some(0), 3), Step::Move(0)));
+        assert!(matches!(decide(press(KeyCode::Down), Some(2), 3), Step::Move(2)));
+        assert!(matches!(decide(press(KeyCode::Down), Some(0), 3), Step::Move(1)));
+        assert!(matches!(decide(press(KeyCode::End), Some(0), 3), Step::Move(2)));
     }
 
     #[test]
-    fn quitting_answers_to_more_than_one_key() {
-        assert!(matches!(decide(press(KeyCode::Char('q')), 0, 3), Step::Quit));
-        assert!(matches!(decide(press(KeyCode::Esc), 0, 3), Step::Quit));
+    fn movement_on_an_empty_list_lands_nowhere_rather_than_panicking() {
+        assert!(matches!(decide(press(KeyCode::Down), Some(0), 0), Step::Move(0)));
+        assert!(matches!(decide(press(KeyCode::End), Some(0), 0), Step::Move(0)));
+    }
+
+    #[test]
+    fn escape_puts_the_selection_away_before_it_leaves() {
+        assert!(matches!(decide(press(KeyCode::Esc), Some(1), 3), Step::Unselect));
+        assert!(matches!(decide(press(KeyCode::Esc), None, 3), Step::Quit));
+    }
+
+    #[test]
+    fn enter_does_nothing_with_no_row_under_it() {
+        assert!(matches!(decide(press(KeyCode::Enter), None, 3), Step::Ignore));
+    }
+
+    #[test]
+    fn moving_brings_the_selection_back_from_either_end() {
+        assert!(matches!(decide(press(KeyCode::Down), None, 3), Step::Move(0)));
+        assert!(matches!(decide(press(KeyCode::Up), None, 3), Step::Move(2)));
+        assert!(matches!(decide(press(KeyCode::Char('j')), None, 3), Step::Move(0)));
+    }
+
+    #[test]
+    fn refreshing_and_quitting_work_with_nothing_selected() {
+        assert!(matches!(decide(press(KeyCode::Char('r')), None, 3), Step::Refresh));
+        assert!(matches!(decide(press(KeyCode::Char('q')), None, 3), Step::Quit));
+    }
+
+    #[test]
+    fn quitting_outright_answers_to_more_than_one_key() {
+        assert!(matches!(decide(press(KeyCode::Char('q')), Some(0), 3), Step::Quit));
         let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(decide(interrupt, 0, 3), Step::Quit));
+        assert!(matches!(decide(interrupt, Some(0), 3), Step::Quit));
     }
 
     #[test]

@@ -1,69 +1,62 @@
 # ccs
 
-Switch Claude Code accounts — including sessions that are already running — and
-see what each account has left before you commit to it.
+Switch Claude Code accounts without logging out, and see what each one has left
+before you commit to it.
 
-```
-   ACCOUNT              PLAN    SESSION           WEEKLY            FABLE             OPUS
- 1 jesse@soob.co        max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m   █░░░  12% 6h24m   <- active
- 2 jesse+alt@soob.co    max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h   ░░░░   4% 2d11h
- 3 work@acme.com        pro     ███░  61% 1h44m   ████  88% 5d19h   —                 ███░  70% 5d19h
-```
+![the ccs picker](docs/picker.svg)
 
-Each cell carries how much of that limit is gone and how long until it comes
-back.
+If you run more than one Claude subscription you know the shape of this problem.
+You are deep in something, the weekly Opus limit lands, and the only road to your
+other account is `/login` — which signs you out everywhere, drops whatever
+sessions you had going, and tells you nothing about whether the account you are
+moving to has any room left either. An hour later you do the whole thing again in
+reverse.
 
-## Why it works on live sessions
+`ccs` keeps every account logged in at once, shows you where each one stands, and
+moves between them in place. Sessions that are already running follow along on
+their next request. Nothing restarts, and nothing gets signed out.
 
-Claude Code compares the mtime of its credentials file every time it resolves
-credentials, and drops its in-memory auth when it has moved. `ccs` replaces that
-file atomically, so a running session picks up the new account on its next
-request — no restart, no re-login.
+## What it is actually good at
 
-The switch is global: all sessions follow. To confine one session to one
-account instead, start it with `ccs pin`.
+**Seeing before switching.** The table above is the whole point. Session window,
+all-models weekly, and a column per model that has its own weekly limit — how much
+is gone and how long until it comes back, for every account at once. You pick the
+account with room instead of discovering there wasn't any two prompts later.
 
-## Pinning one session
+**Never logging in again.** Each account is stashed with its own credentials.
+Switching installs one of them over the live file; it never signs the other one
+out. Going back is another switch, not another login.
 
-`ccs pin` picks an account the same way `ccs` does — the usage table, arrows,
-`enter` — and then starts Claude Code on it:
+**Live sessions.** A switch reaches sessions that are already running, mid-task,
+without a restart. That is the difference between "I'll switch accounts" being a
+two-second decision and being a five-minute interruption.
 
-```sh
-ccs pin                     # choose from the table, then launch
-ccs pin work                # skip the picker
-ccs pin work -- --continue  # anything after `--` goes to Claude Code
-```
+**Pinning.** One session on one account, every other session left where it is.
+This is the feature that changes how you work — see below.
 
-That session is the only one that moves. Every other session stays on the
-account in use, and a later `ccs use` leaves the pinned one where it is. It
-says which account it is on wherever Claude Code shows a session name.
+## Install
 
-A pinned session is a normal session in every other way: same settings, skills,
-plugins, MCP servers, project trust and history. `ccs pin` gives the account a
-*pen* — a configuration directory of symbolic links back to the real one, whose
-only file of its own is the credentials — and points `CLAUDE_CONFIG_DIR` at it.
-Nothing is copied, so the pen never falls behind what it mirrors.
-
-Inside a pinned session `ccs` still reads the real stash, and `ccs use` there
-re-pins that session alone. `ccs rm` takes an account's pen away with it.
-
-## Setup
+You need a Rust toolchain. Then:
 
 ```sh
+git clone https://github.com/orthory/ccs
+cd ccs
 make install
 ```
 
-That builds and puts `ccs` on your `PATH` under `$CARGO_HOME/bin`. Point it
-somewhere else with `PREFIX`:
+That builds a release binary and puts `ccs` on your `PATH` under `$CARGO_HOME/bin`.
+Somewhere else:
 
 ```sh
 sudo make install PREFIX=/usr/local
 ```
 
-`make help` lists the rest: `make check` runs formatting, clippy and the
-tests; `make uninstall` takes it back off.
+`make help` lists the rest — `make check` runs formatting, clippy and the tests,
+`make uninstall` takes it back off.
 
-Capture the account you are already on, then log in to the rest:
+## Getting your accounts in
+
+Start with the one you are already signed in as, then log in to the others:
 
 ```sh
 ccs add --current    # stash whoever is logged in right now
@@ -71,58 +64,186 @@ ccs add              # log in to another account
 ccs add              # ...and another
 ```
 
-`ccs add` runs `claude auth login` against a throwaway config directory, keeps
-the credentials it mints, and destroys the directory. The account you are using
-is never signed out and never touched — no logout, no re-login, and running
-sessions carry on through it.
+`ccs add` runs `claude auth login` against a throwaway config directory, keeps the
+credentials it mints, and destroys the directory. The account you are currently
+using is never touched — no logout, no re-login, and sessions running against it
+carry on straight through the login you are doing in the next window.
 
-Steer the login page with `--email <address>`, `--console`, or `--sso`; stash
-under a chosen name with `--name <slug>`.
+Steer the login page with `--email <address>`, `--console` (Console billing rather
+than a subscription), or `--sso`. Stash under a name of your choosing with
+`--name <slug>`; otherwise the slug comes from the email.
 
-After that you never log in again — `ccs use` moves between stashed accounts
+After that you are done logging in. `ccs use` moves between stashed accounts
 directly.
+
+## Everyday use
+
+Run `ccs` with no arguments and you get the picker:
+
+```
+     ACCOUNT              PLAN    SESSION           WEEKLY            FABLE             OPUS
+>  1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   █░░░  12% 6h24m   ████ 100% 6h24m   <- active
+   2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░   4% 2d11h   █░░░  22% 2d11h
+   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   —                 ███░  70% 5d19h
+
+  session          █░░░  10%   resets in 3h 54m
+  weekly           ███░  55%   resets in 6h 24m
+  Fable            █░░░  12%   resets in 6h 24m
+  Opus             ████ 100%   resets in 6h 24m   spent
+
+  up/down select   enter switch   esc unselect   r refresh   q quit      updated just now
+```
+
+Arrows or `j`/`k` move, `home`/`end` jump to the ends, and the block under the
+table details whichever account you are sitting on. `enter` asks before it does
+anything, and says what is spent if anything is:
+
+```
+  you@example.com has no Opus left. Switch anyway? [y/n]
+```
+
+`esc` backs out one step at a time. From a question it takes you back to the list;
+from the list it puts the selection away entirely, which leaves `enter` with
+nothing to act on:
+
+```
+     ACCOUNT              PLAN    SESSION           WEEKLY            FABLE             OPUS
+   1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   █░░░  12% 6h24m   ████ 100% 6h24m   <- active
+   2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░   4% 2d11h   █░░░  22% 2d11h
+   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   —                 ███░  70% 5d19h
+
+  up/down select   r refresh   q quit      updated just now
+```
+
+Move again and the selection comes back. One more `esc` from there leaves the
+picker; `q` and `ctrl-c` leave from anywhere.
+
+If you already know where you are going, skip the picker:
+
+```sh
+ccs use work            # slug, email, unambiguous prefix, or the index from `ccs ls`
+ccs use 2
+ccs ls                  # the same table, printed and gone
+ccs status              # just the account in use, in detail
+```
+
+`ccs use` switches straight away. It only stops to ask when the account you are
+switching to has a limit already at 100%, and `--force` skips even that.
+
+## Pinning a session to one account
+
+A switch is global — every session follows it. Sometimes that is exactly wrong:
+you want this terminal on the work account and everything else left alone. That
+is `ccs pin`:
+
+```sh
+ccs pin                     # pick from the table, then launch
+ccs pin work                # skip the picker
+ccs pin work -- --continue  # anything after `--` is handed to Claude Code
+```
+
+It picks an account the same way `ccs` does, then starts Claude Code on it. That
+session is the only thing that moves. Every other session stays on the account in
+use, and a later `ccs use` leaves the pinned one exactly where it is. The session
+says which account it is on wherever Claude Code shows a session name.
+
+Run several at once, one terminal each, and you are working three accounts in
+parallel with three separate limit budgets.
+
+### What a pinned session shares, and what it doesn't
+
+A pinned session is a normal session in every way but one. It gets a *pen* — a
+configuration directory of symbolic links back to your real one, whose only file
+of its own is the credentials — and `CLAUDE_CONFIG_DIR` points at it.
+
+**Shared, live, with every other session:** settings, skills, plugins, agents,
+slash commands, MCP servers, project trust, conversation history, todos — and the
+global `.claude.json` alongside them. These are links, not copies, so a pen never
+drifts from what it mirrors, and a skill you add inside a pinned session is a skill
+every session has. There is no syncing step because there is nothing to sync.
+
+**The pen's own, shared with nothing:** the credentials. That is the entire point
+of the pen, and it is the only real file in it. A `ccs use` elsewhere rewrites the
+live credentials and leaves the pen's standing.
+
+**Also not mirrored:** the account stash itself and the credential write lock. The
+stash stays reachable from inside a pen anyway — a pen records the configuration it
+was cut from, so `ccs` inside a pinned session reads your real accounts, and
+`ccs use` in there re-pins that one session rather than moving everybody. `ccs rm`
+takes an account's pen away with it.
+
+If Claude Code ever replaces one of those links with a real file of its own, the
+pen keeps that file from then on rather than clobbering it back to a link.
+
+## How it works
+
+**Switching a live session.** Claude Code checks the mtime of its credentials file
+each time it resolves credentials, and drops its in-memory auth when the file has
+moved underneath it. `ccs` writes the replacement to a sibling temp file and
+renames it into place, so a reader sees either the old file or the new one and
+never a half-written one — and the rename freshens the mtime that running sessions
+are watching. That is the whole trick. There is no daemon and no IPC.
+
+**Not fighting over the file.** Claude Code takes a lock beside the credentials
+file when it refreshes tokens. `ccs` takes the same lock, so a switch can't
+interleave with a refresh and lose one of the two writes.
+
+**Keeping stashed tokens alive.** This is the part that is easy to get wrong.
+Claude Code refreshes access tokens in place, so a stashed copy goes stale the
+moment its account is used, and a refresh can *rotate* the refresh token — which
+makes the copy you were holding worthless. So `ccs` folds the live tokens back into
+the stash on the way out of an account, refreshes any stashed token that has
+expired before polling it, and writes down whatever comes back before doing
+anything else with it. When the account it refreshed is the live one, the
+credentials file gets the new token too, so running sessions are never left holding
+one that has been superseded.
+
+**Reading usage.** The limits come from the same OAuth endpoint Claude Code uses
+for `/status`, one request per stashed account. The columns are built from whatever
+the API reports rather than from a fixed list, so a newly scoped model turns up as
+its own column without a change here.
+
+**Polling.** The picker polls with the screen already up — on open, on `r`, and
+every ten minutes on its own — so the list is never taken away to fetch. An
+unattended poll waits for a lull rather than freezing the list under you, the
+footer says how old the reading is, and a poll that fails says so there and leaves
+the last good reading standing. The interval is long because each poll costs a
+request per account against an endpoint that rate-limits. The countdowns don't wait
+on it: they are recomputed from the reset instants every time the screen is
+painted, so only the percentages are as old as the footer says.
 
 ## Commands
 
 | command | what it does |
 | --- | --- |
-| `ccs` | interactive picker: arrows to move, `enter` then `y` to switch, `r` to re-poll, `q` to quit |
-| `ccs ls` | every stashed account with its session, weekly, and per-model limits |
-| `ccs use <account>` | switch to an account; running sessions follow |
-| `ccs pin [<account>]` | start a session confined to one account, leaving every other session alone |
-| `ccs add` | log in to another account and stash it, without disturbing the one in use |
+| `ccs` | the picker |
+| `ccs ls` | every stashed account and what it has left |
+| `ccs use <account>` | switch; running sessions follow |
+| `ccs pin [<account>]` | start a session confined to one account |
+| `ccs add` | log in to another account and stash it |
 | `ccs add --current` | stash whichever account is logged in right now |
 | `ccs rm <account>` | forget a stashed account |
-| `ccs status` | limits for the account currently in use, with reset times |
+| `ccs status` | limits for the account in use, with reset times |
 
-`<account>` is a slug, an email, an unambiguous prefix of either, or the index
-from `ccs ls`. Without one, `ccs pin` opens the picker. `ccs ls --json` and
-`ccs status --json` emit the same data for scripts and status lines.
+`<account>` is a slug, an email, an unambiguous prefix of either, or the index from
+`ccs ls`. `ccs pin` without one opens the picker; `ccs use` without one is an
+error rather than a guess.
 
-The picker always asks before switching, and says what is spent if anything is.
-On the command line `ccs use` switches straight away, asking only when the
-target has a limit already at 100%; `--force` skips that question.
-
-Polling happens with the picker on screen — the first load, every `r`, and every
-ten minutes on its own — so the list is never taken away to fetch. An unattended
-poll waits for a lull rather than freezing the list under you, the footer says
-how old the reading is, and a poll that fails says so there and leaves the last
-good reading standing.
-
-A poll costs one request per stashed account against an endpoint that
-rate-limits, which is why the interval is long. The countdowns do not wait on
-it: they are computed from the reset instants every time the screen is painted,
-so they keep running down between polls, and only the percentages are as old as
-the footer says.
+`-f`/`--force` switches even into an account with nothing left. `--json` on `ls`
+and `status` gives you the same data for scripts and status lines.
 
 ## Limits
 
-The columns come from whatever the API reports rather than a fixed list, so a
-newly scoped model appears on its own:
+Columns come from whatever the API reports, so this list is a description rather
+than a schema:
 
 - **session** — the rolling five-hour window
 - **weekly** — the all-models weekly window
 - one column per model with its own weekly limit (Fable, Opus, …)
+
+Green is fine, yellow is worth knowing about, red is spent. An account with any
+limit at 100% is dimmed in the table, and `ccs` asks twice before walking into it.
+A `—` means that account has no limit of that kind at all.
 
 ## Where things live
 
@@ -134,23 +255,21 @@ newly scoped model appears on its own:
 ~/.claude/ccs/.login-<pid>/     a login in progress, destroyed when it ends
 ```
 
-Stash files hold OAuth refresh tokens. They are written `0600` inside a `0700`
-directory, and they are worth exactly as much as a login — do not sync them
-anywhere you would not sync a password.
+**Those account files hold OAuth refresh tokens.** They are written `0600` inside a
+`0700` directory, and each one is worth exactly as much as a password. Don't sync
+them anywhere you wouldn't sync a password.
 
-`CLAUDE_CONFIG_DIR` is honoured, the same way Claude Code honours it, and
-`CCS_CLAUDE_BINARY` points at a `claude` that is not on `PATH`.
+A login directory left behind by an interrupted run is swept on the next `ccs add`.
+Each is named after the process that owns it, so a run still in flight is never
+swept out from under itself.
 
-A login directory left behind by an interrupted run is swept on the next `ccs
-add` — each is named after the process that owns it, so a run still in flight
-is never swept out from under itself.
+## Environment
 
-## Keeping tokens alive
+`CLAUDE_CONFIG_DIR` is honoured the same way Claude Code honours it, which is what
+lets `ccs` work correctly from inside a pinned session. `CCS_CLAUDE_BINARY` points
+at a `claude` that isn't on `PATH`. `NO_COLOR` does what you expect.
 
-Claude Code refreshes access tokens in place, so a stashed copy goes stale as
-soon as its account is used. `ccs` folds the live tokens back into the stash on
-the way out of an account, and refreshes any stashed token that has expired
-before polling it. A refresh can rotate the refresh token, so the result is
-written down before anything else happens — and when the refreshed account is
-the live one, the credentials file is updated too, so running sessions are not
-left holding a token that no longer works.
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` take
+precedence over the credentials file for any session that inherits them — so a
+session with one of those set ignores whatever account you switched to. `ccs` says
+so rather than letting you wonder.

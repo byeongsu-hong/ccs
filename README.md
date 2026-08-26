@@ -103,11 +103,17 @@ The picker always asks before switching, and says what is spent if anything is.
 On the command line `ccs use` switches straight away, asking only when the
 target has a limit already at 100%; `--force` skips that question.
 
-Polling happens with the picker on screen — the first load, every `r`, and once
-a minute on its own — so the list is never taken away to fetch. An unattended
+Polling happens with the picker on screen — the first load, every `r`, and every
+ten minutes on its own — so the list is never taken away to fetch. An unattended
 poll waits for a lull rather than freezing the list under you, the footer says
 how old the reading is, and a poll that fails says so there and leaves the last
 good reading standing.
+
+A poll costs one request per stashed account against an endpoint that
+rate-limits, which is why the interval is long. The countdowns do not wait on
+it: they are computed from the reset instants every time the screen is painted,
+so they keep running down between polls, and only the percentages are as old as
+the footer says.
 
 ## Limits
 

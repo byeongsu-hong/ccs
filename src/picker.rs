@@ -54,7 +54,13 @@ impl Drop for Screen {
 }
 
 /// How often the list re-polls on its own.
-const AUTO_REFRESH: Duration = Duration::from_secs(60);
+///
+/// Each poll costs one request per stashed account, against an endpoint that
+/// rate-limits — so the interval is generous, and the countdowns carry the
+/// time in between. They are computed from the reset instants at every
+/// repaint rather than at every poll, so they keep running down whether or
+/// not anything has been fetched; only the percentages wait on a reading.
+const AUTO_REFRESH: Duration = Duration::from_secs(600);
 
 /// How long after a keypress an unattended poll holds off. Polling blocks for
 /// as long as the network takes, so it waits for a lull rather than freezing
@@ -65,8 +71,8 @@ const IDLE_GRACE: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(200);
 
 /// Show the accounts and let one be chosen. Usage is polled through `refresh`,
-/// with the screen already up — the first load, every minute after that, and
-/// any time `r` is pressed — so the list is never taken away to fetch.
+/// with the screen already up — the first load, at a long interval after that,
+/// and any time `r` is pressed — so the list is never taken away to fetch.
 ///
 /// `verb` is what choosing will do, which the confirmation and the key list
 /// both have to say plainly: a switch moves every session, a launch moves none.

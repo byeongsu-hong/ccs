@@ -18,10 +18,11 @@ their next request. Nothing restarts, and nothing gets signed out.
 
 ## What it is actually good at
 
-**Seeing before switching.** The table above is the whole point. Session window,
-all-models weekly, and a column per model that has its own weekly limit — how much
-is gone and how long until it comes back, for every account at once. You pick the
-account with room instead of discovering there wasn't any two prompts later.
+**Seeing before switching.** The table above is the whole point. The five-hour
+session window, the all-models weekly window, and any weekly window scoped to a
+single model — Fable, today — for every account at once: how much is gone, and
+how long until it comes back. You pick the account with room instead of
+discovering there wasn't any two prompts later.
 
 **Never logging in again.** Each account is stashed with its own credentials.
 Switching installs one of them over the live file; it never signs the other one
@@ -235,7 +236,7 @@ and `status` gives you the same data for scripts and status lines.
 
 Columns are built from whatever the usage endpoint reports rather than from a
 list in the code, so this describes what it returns today and is not a schema.
-On a Max plan that is three:
+Today that is three:
 
 - **session** — the rolling five-hour window
 - **weekly** — the all-models weekly window
@@ -246,8 +247,8 @@ starts scoping another one it gets a column without a change here.
 
 Green is fine, yellow is worth knowing about, red is spent. An account with any
 limit at 100% is dimmed in the table, and `ccs` asks twice before walking into it.
-A `—` means that account has no limit of that kind at all, which is how an
-account on a different plan reads beside the others.
+A `—` means that account reported no limit of that kind at all, where another
+account did.
 
 ## Where things live
 

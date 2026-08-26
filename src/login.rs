@@ -12,7 +12,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::creds::{CredStore, FileStore};
+use crate::creds::{self, CredStore, FileStore};
 use crate::model::Oauth;
 
 /// Prefix marking a throwaway login directory, so one left behind by an
@@ -20,16 +20,6 @@ use crate::model::Oauth;
 const SCRATCH: &str = ".login-";
 
 const SCRATCH_MODE: u32 = 0o700;
-
-/// Environment that would let the child satisfy itself without a real login,
-/// leaving nothing to capture.
-const PREEMPTING: [&str; 5] = [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-    "CLAUDE_CODE_HOST_CREDS_FILE",
-];
 
 /// Which Claude Code to drive, overridable for a non-standard install.
 pub fn binary() -> String {
@@ -73,7 +63,9 @@ pub fn run(root: &Path, binary: &str, options: &Options) -> Result<Oauth> {
 
     let mut command = Command::new(binary);
     command.args(["auth", "login"]).env("CLAUDE_CONFIG_DIR", &scratch.path);
-    for key in PREEMPTING {
+    // Anything that answers for the credentials file would let the child
+    // satisfy itself without logging in, leaving nothing to capture.
+    for key in creds::OVERRIDING {
         command.env_remove(key);
     }
     if let Some(email) = &options.email {

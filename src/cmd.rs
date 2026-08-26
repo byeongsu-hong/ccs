@@ -5,7 +5,7 @@
 //! command stays testable against substitutes.
 
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use anyhow::{Context as _, Result, bail};
@@ -13,20 +13,25 @@ use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::{Api, refreshed_oauth};
-use crate::creds::CredStore;
+use crate::creds::{self, CredStore, FileStore};
 use crate::lock;
 use crate::login;
 use crate::model::{Account, CredsFile, Limit, Oauth, Stashed};
+use crate::pen;
 use crate::picker::{self, Outcome};
-use crate::render::{self, Entry, Style, Table};
+use crate::render::{self, Entry, Style, Table, Verb};
 use crate::stash::{self, Stash};
 
 pub struct Ctx<'a> {
     pub creds: &'a dyn CredStore,
     pub stash: &'a Stash,
     pub api: &'a Api,
-    /// Directory whose lock guards credential writes.
+    /// Directory whose lock guards credential writes, and whose credentials a
+    /// switch replaces.
     pub config_dir: &'a Path,
+    /// The real configuration: where the stash lives and what pens are cut
+    /// from. The same as `config_dir` unless this process is itself in a pen.
+    pub home: &'a pen::Home,
 }
 
 // ── probing ─────────────────────────────────────────────────────────────────
@@ -120,10 +125,7 @@ fn merged(current: Option<CredsFile>, oauth: &Oauth) -> CredsFile {
 // ── commands ────────────────────────────────────────────────────────────────
 
 pub fn list(ctx: &Ctx, json: bool) -> Result<()> {
-    let accounts = ctx.stash.list()?;
-    if accounts.is_empty() {
-        bail!("no accounts stashed yet; log in with `claude` then run `ccs add`");
-    }
+    let accounts = stashed(ctx)?;
     let (table, _) = survey(ctx, &accounts, Style::detect())?;
     if json {
         return emit_json(&table);
@@ -265,6 +267,9 @@ pub fn remove(ctx: &Ctx, needle: &str) -> Result<()> {
     let accounts = ctx.stash.list()?;
     let target = stash::resolve(&accounts, needle)?.clone();
     ctx.stash.remove(&target.slug)?;
+    if let Err(e) = pen::discard(ctx.stash.root(), &target.slug) {
+        eprintln!("ccs: {}'s pen is still there: {}", target.slug, describe(&e));
+    }
     println!("forgot {} ({})", target.account.email, target.slug);
     Ok(())
 }
@@ -282,16 +287,94 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
 }
 
 pub fn pick(ctx: &Ctx) -> Result<()> {
+    let accounts = stashed(ctx)?;
+    let Some(target) = choose(ctx, &accounts, Verb::Switch)? else { return Ok(()) };
+    switch_to(ctx, &accounts, &target)
+}
+
+/// Confine a session to one account: install that account's credentials in its
+/// own pen and hand the process over to Claude Code there.
+///
+/// Nothing outside the pen is touched, so every other session stays on the
+/// account in use and a later `ccs use` leaves this one where it is.
+pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
+    let accounts = stashed(ctx)?;
+
+    // Named outright, the account is taken at its word and the session starts
+    // without a round trip; the picker is where usage is shopped for.
+    let target = match needle {
+        Some(needle) => stash::resolve(&accounts, needle)?.clone(),
+        None => {
+            let Some(chosen) = choose(ctx, &accounts, Verb::Launch)? else { return Ok(()) };
+            chosen
+        }
+    };
+
+    let pen = pen_for(ctx, &target)?;
+    warn_overridden();
+    println!("{} is pinned to this session only", target.account.email);
+    pen::launch(&pen, &login::binary(), &labelled(args, &target.account.email))
+}
+
+/// Have the session say which account it is confined to, where Claude Code
+/// shows a session's name. A launch that named itself keeps its own name.
+fn labelled(args: &[String], email: &str) -> Vec<String> {
+    if args.iter().any(|a| a == "--name" || a == "-n") {
+        return args.to_vec();
+    }
+    let mut out = vec!["--name".to_string(), format!("pinned by ccs: {email}")];
+    out.extend_from_slice(args);
+    out
+}
+
+/// The account's pen, with its freshest credentials in place.
+fn pen_for(ctx: &Ctx, target: &Stashed) -> Result<PathBuf> {
+    let oauth = match freshen(ctx.api, &target.account.oauth)? {
+        Some(oauth) => {
+            let account = Account { oauth: oauth.clone(), ..target.account.clone() };
+            ctx.stash.save(&target.slug, &account)?;
+            oauth
+        }
+        None => target.account.oauth.clone(),
+    };
+
+    let pen = pen::prepare(ctx.home, ctx.stash.root(), &target.slug)?;
+    let store = FileStore::new(&pen);
+    let _guard = lock::acquire(&pen)?;
+    let current = store.read()?;
+    store.write(&merged(current, &oauth))?;
+    Ok(pen)
+}
+
+/// Say so when the environment answers for the credentials, because it decides
+/// the account whatever a pen holds.
+fn warn_overridden() {
+    let set: Vec<&str> =
+        creds::OVERRIDING.iter().copied().filter(|k| std::env::var_os(k).is_some()).collect();
+    if set.is_empty() {
+        return;
+    }
+    eprintln!(
+        "ccs: {} takes precedence over any account; the session may not use this one",
+        set.join(", ")
+    );
+}
+
+/// Put the accounts on screen and wait for one to be picked. The picker owns
+/// the whole screen while it is up, so it is always drawn in colour.
+fn choose(ctx: &Ctx, accounts: &[Stashed], verb: Verb) -> Result<Option<Stashed>> {
+    let poll = || survey(ctx, accounts, Style::colored()).map(|(table, _)| table);
+    let Outcome::Chose(slug) = picker::run(poll, verb)? else { return Ok(None) };
+    Ok(accounts.iter().find(|a| a.slug == slug).cloned())
+}
+
+/// Every stashed account, refusing to go further when there are none.
+fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
     let accounts = ctx.stash.list()?;
     if accounts.is_empty() {
         bail!("no accounts stashed yet; log in with `claude` then run `ccs add`");
     }
-    let style = Style::colored();
-    let poll = || survey(ctx, &accounts, style).map(|(table, _)| table);
-
-    let Outcome::Switch(slug) = picker::run(poll)? else { return Ok(()) };
-    let Some(target) = accounts.iter().find(|a| a.slug == slug) else { return Ok(()) };
-    switch_to(ctx, &accounts, target)
+    Ok(accounts)
 }
 
 // ── shared steps ────────────────────────────────────────────────────────────
@@ -359,7 +442,7 @@ fn guard_exhausted(entry: &Entry, force: bool) -> Result<()> {
     if entry.exhausted().is_empty() {
         return Ok(());
     }
-    if !confirm(&render::switch_question(entry))? {
+    if !confirm(&render::question(entry, Verb::Switch))? {
         bail!("not switching; `ccs use <account> --force` overrides");
     }
     Ok(())
@@ -420,4 +503,33 @@ fn entry_of(account: &Stashed, probe: &Probe, active: bool) -> Entry {
 
 fn describe(error: &anyhow::Error) -> String {
     error.chain().map(|c| c.to_string()).collect::<Vec<_>>().join(": ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn a_pinned_session_names_the_account_it_is_confined_to() {
+        let args = labelled(&[], "work@acme.com");
+        assert_eq!(args, ["--name", "pinned by ccs: work@acme.com"]);
+    }
+
+    #[test]
+    fn the_label_goes_in_front_of_what_was_forwarded() {
+        let args = labelled(&words(&["--continue"]), "work@acme.com");
+        assert_eq!(args.last().map(String::as_str), Some("--continue"));
+    }
+
+    #[test]
+    fn a_launch_that_named_itself_keeps_its_own_name() {
+        for flag in ["--name", "-n"] {
+            let given = words(&[flag, "mine"]);
+            assert_eq!(labelled(&given, "work@acme.com"), given, "{flag} should win");
+        }
+    }
 }

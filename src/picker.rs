@@ -13,14 +13,14 @@ use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute, queue};
 
 use crate::model::Health;
-use crate::render::{self, Style, Table};
+use crate::render::{self, Style, Table, Verb};
 
 /// How the picker was closed.
 pub enum Outcome {
-    /// Switch to the account with this slug. Carrying the slug rather than a
-    /// row index keeps the answer meaningful after a refresh has rebuilt the
-    /// table underneath it.
-    Switch(String),
+    /// Act on the account with this slug. Carrying the slug rather than a row
+    /// index keeps the answer meaningful after a refresh has rebuilt the table
+    /// underneath it.
+    Chose(String),
     Quit,
 }
 
@@ -67,7 +67,10 @@ const TICK: Duration = Duration::from_millis(200);
 /// Show the accounts and let one be chosen. Usage is polled through `refresh`,
 /// with the screen already up — the first load, every minute after that, and
 /// any time `r` is pressed — so the list is never taken away to fetch.
-pub fn run(refresh: impl Fn() -> Result<Table>) -> Result<Outcome> {
+///
+/// `verb` is what choosing will do, which the confirmation and the key list
+/// both have to say plainly: a switch moves every session, a launch moves none.
+pub fn run(refresh: impl Fn() -> Result<Table>, verb: Verb) -> Result<Outcome> {
     let _screen = Screen::enter()?;
     let style = Style::colored();
 
@@ -87,7 +90,7 @@ pub fn run(refresh: impl Fn() -> Result<Table>) -> Result<Outcome> {
     loop {
         // Repaint only on a real change, so the ticking age in the footer costs
         // one frame a second and nothing else costs any.
-        let current = frame(&table, at, &mode, style, polled);
+        let current = frame(&table, at, &mode, style, polled, verb);
         if current != painted {
             paint(&current)?;
             painted = current;
@@ -108,7 +111,7 @@ pub fn run(refresh: impl Fn() -> Result<Table>) -> Result<Outcome> {
                         let Some(entry) = table.entries().get(target) else {
                             return Ok(Outcome::Quit);
                         };
-                        return Ok(Outcome::Switch(entry.slug.clone()));
+                        return Ok(Outcome::Chose(entry.slug.clone()));
                     }
                     Answer::No => mode = Mode::Browsing,
                     Answer::Ignore => {}
@@ -132,7 +135,7 @@ pub fn run(refresh: impl Fn() -> Result<Table>) -> Result<Outcome> {
 
         if poll_now {
             mode = Mode::Note("refreshing…".to_string());
-            let pending = frame(&table, at, &mode, style, polled);
+            let pending = frame(&table, at, &mode, style, polled, verb);
             paint(&pending)?;
             painted = pending;
             mode = repoll(&refresh, &mut table, &mut at, &mut polled, &mut attempted);
@@ -222,7 +225,14 @@ fn note(style: Style, text: &str) -> Result<()> {
 
 /// The whole screen as text, so the loop can tell whether anything moved before
 /// spending a repaint on it.
-fn frame(table: &Table, at: usize, mode: &Mode, style: Style, polled: Instant) -> String {
+fn frame(
+    table: &Table,
+    at: usize,
+    mode: &Mode,
+    style: Style,
+    polled: Instant,
+    verb: Verb,
+) -> String {
     let mut lines = vec![format!("  {}", table.header())];
     for index in 0..table.len() {
         let marker = if index == at { "> " } else { "  " };
@@ -233,7 +243,7 @@ fn frame(table: &Table, at: usize, mode: &Mode, style: Style, polled: Instant) -
         lines.extend(render::detail(entry, style));
     }
     lines.push(String::new());
-    lines.push(footer(table, mode, style, polled));
+    lines.push(footer(table, mode, style, polled, verb));
     lines.join("\n")
 }
 
@@ -252,16 +262,17 @@ fn paint(frame: &str) -> Result<()> {
     Ok(())
 }
 
-fn footer(table: &Table, mode: &Mode, style: Style, polled: Instant) -> String {
+fn footer(table: &Table, mode: &Mode, style: Style, polled: Instant, verb: Verb) -> String {
     match mode {
         Mode::Browsing => style.dim(&format!(
-            "  up/down select   enter switch   r refresh   q quit      updated {}",
+            "  up/down select   enter {}   r refresh   q quit      updated {}",
+            verb.word(),
             age(polled.elapsed())
         )),
         Mode::Note(text) => style.bold(&format!("  {text}")),
         Mode::Confirming(target) => {
             let Some(entry) = table.entries().get(*target) else { return String::new() };
-            let question = format!("  {} [y/n]", render::switch_question(entry));
+            let question = format!("  {} [y/n]", render::question(entry, verb));
             match entry.exhausted().is_empty() {
                 true => style.bold(&question),
                 false => style.health(&question, Health::Critical),

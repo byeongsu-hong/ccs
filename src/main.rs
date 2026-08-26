@@ -6,6 +6,7 @@ mod fsx;
 mod lock;
 mod login;
 mod model;
+mod pen;
 mod picker;
 mod render;
 mod stash;
@@ -42,10 +43,15 @@ fn run() -> Result<()> {
     }
 
     let config_dir = config_dir()?;
+    // A pen records the configuration it was cut from; anywhere else, this is it.
+    let here = pen::Home { config: config_dir.clone(), global: global_config()? };
+    let home = pen::home_of(&config_dir).unwrap_or(here);
+
     let creds = FileStore::new(&config_dir);
-    let stash = Stash::open(&config_dir)?;
+    let stash = Stash::open(&home.config)?;
     let api = Api::new();
-    let ctx = cmd::Ctx { creds: &creds, stash: &stash, api: &api, config_dir: &config_dir };
+    let ctx =
+        cmd::Ctx { creds: &creds, stash: &stash, api: &api, config_dir: &config_dir, home: &home };
 
     match command {
         Cmd::Pick => cmd::pick(&ctx),
@@ -55,18 +61,35 @@ fn run() -> Result<()> {
             let options = login::Options { email, console, sso };
             cmd::add(&ctx, name.as_deref(), current, &options)
         }
+        Cmd::Pin { target, args } => cmd::pin(&ctx, target.as_deref(), &args),
         Cmd::Remove { target } => cmd::remove(&ctx, &target),
         Cmd::Status { json } => cmd::status(&ctx, json),
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
     }
 }
 
-/// Claude Code's configuration directory, honouring the same override Claude
-/// Code itself honours.
+/// The configuration directory this process acts on: where the credentials a
+/// switch replaces live. Honours the same override Claude Code itself honours,
+/// so a session confined to a pen switches inside that pen rather than out of
+/// it.
 fn config_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".claude"))
+    Ok(home()?.join(".claude"))
+}
+
+/// Where Claude Code resolves its global configuration file, which is beside
+/// the home directory rather than inside the configuration directory — until
+/// `CLAUDE_CONFIG_DIR` is set, which moves it in.
+fn global_config() -> Result<PathBuf> {
+    let dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => home()?,
+    };
+    Ok(dir.join(pen::GLOBAL))
+}
+
+fn home() -> Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?))
 }

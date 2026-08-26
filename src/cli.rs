@@ -9,6 +9,8 @@ USAGE
     ccs                      pick an account interactively
     ccs ls                   every stashed account and what it has left
     ccs use <account>        switch to an account; running sessions follow
+    ccs pin [<account>]      start a session confined to one account, leaving
+                             every other session on the account in use
     ccs add                  log in to another account and stash it, without
                              disturbing the account in use
     ccs add --current        stash the account that is logged in right now
@@ -16,7 +18,9 @@ USAGE
     ccs status               limits for the account currently in use
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
-    index shown by `ccs ls`.
+    index shown by `ccs ls`. Without one, `ccs pin` asks.
+
+    Anything after `--` is passed on to Claude Code: `ccs pin -- --continue`.
 
 OPTIONS
     -f, --force              switch even to an account with no headroom left
@@ -35,6 +39,7 @@ pub enum Cmd {
     List { json: bool },
     Use { target: String, force: bool },
     Add { name: Option<String>, current: bool, email: Option<String>, console: bool, sso: bool },
+    Pin { target: Option<String>, args: Vec<String> },
     Remove { target: String },
     Status { json: bool },
     Help,
@@ -67,6 +72,10 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
                 sso: has(rest, "--sso"),
             })
         }
+        "pin" | "confine" => {
+            let (mine, forwarded) = forwarded(&args[1..]);
+            Ok(Cmd::Pin { target: positional(mine), args: forwarded })
+        }
         "rm" | "remove" | "forget" => {
             let Some(target) = positional(&args[1..]) else {
                 bail!("`ccs rm` needs an account; `ccs ls` lists them");
@@ -75,6 +84,13 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         }
         other => bail!("unknown command {other:?}; `ccs --help` lists them"),
     }
+}
+
+/// Split at `--`: what follows belongs to the command being launched rather
+/// than to this one, flags and all.
+fn forwarded(args: &[String]) -> (&[String], Vec<String>) {
+    let Some(at) = args.iter().position(|a| a == "--") else { return (args, Vec::new()) };
+    (&args[..at], args[at + 1..].to_vec())
 }
 
 fn has(args: &[String], flag: &str) -> bool {
@@ -190,6 +206,38 @@ mod tests {
     #[test]
     fn use_without_a_target_is_an_error_not_a_silent_no_op() {
         assert!(parse(["use".to_string()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn pin_without_a_target_asks_rather_than_failing() {
+        let Cmd::Pin { target, args } = parsed(&["pin"]) else { panic!("not a pin") };
+        assert_eq!(target, None);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn pin_takes_a_target_when_one_is_given() {
+        let Cmd::Pin { target, .. } = parsed(&["pin", "work"]) else { panic!("not a pin") };
+        assert_eq!(target.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn pin_hands_everything_after_a_double_dash_to_claude_code() {
+        let Cmd::Pin { target, args } = parsed(&["pin", "work", "--", "--continue", "-p", "hi"])
+        else {
+            panic!("not a pin")
+        };
+        assert_eq!(target.as_deref(), Some("work"));
+        assert_eq!(args, ["--continue", "-p", "hi"]);
+    }
+
+    #[test]
+    fn a_forwarded_flag_is_never_mistaken_for_the_target() {
+        let Cmd::Pin { target, args } = parsed(&["pin", "--", "resume"]) else {
+            panic!("not a pin")
+        };
+        assert_eq!(target, None);
+        assert_eq!(args, ["resume"]);
     }
 
     #[test]

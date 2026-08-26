@@ -20,8 +20,32 @@ credentials, and drops its in-memory auth when it has moved. `ccs` replaces that
 file atomically, so a running session picks up the new account on its next
 request — no restart, no re-login.
 
-The switch is global: all sessions follow. To pin a single session to one
-account instead, launch it with its own `CLAUDE_CONFIG_DIR`.
+The switch is global: all sessions follow. To confine one session to one
+account instead, start it with `ccs pin`.
+
+## Pinning one session
+
+`ccs pin` picks an account the same way `ccs` does — the usage table, arrows,
+`enter` — and then starts Claude Code on it:
+
+```sh
+ccs pin                     # choose from the table, then launch
+ccs pin work                # skip the picker
+ccs pin work -- --continue  # anything after `--` goes to Claude Code
+```
+
+That session is the only one that moves. Every other session stays on the
+account in use, and a later `ccs use` leaves the pinned one where it is. It
+says which account it is on wherever Claude Code shows a session name.
+
+A pinned session is a normal session in every other way: same settings, skills,
+plugins, MCP servers, project trust and history. `ccs pin` gives the account a
+*pen* — a configuration directory of symbolic links back to the real one, whose
+only file of its own is the credentials — and points `CLAUDE_CONFIG_DIR` at it.
+Nothing is copied, so the pen never falls behind what it mirrors.
+
+Inside a pinned session `ccs` still reads the real stash, and `ccs use` there
+re-pins that session alone. `ccs rm` takes an account's pen away with it.
 
 ## Setup
 
@@ -65,14 +89,15 @@ directly.
 | `ccs` | interactive picker: arrows to move, `enter` then `y` to switch, `r` to re-poll, `q` to quit |
 | `ccs ls` | every stashed account with its session, weekly, and per-model limits |
 | `ccs use <account>` | switch to an account; running sessions follow |
+| `ccs pin [<account>]` | start a session confined to one account, leaving every other session alone |
 | `ccs add` | log in to another account and stash it, without disturbing the one in use |
 | `ccs add --current` | stash whichever account is logged in right now |
 | `ccs rm <account>` | forget a stashed account |
 | `ccs status` | limits for the account currently in use, with reset times |
 
 `<account>` is a slug, an email, an unambiguous prefix of either, or the index
-from `ccs ls`. `ccs ls --json` and `ccs status --json` emit the same data for
-scripts and status lines.
+from `ccs ls`. Without one, `ccs pin` opens the picker. `ccs ls --json` and
+`ccs status --json` emit the same data for scripts and status lines.
 
 The picker always asks before switching, and says what is spent if anything is.
 On the command line `ccs use` switches straight away, asking only when the
@@ -98,6 +123,7 @@ newly scoped model appears on its own:
 ```
 ~/.claude/.credentials.json     the live account, as Claude Code reads it
 ~/.claude/ccs/accounts/*.json   one stashed account each, mode 0600
+~/.claude/ccs/pens/<account>/   one pinned session's configuration each
 ~/.claude/ccs/state.json        which slug is currently installed
 ~/.claude/ccs/.login-<pid>/     a login in progress, destroyed when it ends
 ```

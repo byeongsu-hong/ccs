@@ -13,6 +13,18 @@ use crate::model::CredsFile;
 /// itself writes.
 const MODE: u32 = 0o600;
 
+/// Environment Claude Code reads in preference to the credentials file.
+/// Anything set here decides the account whatever the file holds — which makes
+/// it something a login has to clear, and something a pinned session has to be
+/// warned about.
+pub const OVERRIDING: [&str; 5] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_HOST_CREDS_FILE",
+];
+
 /// Where Claude Code's live credentials live.
 ///
 /// Only the plain-file backend exists today. The trait is the seam a Keychain

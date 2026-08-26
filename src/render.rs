@@ -254,13 +254,36 @@ pub fn compact(seconds: i64) -> String {
     }
 }
 
-/// The question to put before a switch, naming what is spent when something is.
-/// Shared so the picker and the command line ask it the same way.
-pub fn switch_question(entry: &Entry) -> String {
+/// What acting on an account is about to do, so the picker names it.
+#[derive(Clone, Copy)]
+pub enum Verb {
+    /// Replace the live credentials, which every session follows.
+    Switch,
+    /// Start one session on the account, leaving every other where it is.
+    Launch,
+}
+
+impl Verb {
+    /// The verb alone, as the footer's list of keys says it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::Launch => "launch",
+        }
+    }
+}
+
+/// The question to put before acting on an account, naming what is spent when
+/// something is. Shared so the picker and the command line ask it the same way.
+pub fn question(entry: &Entry, verb: Verb) -> String {
+    let (asked, anyway) = match verb {
+        Verb::Switch => (format!("Switch to {}?", entry.email), "Switch anyway?"),
+        Verb::Launch => (format!("Launch a session on {}?", entry.email), "Launch anyway?"),
+    };
     let spent = entry.exhausted();
     match spent.is_empty() {
-        true => format!("Switch to {}?", entry.email),
-        false => format!("{} has no {} left. Switch anyway?", entry.email, spent.join(", ")),
+        true => asked,
+        false => format!("{} has no {} left. {anyway}", entry.email, spent.join(", ")),
     }
 }
 
@@ -451,12 +474,26 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_question_names_what_is_spent() {
+    fn the_question_names_what_is_spent() {
         let fine = entry("a@x.com", vec![limit!("session", 3.0)]);
-        assert_eq!(switch_question(&fine), "Switch to a@x.com?");
+        assert_eq!(question(&fine, Verb::Switch), "Switch to a@x.com?");
 
         let spent = entry("a@x.com", vec![limit!("weekly_scoped", 100.0, model = "Fable")]);
-        assert!(switch_question(&spent).contains("no Fable left"), "{}", switch_question(&spent));
+        let asked = question(&spent, Verb::Switch);
+        assert!(asked.contains("no Fable left"), "{asked}");
+        assert!(asked.contains("Switch anyway?"), "{asked}");
+    }
+
+    #[test]
+    fn a_launch_is_never_described_as_a_switch() {
+        let fine = entry("a@x.com", vec![limit!("session", 3.0)]);
+        assert_eq!(question(&fine, Verb::Launch), "Launch a session on a@x.com?");
+
+        let spent = entry("a@x.com", vec![limit!("weekly_scoped", 100.0, model = "Fable")]);
+        let asked = question(&spent, Verb::Launch);
+        assert!(asked.contains("no Fable left"), "{asked}");
+        assert!(asked.contains("Launch anyway?"), "{asked}");
+        assert!(!asked.contains("Switch"), "a launch moves no other session: {asked}");
     }
 
     #[test]

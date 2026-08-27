@@ -400,18 +400,7 @@ pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
     let pen = pen_for(ctx, &target, live.as_deref())?;
     warn_overridden();
     println!("{} is pinned to this session only", target.account.email);
-    pen::launch(&pen, &claude_binary(), &labelled(args, &target.account.email))
-}
-
-/// Have the session say which account it is confined to, where Claude Code
-/// shows a session's name. A launch that named itself keeps its own name.
-fn labelled(args: &[String], email: &str) -> Vec<String> {
-    if args.iter().any(|a| a == "--name" || a == "-n") {
-        return args.to_vec();
-    }
-    let mut out = vec!["--name".to_string(), format!("pinned by ccs: {email}")];
-    out.extend_from_slice(args);
-    out
+    pen::launch(&pen, &claude_binary(), args)
 }
 
 /// The account's pen, with its freshest credentials in place.
@@ -605,10 +594,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::fs;
-
-    fn words(args: &[&str]) -> Vec<String> {
-        args.iter().map(|a| a.to_string()).collect()
-    }
 
     /// Credentials held in memory rather than on disk, so a test can see what
     /// a command installed.
@@ -812,25 +797,5 @@ mod tests {
             fixture.creds.read().expect("read").is_none(),
             "nothing to install, so nothing was"
         );
-    }
-
-    #[test]
-    fn a_pinned_session_names_the_account_it_is_confined_to() {
-        let args = labelled(&[], "work@example.com");
-        assert_eq!(args, ["--name", "pinned by ccs: work@example.com"]);
-    }
-
-    #[test]
-    fn the_label_goes_in_front_of_what_was_forwarded() {
-        let args = labelled(&words(&["--continue"]), "work@example.com");
-        assert_eq!(args.last().map(String::as_str), Some("--continue"));
-    }
-
-    #[test]
-    fn a_launch_that_named_itself_keeps_its_own_name() {
-        for flag in ["--name", "-n"] {
-            let given = words(&[flag, "mine"]);
-            assert_eq!(labelled(&given, "work@example.com"), given, "{flag} should win");
-        }
     }
 }

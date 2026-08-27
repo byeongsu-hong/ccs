@@ -102,6 +102,23 @@ anything, and says what is spent if anything is:
   you@example.com has no Fable left. Switch anyway? [y/n]
 ```
 
+Answering yes switches, and the picker stays where it is — the active marker moves
+to the row you picked and the footer says what happened:
+
+```
+     ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
+   1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m
+>  2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h   <- active
+   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   ███░  70% 5d19h
+
+  switched to you+alt@example.com
+```
+
+Nothing is re-fetched to draw that: a switch spends nobody's limits, so the
+readings on screen are as true after it as they were before. Switch again from
+the same table if the first one was wrong — the terminal you leave the picker in
+still gets the record of where you ended up.
+
 `esc` backs out one step at a time. From a question it takes you back to the list;
 from the list it puts the selection away entirely, which leaves `enter` with
 nothing to act on:
@@ -127,8 +144,10 @@ ccs ls                  # the same table, printed and gone
 ccs status              # just the account in use, in detail
 ```
 
-`ccs use` switches straight away. It only stops to ask when the account you are
-switching to has a limit already at 100%, and `--force` skips even that.
+`ccs use` switches straight away and is the one that leaves you at your prompt;
+the picker is where you switch and then keep looking. It only stops to ask when
+the account you are switching to has a limit already at 100%, and `--force` skips
+even that.
 
 ## Pinning a session to one account
 
@@ -142,7 +161,9 @@ ccs pin work                # skip the picker
 ccs pin work -- --continue  # anything after `--` is handed to Claude Code
 ```
 
-It picks an account the same way `ccs` does, then starts Claude Code on it. That
+It picks an account the same way `ccs` does, then starts Claude Code on it —
+which is the one thing the picker cannot stay up for, because the session takes
+the terminal. That
 session is the only thing that moves. Every other session stays on the account in
 use, and a later `ccs use` leaves the pinned one exactly where it is. Nothing
 displays the account on its own. `ccs status` inside the session names it, and

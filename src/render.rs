@@ -129,6 +129,18 @@ impl Table {
         &self.entries
     }
 
+    /// Move the active marker onto `slug`.
+    ///
+    /// This is the whole of what installing an account changes about a table
+    /// already on screen: which one the live credentials belong to. No limit
+    /// moves because a switch spends nothing, so a re-poll would cost a request
+    /// per account to redraw the same numbers.
+    pub fn mark_active(&mut self, slug: &str) {
+        for entry in &mut self.entries {
+            entry.active = entry.slug == slug;
+        }
+    }
+
     pub fn header(&self) -> String {
         let cells = self
             .columns
@@ -163,8 +175,13 @@ impl Table {
             _ => head,
         };
 
+        // Which account the live credentials belong to is known whether or not
+        // its limits could be read, and it is the one thing on the row worth
+        // knowing when they could not.
+        let suffix = if entry.active { self.style.bold("  <- active") } else { String::new() };
+
         if let Err(error) = &entry.limits {
-            return format!("{head}  {}", self.style.health(error, Health::Critical));
+            return format!("{head}  {}{suffix}", self.style.health(error, Health::Critical));
         }
 
         let cells = self
@@ -173,7 +190,6 @@ impl Table {
             .map(|column| self.cell(entry, column))
             .collect::<Vec<_>>()
             .join("  ");
-        let suffix = if entry.active { self.style.bold("  <- active") } else { String::new() };
         format!("{head}  {cells}{suffix}")
     }
 
@@ -417,6 +433,20 @@ mod tests {
     }
 
     #[test]
+    fn a_row_that_could_not_be_read_still_says_it_is_the_account_in_use() {
+        let broken = Entry {
+            slug: "a".into(),
+            email: "a@x.com".into(),
+            plan: "?".into(),
+            active: true,
+            limits: Err("token rejected".into()),
+        };
+        let row = Table::build(vec![broken], plain()).row(0);
+        assert!(row.contains("token rejected"), "{row}");
+        assert!(row.contains("<- active"), "{row}");
+    }
+
+    #[test]
     fn a_row_marks_the_active_account_and_dashes_limits_it_lacks() {
         let mut active = entry("a@x.com", vec![limit!("session", 3.0)]);
         active.active = true;
@@ -499,5 +529,38 @@ mod tests {
     #[test]
     fn an_unparseable_reset_is_dropped_rather_than_guessed() {
         assert_eq!(until("not a timestamp"), None);
+    }
+
+    #[test]
+    fn the_active_marker_follows_the_account_that_was_installed() {
+        let mut table = Table::build(
+            vec![entry("a@x.com", vec![limit!("session", 3.0)]), entry("b@x.com", vec![])],
+            plain(),
+        );
+        table.mark_active("b_at_x.com");
+
+        assert!(!table.row(0).contains("<- active"), "{}", table.row(0));
+        assert!(table.row(1).contains("<- active"), "{}", table.row(1));
+    }
+
+    #[test]
+    fn marking_one_account_active_takes_the_marker_off_every_other() {
+        let mut first = entry("a@x.com", vec![limit!("session", 3.0)]);
+        first.active = true;
+        let mut table = Table::build(vec![first, entry("b@x.com", vec![])], plain());
+        table.mark_active("b_at_x.com");
+
+        assert!(!table.row(0).contains("<- active"), "{}", table.row(0));
+        assert!(table.row(1).contains("<- active"), "{}", table.row(1));
+    }
+
+    #[test]
+    fn marking_an_account_the_table_does_not_hold_leaves_it_unmarked() {
+        let mut active = entry("a@x.com", vec![limit!("session", 3.0)]);
+        active.active = true;
+        let mut table = Table::build(vec![active], plain());
+        table.mark_active("nobody");
+
+        assert!(!table.row(0).contains("<- active"), "{}", table.row(0));
     }
 }

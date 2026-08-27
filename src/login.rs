@@ -134,6 +134,8 @@ mod tests {
     #[test]
     fn unrelated_neighbours_are_left_alone() {
         assert!(!abandoned("accounts"));
+        assert!(!abandoned("pens"));
+        assert!(!abandoned("usage"));
         assert!(!abandoned("state.json"));
     }
 

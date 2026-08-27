@@ -10,6 +10,7 @@ mod pen;
 mod picker;
 mod render;
 mod stash;
+mod usage;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -49,8 +50,9 @@ fn run() -> Result<()> {
 
     let creds = FileStore::new(&config_dir);
     let stash = Stash::open(&home.config)?;
+    let usage = usage::Cache::open(stash.root())?;
     let api = Api::new();
-    let ctx = cmd::Ctx { creds: &creds, stash: &stash, api: &api, home: &home };
+    let ctx = cmd::Ctx { creds: &creds, stash: &stash, usage: &usage, api: &api, home: &home };
 
     match command {
         Cmd::Pick => cmd::pick(&ctx),

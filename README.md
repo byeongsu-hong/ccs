@@ -205,6 +205,31 @@ for `/status`, one request per stashed account. The columns are built from whate
 the API reports rather than from a fixed list, so a newly scoped model turns up as
 its own column without a change here.
 
+**Leaving the reading behind.** Every poll is written down on the way past, one
+file per account under `ccs/usage/`, stamped with when it was taken. Nothing in
+`ccs` reads them back — they are there for anything that has to show where an
+account stands far more often than a poll can be afforded, a status line above a
+prompt being the case they exist for. The limits are stored exactly as the
+endpoint reported them, so a reader draws whatever windows it finds rather than
+knowing a list of them. A failed poll leaves the last reading standing instead of
+blanking it, and the stamp is what says whether it is still worth believing;
+`ccs status` is the cheapest way to freshen one, costing the account in use a
+single round trip. A reading looks like this, and nothing but the endpoint decides
+how many limits are in it:
+
+```json
+{
+  "polled_at": "2026-08-28T02:31:04Z",
+  "limits": [
+    { "kind": "weekly_all", "percent": 55.0, "severity": "normal",
+      "resets_at": "2026-09-01T14:00:00Z", "scope": null },
+    { "kind": "weekly_scoped", "percent": 100.0, "severity": "critical",
+      "resets_at": "2026-09-01T14:00:00Z",
+      "scope": { "model": { "display_name": "Fable" } } }
+  ]
+}
+```
+
 **Polling.** The picker polls with the screen already up — on open, on `r`, and
 every ten minutes on its own — so the list is never taken away to fetch. An
 unattended poll waits for a lull rather than freezing the list under you, the
@@ -232,7 +257,9 @@ painted, so only the percentages are as old as the footer says.
 error rather than a guess.
 
 `-f`/`--force` switches even into an account with nothing left. `--json` on `ls`
-and `status` gives you the same data for scripts and status lines.
+and `status` gives you the same data for scripts. A status line wants the cache
+under `ccs/usage/` instead — it repaints far more often than a poll can be
+afforded.
 
 ## Limits
 
@@ -258,6 +285,7 @@ account did.
 ~/.claude/.credentials.json     the live account, as Claude Code reads it
 ~/.claude/ccs/accounts/*.json   one stashed account each, mode 0600
 ~/.claude/ccs/pens/<account>/   one pinned session's configuration each
+~/.claude/ccs/usage/*.json      what each account last had left, and when
 ~/.claude/ccs/state.json        which slug is currently installed
 ~/.claude/ccs/.login-<pid>/     a login in progress, destroyed when it ends
 ```

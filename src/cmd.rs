@@ -18,7 +18,7 @@ use crate::lock;
 use crate::login;
 use crate::model::{Account, CredsFile, Limit, Oauth, Stashed, plan_label};
 use crate::pen;
-use crate::picker::{self, Outcome};
+use crate::picker::{self, Act, Outcome};
 use crate::render::{self, Entry, Style, Table, Verb};
 use crate::stash::{self, Stash};
 use crate::usage;
@@ -398,13 +398,16 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     // carries the tokens that refresh superseded.
     let target = stash::resolve(&accounts, &slug)?.clone();
     guard_exhausted(&entry_of(&target, &probe, false), force)?;
-    switch_to(ctx, &accounts, &target)
+    switch_to(ctx, &mut accounts, &target)?;
+    report_switch(&target);
+    Ok(())
 }
 
 pub fn pick(ctx: &Ctx) -> Result<()> {
     let mut accounts = stashed(ctx)?;
-    let Some(target) = choose(ctx, &mut accounts, Verb::Switch)? else { return Ok(()) };
-    switch_to(ctx, &accounts, &target)
+    // Switching is done from inside the picker, which stays up for it, so
+    // nothing is left over here to act on.
+    choose(ctx, &mut accounts, Verb::Switch).map(|_| ())
 }
 
 /// Confine a session to one account: install that account's credentials in its
@@ -448,12 +451,16 @@ fn pen_for(ctx: &Ctx, target: &Stashed, live: Option<&str>) -> Result<PathBuf> {
     Ok(pen)
 }
 
-/// Say so when the environment answers for the credentials, because it decides
-/// the account whatever any credentials file holds — the live one and a pen's
-/// alike.
+/// The environment variables answering for the credentials right now. Set, they
+/// decide the account whatever any credentials file holds — the live one and a
+/// pen's alike, which makes them worth saying wherever a switch is reported.
+fn overriding() -> Vec<&'static str> {
+    creds::OVERRIDING.iter().copied().filter(|k| std::env::var_os(k).is_some()).collect()
+}
+
+/// Say so when the environment answers for the credentials.
 fn warn_overridden() {
-    let set: Vec<&str> =
-        creds::OVERRIDING.iter().copied().filter(|k| std::env::var_os(k).is_some()).collect();
+    let set = overriding();
     if set.is_empty() {
         return;
     }
@@ -464,12 +471,67 @@ fn warn_overridden() {
     );
 }
 
-/// Put the accounts on screen and wait for one to be picked. The picker owns
-/// the whole screen while it is up, so it is always drawn in colour.
+/// The stash as the picker sees it: something to poll, and something to act on.
+///
+/// One collaborator rather than two closures because both halves reach the same
+/// accounts, and only one of them can borrow them at a time.
+struct Deck<'a, 'b> {
+    ctx: &'a Ctx<'b>,
+    accounts: &'a mut [Stashed],
+    verb: Verb,
+    /// The account most recently installed from inside the picker, so the
+    /// terminal the picker was left in still says what happened in it.
+    switched: Option<Stashed>,
+}
+
+impl picker::Accounts for Deck<'_, '_> {
+    fn poll(&mut self) -> Result<Table> {
+        survey(self.ctx, self.accounts, Style::colored()).map(|(table, _)| table)
+    }
+
+    /// A launch is handed back because it takes the process itself; a switch is
+    /// done here and now, leaving the picker up.
+    ///
+    /// The copies are brought into step first, exactly as `ccs use` does. A
+    /// picker that stays up can switch twice, and between the two the account it
+    /// left may have had its live tokens refreshed underneath it by the sessions
+    /// that followed the first switch.
+    fn act(&mut self, slug: &str) -> Result<Act> {
+        if matches!(self.verb, Verb::Launch) {
+            return Ok(Act::Handed);
+        }
+        let live = identify_live(self.ctx, self.accounts)?;
+        reconcile(self.ctx, self.accounts, live.as_deref())?;
+
+        let target = stash::resolve(self.accounts, slug)?.clone();
+        switch_to(self.ctx, self.accounts, &target)?;
+
+        let said = match overriding().as_slice() {
+            [] => format!("switched to {}", target.account.email),
+            set => {
+                format!("switched to {}, but {} overrides it", target.account.email, set.join(", "))
+            }
+        };
+        self.switched = Some(target);
+        Ok(Act::Installed(said))
+    }
+}
+
+/// Put the accounts on screen and wait. A switch happens inside the picker,
+/// which stays up for it; only an act the picker cannot survive comes back, so
+/// what this returns is the account a launch still has to be given. The picker
+/// owns the whole screen while it is up, so it is always drawn in colour.
 fn choose(ctx: &Ctx, accounts: &mut [Stashed], verb: Verb) -> Result<Option<Stashed>> {
-    let outcome =
-        picker::run(|| survey(ctx, accounts, Style::colored()).map(|(table, _)| table), verb)?;
-    let Outcome::Chose(slug) = outcome else { return Ok(None) };
+    let mut deck = Deck { ctx, accounts, verb, switched: None };
+    let outcome = picker::run(&mut deck, verb);
+    let switched = deck.switched.take();
+
+    // Reported after the screen is down, and whether or not the picker itself
+    // came back cleanly: the switch already happened on disk either way.
+    if let Some(target) = &switched {
+        report_switch(target);
+    }
+    let Outcome::Chose(slug) = outcome? else { return Ok(None) };
     Ok(accounts.iter().find(|a| a.slug == slug).cloned())
 }
 
@@ -514,18 +576,23 @@ fn identify_live(ctx: &Ctx, accounts: &[Stashed]) -> Result<Option<String>> {
 /// Code refreshes tokens in place, so the stashed copy goes stale the moment an
 /// account is used. Capturing it on the way out is what keeps a stashed account
 /// usable without a fresh login.
-fn switch_to(ctx: &Ctx, accounts: &[Stashed], target: &Stashed) -> Result<()> {
+fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<()> {
     let _guard = lock::acquire(guarded(ctx.creds)?)?;
     let live = ctx.creds.read()?;
     if let Some(live) = &live {
         capture_outgoing(ctx, accounts, live, &target.slug)?;
     }
     ctx.creds.write(&merged(live, &target.account.oauth))?;
-    ctx.stash.set_active(&target.slug)?;
+    ctx.stash.set_active(&target.slug)
+}
+
+/// What a switch leaves behind in the terminal it happened in. The picker says
+/// its own piece in the footer while it is up; this is the record that outlives
+/// the screen.
+fn report_switch(target: &Stashed) {
     println!("switched to {} ({})", target.account.email, target.slug);
     println!("running sessions pick this up on their next request");
     warn_overridden();
-    Ok(())
 }
 
 /// Fold the outgoing account's live credentials into its stash entry.
@@ -535,9 +602,13 @@ fn switch_to(ctx: &Ctx, accounts: &[Stashed], target: &Stashed) -> Result<()> {
 /// about to be replaced is the only one that can have moved since. It is also
 /// the only write this can do — the caller holds the credential lock, which
 /// installing anything would try to take again.
+///
+/// The entry in hand is moved onto those credentials too. Leaving it behind
+/// would leave the caller holding a token the file it just wrote has superseded,
+/// which is the whole failure this exists to prevent.
 fn capture_outgoing(
     ctx: &Ctx,
-    accounts: &[Stashed],
+    accounts: &mut [Stashed],
     live: &CredsFile,
     incoming: &str,
 ) -> Result<()> {
@@ -545,8 +616,9 @@ fn capture_outgoing(
     if slug == incoming {
         return Ok(());
     }
-    let Some(entry) = accounts.iter().find(|a| a.slug == slug) else { return Ok(()) };
-    ctx.stash.save(&slug, &Account { oauth: live.oauth.clone(), ..entry.account.clone() })
+    let Some(entry) = accounts.iter_mut().find(|a| a.slug == slug) else { return Ok(()) };
+    entry.account.oauth = live.oauth.clone();
+    ctx.stash.save(&slug, &entry.account)
 }
 
 /// Refuse to walk into an account with nothing left, unless told to.
@@ -624,6 +696,7 @@ fn describe(error: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::limit;
+    use crate::picker::Accounts as _;
     use std::cell::RefCell;
     use std::fs;
 
@@ -844,6 +917,70 @@ mod tests {
         assert!(
             fixture.creds.read().expect("read").is_none(),
             "nothing to install, so nothing was"
+        );
+    }
+
+    /// The picker's view of a stash, wired the way `choose` wires it.
+    fn deck<'a, 'b>(ctx: &'a Ctx<'b>, accounts: &'a mut [Stashed], verb: Verb) -> Deck<'a, 'b> {
+        Deck { ctx, accounts, verb, switched: None }
+    }
+
+    fn stash_all(fixture: &Fixture, accounts: &[Stashed]) {
+        for entry in accounts {
+            fixture.stash.save(&entry.slug, &entry.account).expect("stash");
+        }
+    }
+
+    #[test]
+    fn a_switch_is_made_from_inside_the_picker_rather_than_handed_back() {
+        let fixture = Fixture::new("installed");
+        let mut accounts = vec![stashed("a", oauth("a1", 1)), stashed("b", oauth("b1", 1))];
+        stash_all(&fixture, &accounts);
+
+        let ctx = fixture.ctx();
+        let mut deck = deck(&ctx, &mut accounts, Verb::Switch);
+        let Act::Installed(said) = deck.act("b").expect("switches") else {
+            panic!("a switch should leave the picker up")
+        };
+
+        assert!(said.contains("b@example.com"), "{said}");
+        assert_eq!(deck.switched.expect("recorded for the terminal").slug, "b");
+        assert_eq!(fixture.tokens("b").1.as_deref(), Some("b1"));
+        assert_eq!(fixture.stash.active().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_launch_leaves_the_picker_and_installs_nothing() {
+        let fixture = Fixture::new("handed");
+        let mut accounts = vec![stashed("a", oauth("a1", 1))];
+        stash_all(&fixture, &accounts);
+
+        let ctx = fixture.ctx();
+        let mut deck = deck(&ctx, &mut accounts, Verb::Launch);
+        assert!(matches!(deck.act("a").expect("hands back"), Act::Handed));
+        assert!(deck.switched.is_none());
+        assert!(fixture.creds.read().expect("read").is_none(), "a launch installs nothing");
+    }
+
+    #[test]
+    fn switching_away_and_back_without_leaving_the_picker_installs_the_live_token() {
+        let fixture = Fixture::new("round-trip");
+        let mut accounts = vec![stashed("a", oauth("a-old", 1)), stashed("b", oauth("b1", 1))];
+        stash_all(&fixture, &accounts);
+        fixture.stash.set_active("a").expect("active");
+        // A session on `a` refreshed the live credentials after the picker last
+        // polled, so what the picker is holding for `a` is already spent.
+        fixture.creds.write(&CredsFile::new(oauth("a-new", 2))).expect("live");
+
+        let ctx = fixture.ctx();
+        let mut deck = deck(&ctx, &mut accounts, Verb::Switch);
+        deck.act("b").expect("switches to b");
+        deck.act("a").expect("switches back to a");
+
+        let installed = fixture.creds.read().expect("read").expect("installed");
+        assert_eq!(
+            installed.oauth.refresh_token, "a-new",
+            "switching twice in one picker put back a token the first switch had superseded"
         );
     }
 

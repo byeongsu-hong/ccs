@@ -1,8 +1,10 @@
 //! Interactive account picker.
 //!
-//! The picker owns the screen for its whole lifetime: refreshing happens
-//! through an injected closure rather than by exiting and being re-entered, so
-//! the list stays up while usage is re-polled.
+//! The picker owns the screen for its whole lifetime: both re-polling and
+//! acting on an account happen through an injected collaborator rather than by
+//! exiting and being re-entered, so the list stays up through either. A switch
+//! is something done *to* the list — the marker moves and the same table is
+//! still there, free to be used again.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -17,11 +19,35 @@ use crate::render::{self, Style, Table, Verb};
 
 /// How the picker was closed.
 pub enum Outcome {
-    /// Act on the account with this slug. Carrying the slug rather than a row
-    /// index keeps the answer meaningful after a refresh has rebuilt the table
-    /// underneath it.
+    /// Left for the caller to act on the account with this slug, which is what
+    /// an act the picker cannot survive comes back as. Carrying the slug rather
+    /// than a row index keeps the answer meaningful after a refresh has rebuilt
+    /// the table underneath it.
     Chose(String),
     Quit,
+}
+
+/// The accounts on screen, and what the picker may do with one.
+///
+/// One collaborator rather than a pair of closures because both halves reach
+/// the same stash, and only one thing may borrow it at a time.
+pub trait Accounts {
+    /// Where every account stands.
+    fn poll(&mut self) -> Result<Table>;
+
+    /// Act on the account named by `slug`, whatever acting means to the caller.
+    fn act(&mut self, slug: &str) -> Result<Act>;
+}
+
+/// What acting on an account leaves the picker doing.
+pub enum Act {
+    /// Done, and the picker stays up with this to say for it. Nothing but the
+    /// active marker moves: installing an account spends nobody's limits, so
+    /// the readings on screen are as true afterwards as they were before.
+    Installed(String),
+    /// The picker is over: the process itself is being handed to the account,
+    /// so there is nothing to come back to.
+    Handed,
 }
 
 /// What the footer is saying, and whether keys mean what they usually mean.
@@ -70,18 +96,19 @@ const IDLE_GRACE: Duration = Duration::from_secs(2);
 /// How long to wait on a key before looking at the clock again.
 const TICK: Duration = Duration::from_millis(200);
 
-/// Show the accounts and let one be chosen. Usage is polled through `refresh`,
-/// with the screen already up — the first load, at a long interval after that,
-/// and any time `r` is pressed — so the list is never taken away to fetch.
+/// Show the accounts and let them be acted on. Usage is polled through
+/// `accounts`, with the screen already up — the first load, at a long interval
+/// after that, and any time `r` is pressed — so the list is never taken away to
+/// fetch.
 ///
 /// `verb` is what choosing will do, which the confirmation and the key list
 /// both have to say plainly: a switch moves every session, a launch moves none.
-pub fn run(mut refresh: impl FnMut() -> Result<Table>, verb: Verb) -> Result<Outcome> {
+pub fn run(accounts: &mut dyn Accounts, verb: Verb) -> Result<Outcome> {
     let _screen = Screen::enter()?;
     let style = Style::colored();
 
     note(style, "polling accounts…")?;
-    let mut table = refresh()?;
+    let mut table = accounts.poll()?;
     if table.entries().is_empty() {
         return Ok(Outcome::Quit);
     }
@@ -117,7 +144,18 @@ pub fn run(mut refresh: impl FnMut() -> Result<Table>, verb: Verb) -> Result<Out
                         let Some(entry) = table.entries().get(target) else {
                             return Ok(Outcome::Quit);
                         };
-                        return Ok(Outcome::Chose(entry.slug.clone()));
+                        let slug = entry.slug.clone();
+                        mode = match accounts.act(&slug) {
+                            Ok(Act::Handed) => return Ok(Outcome::Chose(slug)),
+                            Ok(Act::Installed(said)) => {
+                                table.mark_active(&slug);
+                                Mode::Note(said)
+                            }
+                            // The list is still true and still usable, so a
+                            // failure is said and left there rather than thrown
+                            // out through a screen about to be torn down.
+                            Err(e) => Mode::Note(format!("{} failed: {e}", verb.word())),
+                        };
                     }
                     Answer::No => mode = Mode::Browsing,
                     Answer::Ignore => {}
@@ -148,7 +186,7 @@ pub fn run(mut refresh: impl FnMut() -> Result<Table>, verb: Verb) -> Result<Out
             let pending = frame(&table, at, &mode, style, polled, verb);
             paint(&pending)?;
             painted = pending;
-            mode = repoll(&mut refresh, &mut table, &mut at, &mut polled, &mut attempted);
+            mode = repoll(accounts, &mut table, &mut at, &mut polled, &mut attempted);
         }
     }
 }
@@ -165,15 +203,15 @@ fn due(mode: &Mode, since_attempt: Duration, since_key: Duration) -> bool {
 /// `attempted` moves either way so a failing endpoint is retried on the usual
 /// interval rather than on every tick; `polled` only moves on success, because
 /// it is what the footer reports as the age of what is on screen.
-fn repoll<F: FnMut() -> Result<Table>>(
-    refresh: &mut F,
+fn repoll(
+    accounts: &mut dyn Accounts,
     table: &mut Table,
     at: &mut Option<usize>,
     polled: &mut Instant,
     attempted: &mut Instant,
 ) -> Mode {
     *attempted = Instant::now();
-    match refresh() {
+    match accounts.poll() {
         Ok(next) => {
             *at = at.map(|at| at.min(next.len().saturating_sub(1)));
             *table = next;

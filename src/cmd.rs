@@ -21,10 +21,13 @@ use crate::pen;
 use crate::picker::{self, Outcome};
 use crate::render::{self, Entry, Style, Table, Verb};
 use crate::stash::{self, Stash};
+use crate::usage;
 
 pub struct Ctx<'a> {
     pub creds: &'a dyn CredStore,
     pub stash: &'a Stash,
+    /// Where a poll's findings are left for readers that cannot make one.
+    pub usage: &'a usage::Cache,
     pub api: &'a Api,
     /// The real configuration: where the stash lives and what pens are cut
     /// from. The same directory `creds` reads, unless this process is itself
@@ -165,6 +168,19 @@ fn persist(
     Ok(())
 }
 
+/// Write down what each probe found, so something that cannot afford a poll
+/// can still say where an account stands.
+///
+/// A probe that failed leaves the last good reading alone: to a reader, stale
+/// is worth more than absent, and the stamp on it says how stale.
+fn remember(ctx: &Ctx, probes: &[Probe]) -> Result<()> {
+    for probe in probes {
+        let Ok(limits) = &probe.limits else { continue };
+        ctx.usage.record(&probe.slug, limits)?;
+    }
+    Ok(())
+}
+
 /// Which stashed account the live credentials belong to.
 ///
 /// A token match is direct evidence and wins; the recorded pointer is the
@@ -243,18 +259,28 @@ pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
 
     let (file, oauth) = in_use(ctx, "run `claude` and sign in first")?;
     let accounts = ctx.stash.list()?;
-    let slug = identify(ctx, &accounts, Some(&file)).unwrap_or_default();
+    let identified = identify(ctx, &accounts, Some(&file));
 
     let profile = ctx.api.profile(&oauth.access_token)?;
     let limits = ctx.api.usage(&oauth.access_token)?.limits;
+    // An account nothing in the stash answers for has nowhere to be recorded;
+    // the reading is keyed by slug, and there is no slug to key it under.
+    if let Some(slug) = &identified {
+        ctx.usage.record(slug, &limits)?;
+    }
     let organization = profile.organization.as_ref();
     let plan = plan_label(
         organization.and_then(|o| o.rate_limit_tier.as_deref()),
         organization.and_then(|o| o.organization_type.as_deref()),
     );
 
-    let entry =
-        Entry { slug, email: profile.account.email, plan, active: true, limits: Ok(limits) };
+    let entry = Entry {
+        slug: identified.unwrap_or_default(),
+        email: profile.account.email,
+        plan,
+        active: true,
+        limits: Ok(limits),
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&view(&entry))?);
         return Ok(());
@@ -350,6 +376,9 @@ pub fn remove(ctx: &Ctx, needle: &str) -> Result<()> {
     if let Err(e) = pen::discard(ctx.stash.root(), &target.slug) {
         eprintln!("ccs: {}'s pen is still there: {}", target.slug, describe(&e));
     }
+    if let Err(e) = ctx.usage.forget(&target.slug) {
+        eprintln!("ccs: {}'s last usage reading is still there: {}", target.slug, describe(&e));
+    }
     println!("forgot {} ({})", target.account.email, target.slug);
     Ok(())
 }
@@ -362,6 +391,7 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     reconcile(ctx, &mut accounts, live.as_deref())?;
     let probe = probe(ctx.api, stash::resolve(&accounts, &slug)?);
     persist(ctx, &mut accounts, std::slice::from_ref(&probe), live.as_deref())?;
+    remember(ctx, std::slice::from_ref(&probe))?;
 
     // Read after the probe has been folded back in, never before it: the probe
     // may have refreshed this very account, and the copy taken beforehand
@@ -461,6 +491,7 @@ fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, O
     reconcile(ctx, accounts, live.as_deref())?;
     let probes = probe_all(ctx.api, accounts);
     persist(ctx, accounts, &probes, live.as_deref())?;
+    remember(ctx, &probes)?;
 
     let entries = accounts
         .iter()
@@ -592,6 +623,7 @@ fn describe(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limit;
     use std::cell::RefCell;
     use std::fs;
 
@@ -637,6 +669,7 @@ mod tests {
         dir: PathBuf,
         creds: Recorder,
         stash: Stash,
+        usage: usage::Cache,
         api: Api,
         home: pen::Home,
     }
@@ -646,9 +679,11 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("ccs-cmd-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("config directory");
+            let stash = Stash::open(&dir).expect("stash");
             Self {
                 creds: Recorder { path: dir.join(".credentials.json"), held: RefCell::new(None) },
-                stash: Stash::open(&dir).expect("stash"),
+                usage: usage::Cache::open(stash.root()).expect("usage cache"),
+                stash,
                 api: Api::new(),
                 home: pen::Home { config: dir.clone(), global: dir.join(".claude.json") },
                 dir,
@@ -656,7 +691,13 @@ mod tests {
         }
 
         fn ctx(&self) -> Ctx<'_> {
-            Ctx { creds: &self.creds, stash: &self.stash, api: &self.api, home: &self.home }
+            Ctx {
+                creds: &self.creds,
+                stash: &self.stash,
+                usage: &self.usage,
+                api: &self.api,
+                home: &self.home,
+            }
         }
 
         /// Put credentials where a session confined to `slug` would keep them.
@@ -667,6 +708,13 @@ mod tests {
 
         fn pen(&self, slug: &str) -> FileStore {
             FileStore::new(&pen::at(self.stash.root(), slug))
+        }
+
+        /// The usage reading recorded for `slug`, if one was.
+        fn reading(&self, slug: &str) -> Option<usage::Reading> {
+            let raw =
+                fs::read(self.stash.root().join("usage").join(format!("{slug}.json"))).ok()?;
+            Some(serde_json::from_slice(&raw).expect("parses"))
         }
 
         /// The refresh token each copy of `slug` is holding: stash, live, pen.
@@ -797,5 +845,45 @@ mod tests {
             fixture.creds.read().expect("read").is_none(),
             "nothing to install, so nothing was"
         );
+    }
+
+    #[test]
+    fn a_poll_leaves_its_findings_where_something_that_cannot_poll_can_read_them() {
+        let fixture = Fixture::new("recorded");
+        let probe = Probe {
+            slug: "a".into(),
+            refreshed: None,
+            limits: Ok(vec![limit!("weekly_scoped", 61.0, model = "Fable")]),
+        };
+        remember(&fixture.ctx(), std::slice::from_ref(&probe)).expect("records");
+
+        let reading = fixture.reading("a").expect("recorded");
+        assert_eq!(reading.limits[0].model_name(), Some("Fable"));
+        assert_eq!(reading.limits[0].percent, 61.0);
+    }
+
+    #[test]
+    fn a_probe_that_failed_leaves_the_last_good_reading_standing() {
+        let fixture = Fixture::new("kept");
+        let good =
+            Probe { slug: "a".into(), refreshed: None, limits: Ok(vec![limit!("session", 12.0)]) };
+        remember(&fixture.ctx(), std::slice::from_ref(&good)).expect("records");
+
+        let failed =
+            Probe { slug: "a".into(), refreshed: None, limits: Err("token rejected".into()) };
+        remember(&fixture.ctx(), std::slice::from_ref(&failed)).expect("records nothing");
+
+        assert_eq!(fixture.reading("a").expect("still there").limits[0].percent, 12.0);
+    }
+
+    #[test]
+    fn forgetting_an_account_takes_its_usage_reading_with_it() {
+        let fixture = Fixture::new("forgotten");
+        let entry = stashed("gone", oauth("r", 0));
+        fixture.stash.save(&entry.slug, &entry.account).expect("stash");
+        fixture.usage.record("gone", &[limit!("session", 5.0)]).expect("records");
+
+        remove(&fixture.ctx(), "gone").expect("removes");
+        assert!(fixture.reading("gone").is_none());
     }
 }

@@ -26,6 +26,11 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 /// request at the worst moment.
 const FALLBACK_LIFETIME_MS: i64 = 60 * 60 * 1000;
 
+/// The way back from credentials the server will not accept. Logging in through
+/// this tool mints the account afresh on its own, so it is never worth sending
+/// anyone through a `claude` login, which would sign the account in use out.
+const RELOGIN: &str = "`ccs add` logs this account in again without disturbing the one in use";
+
 pub struct Api {
     agent: ureq::Agent,
 }
@@ -34,6 +39,14 @@ impl Default for Api {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The token endpoint's error shape, read to tell credentials that have been
+/// superseded from every other reason a refresh can fail.
+#[derive(Debug, Deserialize)]
+struct TokenError {
+    #[serde(default)]
+    error: String,
 }
 
 /// Tokens as the refresh endpoint returns them.
@@ -91,6 +104,13 @@ impl Api {
         let status = resp.status().as_u16();
         if status != 200 {
             let detail = resp.body_mut().read_to_string().unwrap_or_default();
+            // A refresh token is spent by the refresh that presents it, so the
+            // server rejecting one means a newer refresh has already replaced
+            // it — or the whole account has been signed out. Either way the raw
+            // rejection says nothing anyone can act on.
+            if superseded(&detail) {
+                bail!("these credentials no longer refresh; {RELOGIN}");
+            }
             bail!("token refresh failed ({status}): {}", snippet(&detail));
         }
         resp.body_mut().read_json().context("parsing refresh response")
@@ -108,9 +128,7 @@ impl Api {
 
         let status = resp.status().as_u16();
         if status == 401 {
-            bail!(
-                "token rejected (401); this account needs a fresh `claude /login` then `ccs add`"
-            );
+            bail!("token rejected (401); {RELOGIN}");
         }
         if status != 200 {
             let detail = resp.body_mut().read_to_string().unwrap_or_default();
@@ -129,6 +147,12 @@ pub fn refreshed_oauth(prev: &Oauth, next: &Refreshed) -> Oauth {
         expires_at: now_ms() + next.expires_in.map_or(FALLBACK_LIFETIME_MS, |s| s * 1000),
         ..prev.clone()
     }
+}
+
+/// Whether a rejected refresh is the endpoint saying the token it was handed
+/// has been spent or revoked, rather than anything a retry could get past.
+fn superseded(body: &str) -> bool {
+    serde_json::from_str::<TokenError>(body).is_ok_and(|e| e.error == "invalid_grant")
 }
 
 /// Error bodies are occasionally enormous; one line of it is enough to act on.
@@ -196,6 +220,24 @@ mod tests {
             Refreshed { access_token: "new".into(), refresh_token: None, expires_in: Some(3600) };
         let slack = (refreshed_oauth(&previous(), &next).expires_at - now_ms() - 3_600_000).abs();
         assert!(slack < 5_000, "expiry should track the stated lifetime, off by {slack}ms");
+    }
+
+    #[test]
+    fn a_spent_refresh_token_is_recognised_from_the_rejection() {
+        let body = r#"{"error": "invalid_grant", "error_description": "Refresh token not found"}"#;
+        assert!(superseded(body));
+    }
+
+    #[test]
+    fn another_rejection_is_not_mistaken_for_a_spent_token() {
+        assert!(!superseded(r#"{"error": "invalid_client"}"#));
+    }
+
+    #[test]
+    fn a_rejection_that_is_not_the_endpoints_own_shape_is_left_to_speak_for_itself() {
+        for body in ["", "<html>502 Bad Gateway</html>", "{}"] {
+            assert!(!superseded(body), "{body:?} should not read as a spent token");
+        }
     }
 
     #[test]

@@ -60,9 +60,17 @@ pub fn home_of(config_dir: &Path) -> Option<Home> {
     Some(serde_json::from_slice::<Marker>(&raw).ok()?.home)
 }
 
+/// Where `slug`'s pen is kept, whether or not one has been built there.
+///
+/// Answering this without building anything is what lets the credentials a pen
+/// holds be read by a run that is not launching a session into it.
+pub fn at(root: &Path, slug: &str) -> PathBuf {
+    root.join("pens").join(slug)
+}
+
 /// Build, or bring up to date, the pen belonging to `slug`.
 pub fn prepare(home: &Home, root: &Path, slug: &str) -> Result<PathBuf> {
-    let pen = root.join("pens").join(slug);
+    let pen = at(root, slug);
     fs::create_dir_all(&pen).with_context(|| format!("creating {}", pen.display()))?;
     fs::set_permissions(&pen, Permissions::from_mode(DIR_MODE))
         .with_context(|| format!("securing {}", pen.display()))?;
@@ -77,7 +85,7 @@ pub fn prepare(home: &Home, root: &Path, slug: &str) -> Result<PathBuf> {
 
 /// Take a pen away, along with the credentials it holds.
 pub fn discard(root: &Path, slug: &str) -> Result<()> {
-    let pen = root.join("pens").join(slug);
+    let pen = at(root, slug);
     match pen.exists() {
         true => fs::remove_dir_all(&pen).with_context(|| format!("removing {}", pen.display())),
         false => Ok(()),

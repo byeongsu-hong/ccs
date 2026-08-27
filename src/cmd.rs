@@ -74,13 +74,83 @@ fn freshen(api: &Api, oauth: &Oauth) -> Result<Option<Oauth>> {
     Ok(Some(refreshed_oauth(oauth, &next)))
 }
 
-/// Write back every token a probe refreshed: into the stash, into `accounts`
-/// itself, and into the live credentials when the account is the installed one.
+// ── credential copies ───────────────────────────────────────────────────────
+//
+// One account's credentials are kept in more than one place: its stash entry,
+// the live credentials while it is the installed account, and its pen while a
+// session is confined to it. Claude Code refreshes whichever of them it is
+// pointed at, and a refresh spends the token it presents — so a copy this tool
+// was not the last writer of holds a token the server will not honour again.
+// Keeping an account's copies in step is what stops that being discovered as a
+// failed refresh.
+
+/// Every copy of one account's credentials there is to read.
 ///
-/// Updating `accounts` in place is what stops a later step installing the copy
-/// that was read before the probe. A refresh can rotate the refresh token, and
-/// the superseded one no longer buys anything — handing it to a session costs
-/// that session an interactive re-login.
+/// `installed` is the live credentials, and belongs here only when they are
+/// this account's.
+fn copies(ctx: &Ctx, entry: &Stashed, installed: Option<&CredsFile>) -> Result<Vec<Oauth>> {
+    let pen = FileStore::new(&pen::at(ctx.stash.root(), &entry.slug)).read()?;
+    Ok([
+        Some(entry.account.oauth.clone()),
+        installed.map(|file| file.oauth.clone()),
+        pen.map(|file| file.oauth),
+    ]
+    .into_iter()
+    .flatten()
+    .collect())
+}
+
+/// The most recently minted of some copies of one account's credentials.
+///
+/// A refresh mints an access token that outlives the one it replaces, so the
+/// furthest expiry marks the copy carrying the refresh token the server still
+/// honours; the rest were spent producing it.
+fn newest(copies: impl IntoIterator<Item = Oauth>) -> Option<Oauth> {
+    copies.into_iter().max_by_key(|oauth| oauth.expires_at)
+}
+
+/// Hand `oauth` to every copy of this account's credentials: the stash entry,
+/// `entry` itself, the live credentials when it is the installed account, and
+/// its pen when it has one.
+///
+/// Updating `entry` in place is what stops a later step installing the copy
+/// that was read beforehand. A copy left on a superseded token buys nothing,
+/// and a session holding one is a session that has to log in again.
+fn propagate(ctx: &Ctx, entry: &mut Stashed, oauth: &Oauth, live: Option<&str>) -> Result<()> {
+    entry.account.oauth = oauth.clone();
+    ctx.stash.save(&entry.slug, &entry.account)?;
+
+    if live == Some(entry.slug.as_str()) {
+        install(ctx.creds, oauth)?;
+    }
+    let pen = pen::at(ctx.stash.root(), &entry.slug);
+    if pen.is_dir() {
+        install(&FileStore::new(&pen), oauth)?;
+    }
+    Ok(())
+}
+
+/// Bring every copy of every account onto the newest credentials on disk for
+/// it, before any of them is presented to the server.
+///
+/// This is the standing repair for the copies this tool does not write: a
+/// session refreshing its own credentials leaves every other copy of that
+/// account behind, and nothing says so until one of them is used.
+fn reconcile(ctx: &Ctx, accounts: &mut [Stashed], live: Option<&str>) -> Result<()> {
+    let installed = ctx.creds.read()?;
+    for entry in accounts.iter_mut() {
+        let mine = (live == Some(entry.slug.as_str())).then_some(installed.as_ref()).flatten();
+        let held = copies(ctx, entry, mine)?;
+        let Some(newest) = newest(held.iter().cloned()) else { continue };
+        if held.iter().all(|oauth| oauth.refresh_token == newest.refresh_token) {
+            continue;
+        }
+        propagate(ctx, entry, &newest, live)?;
+    }
+    Ok(())
+}
+
+/// Write back every token a probe refreshed.
 fn persist(
     ctx: &Ctx,
     accounts: &mut [Stashed],
@@ -90,14 +160,7 @@ fn persist(
     for probe in probes {
         let Some(oauth) = &probe.refreshed else { continue };
         let Some(entry) = accounts.iter_mut().find(|a| a.slug == probe.slug) else { continue };
-        entry.account.oauth = oauth.clone();
-        ctx.stash.save(&probe.slug, &entry.account)?;
-
-        // The refresh rotated the token running sessions are holding, so they
-        // cannot be left behind on it.
-        if live == Some(probe.slug.as_str()) {
-            install(ctx.creds, oauth)?;
-        }
+        propagate(ctx, entry, oauth, live)?;
     }
     Ok(())
 }
@@ -296,6 +359,7 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     let slug = stash::resolve(&accounts, needle)?.slug.clone();
 
     let live = identify_live(ctx, &accounts)?;
+    reconcile(ctx, &mut accounts, live.as_deref())?;
     let probe = probe(ctx.api, stash::resolve(&accounts, &slug)?);
     persist(ctx, &mut accounts, std::slice::from_ref(&probe), live.as_deref())?;
 
@@ -320,6 +384,8 @@ pub fn pick(ctx: &Ctx) -> Result<()> {
 /// account in use and a later `ccs use` leaves this one where it is.
 pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
     let mut accounts = stashed(ctx)?;
+    let live = identify_live(ctx, &accounts)?;
+    reconcile(ctx, &mut accounts, live.as_deref())?;
 
     // Named outright, the account is taken at its word and the session starts
     // without a round trip; the picker is where usage is shopped for.
@@ -331,7 +397,7 @@ pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
         }
     };
 
-    let pen = pen_for(ctx, &target)?;
+    let pen = pen_for(ctx, &target, live.as_deref())?;
     warn_overridden();
     println!("{} is pinned to this session only", target.account.email);
     pen::launch(&pen, &claude_binary(), &labelled(args, &target.account.email))
@@ -349,18 +415,17 @@ fn labelled(args: &[String], email: &str) -> Vec<String> {
 }
 
 /// The account's pen, with its freshest credentials in place.
-fn pen_for(ctx: &Ctx, target: &Stashed) -> Result<PathBuf> {
-    let oauth = match freshen(ctx.api, &target.account.oauth)? {
-        Some(oauth) => {
-            let account = Account { oauth: oauth.clone(), ..target.account.clone() };
-            ctx.stash.save(&target.slug, &account)?;
-            oauth
-        }
-        None => target.account.oauth.clone(),
-    };
-
+///
+/// The pen is built before the credentials are settled so that folding them out
+/// finds it, which is what leaves the pen and every other copy of the account on
+/// the one token a refresh here has not spent.
+fn pen_for(ctx: &Ctx, target: &Stashed, live: Option<&str>) -> Result<PathBuf> {
     let pen = pen::prepare(ctx.home, ctx.stash.root(), &target.slug)?;
-    install(&FileStore::new(&pen), &oauth)?;
+
+    let mut entry = target.clone();
+    let oauth =
+        freshen(ctx.api, &entry.account.oauth)?.unwrap_or_else(|| entry.account.oauth.clone());
+    propagate(ctx, &mut entry, &oauth, live)?;
     Ok(pen)
 }
 
@@ -404,6 +469,7 @@ fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
 /// results out as a table.
 fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, Option<String>)> {
     let live = identify_live(ctx, accounts)?;
+    reconcile(ctx, accounts, live.as_deref())?;
     let probes = probe_all(ctx.api, accounts);
     persist(ctx, accounts, &probes, live.as_deref())?;
 
@@ -442,6 +508,13 @@ fn switch_to(ctx: &Ctx, accounts: &[Stashed], target: &Stashed) -> Result<()> {
     Ok(())
 }
 
+/// Fold the outgoing account's live credentials into its stash entry.
+///
+/// The stash is the only copy written here, and that is enough: every copy of
+/// that account was brought into step before the switch began, so the live file
+/// about to be replaced is the only one that can have moved since. It is also
+/// the only write this can do — the caller holds the credential lock, which
+/// installing anything would try to take again.
 fn capture_outgoing(
     ctx: &Ctx,
     accounts: &[Stashed],
@@ -559,14 +632,74 @@ mod tests {
         }
     }
 
-    fn oauth(refresh_token: &str) -> Oauth {
+    /// Credentials identified by their refresh token, expiring when told to.
+    /// The expiry is what orders the copies of one account, so a test that
+    /// cares which copy wins sets it deliberately.
+    fn oauth(refresh_token: &str, expires_at: i64) -> Oauth {
         Oauth {
             access_token: format!("access-{refresh_token}"),
             refresh_token: refresh_token.to_string(),
-            expires_at: 0,
+            expires_at,
             scopes: vec![],
             subscription_type: None,
             extra: serde_json::Map::new(),
+        }
+    }
+
+    /// A configuration directory with a stash in it, private to one test so
+    /// concurrently running tests never share a path.
+    struct Fixture {
+        dir: PathBuf,
+        creds: Recorder,
+        stash: Stash,
+        api: Api,
+        home: pen::Home,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ccs-cmd-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("config directory");
+            Self {
+                creds: Recorder { path: dir.join(".credentials.json"), held: RefCell::new(None) },
+                stash: Stash::open(&dir).expect("stash"),
+                api: Api::new(),
+                home: pen::Home { config: dir.clone(), global: dir.join(".claude.json") },
+                dir,
+            }
+        }
+
+        fn ctx(&self) -> Ctx<'_> {
+            Ctx { creds: &self.creds, stash: &self.stash, api: &self.api, home: &self.home }
+        }
+
+        /// Put credentials where a session confined to `slug` would keep them.
+        fn pin(&self, slug: &str, oauth: &Oauth) {
+            fs::create_dir_all(pen::at(self.stash.root(), slug)).expect("pen");
+            self.pen(slug).write(&CredsFile::new(oauth.clone())).expect("pen credentials");
+        }
+
+        fn pen(&self, slug: &str) -> FileStore {
+            FileStore::new(&pen::at(self.stash.root(), slug))
+        }
+
+        /// The refresh token each copy of `slug` is holding: stash, live, pen.
+        fn tokens(&self, slug: &str) -> (String, Option<String>, Option<String>) {
+            let accounts = self.stash.list().expect("list");
+            let stashed = accounts.iter().find(|s| s.slug == slug).expect("stash entry");
+            let token = |file: Option<CredsFile>| file.map(|f| f.oauth.refresh_token);
+            (
+                stashed.account.oauth.refresh_token.clone(),
+                token(self.creds.read().expect("read live")),
+                token(self.pen(slug).read().expect("read pen")),
+            )
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -585,36 +718,100 @@ mod tests {
     }
 
     /// A rotated refresh token has to reach every copy at once: the stash, the
-    /// live credentials, and the in-memory list the caller goes on to install
-    /// from. A copy left on the superseded token buys nothing, and a session
-    /// handed one is a session that has to log in again.
+    /// live credentials, the pen a session is confined in, and the in-memory
+    /// list the caller goes on to install from. A copy left on the superseded
+    /// token buys nothing, and a session handed one has to log in again.
     #[test]
     fn a_refresh_reaches_every_copy_of_the_account_it_refreshed() {
-        let dir = std::env::temp_dir().join(format!("ccs-cmd-persist-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("config directory");
+        let fixture = Fixture::new("persist");
+        fixture.pin("work", &oauth("superseded", 1));
 
-        let creds = Recorder { path: dir.join(".credentials.json"), held: RefCell::new(None) };
-        let stash = Stash::open(&dir).expect("stash");
-        let api = Api::new();
-        let home = pen::Home { config: dir.clone(), global: dir.join(".claude.json") };
-        let ctx = Ctx { creds: &creds, stash: &stash, api: &api, home: &home };
-
-        let mut accounts = vec![stashed("work", oauth("superseded"))];
+        let mut accounts = vec![stashed("work", oauth("superseded", 1))];
         let probes = vec![Probe {
             slug: "work".into(),
-            refreshed: Some(oauth("rotated")),
+            refreshed: Some(oauth("rotated", 2)),
             limits: Ok(vec![]),
         }];
-        persist(&ctx, &mut accounts, &probes, Some("work")).expect("persist");
+        persist(&fixture.ctx(), &mut accounts, &probes, Some("work")).expect("persist");
 
         assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
-        let live = creds.read().expect("read").expect("credentials were installed");
-        assert_eq!(live.oauth.refresh_token, "rotated", "the live credentials");
-        let saved = stash.list().expect("list");
-        assert_eq!(saved[0].account.oauth.refresh_token, "rotated", "the stash");
+        let (stashed, live, pen) = fixture.tokens("work");
+        assert_eq!(stashed, "rotated", "the stash");
+        assert_eq!(live.as_deref(), Some("rotated"), "the live credentials");
+        assert_eq!(pen.as_deref(), Some("rotated"), "the pen");
+    }
 
-        let _ = fs::remove_dir_all(&dir);
+    #[test]
+    fn the_furthest_expiry_is_the_copy_that_was_minted_last() {
+        let copies = [oauth("spent", 10), oauth("current", 30), oauth("older", 20)];
+        assert_eq!(newest(copies).expect("a copy").refresh_token, "current");
+    }
+
+    #[test]
+    fn newest_of_nothing_is_nothing() {
+        assert!(newest([]).is_none());
+    }
+
+    /// The live session refreshes the credentials this tool installed for it,
+    /// which spends the token the stash is holding. Reading the stash entry
+    /// afterwards is reading a token the server will refuse.
+    #[test]
+    fn credentials_the_live_session_refreshed_are_taken_back_into_the_stash() {
+        let fixture = Fixture::new("live");
+        fixture.creds.write(&CredsFile::new(oauth("rotated", 2))).expect("live credentials");
+
+        let mut accounts = vec![stashed("work", oauth("superseded", 1))];
+        reconcile(&fixture.ctx(), &mut accounts, Some("work")).expect("reconcile");
+
+        assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
+        assert_eq!(fixture.tokens("work").0, "rotated", "the stash");
+    }
+
+    /// Same for a pinned session: it refreshes inside its pen, and nothing else
+    /// hears about it.
+    #[test]
+    fn credentials_a_pinned_session_refreshed_are_taken_back_into_the_stash() {
+        let fixture = Fixture::new("pen");
+        fixture.pin("work", &oauth("rotated", 2));
+        fixture.creds.write(&CredsFile::new(oauth("elsewhere", 5))).expect("live credentials");
+
+        let mut accounts = vec![stashed("work", oauth("superseded", 1))];
+        reconcile(&fixture.ctx(), &mut accounts, Some("other")).expect("reconcile");
+
+        assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
+        let (stashed, live, _) = fixture.tokens("work");
+        assert_eq!(stashed, "rotated", "the stash");
+        assert_eq!(live.as_deref(), Some("elsewhere"), "another account's live credentials");
+    }
+
+    /// The newest copy goes to the laggards whichever copy it is, so an account
+    /// refreshed here while a session was pinned to it leaves no dead pen.
+    #[test]
+    fn the_newest_copy_reaches_the_ones_that_fell_behind() {
+        let fixture = Fixture::new("laggard");
+        fixture.pin("work", &oauth("superseded", 1));
+
+        let mut accounts = vec![stashed("work", oauth("rotated", 2))];
+        reconcile(&fixture.ctx(), &mut accounts, Some("work")).expect("reconcile");
+
+        let (stashed, live, pen) = fixture.tokens("work");
+        assert_eq!(stashed, "rotated", "the stash");
+        assert_eq!(live.as_deref(), Some("rotated"), "the live credentials");
+        assert_eq!(pen.as_deref(), Some("rotated"), "the pen");
+    }
+
+    #[test]
+    fn copies_that_already_agree_are_left_alone() {
+        let fixture = Fixture::new("agree");
+        fixture.pin("work", &oauth("current", 2));
+
+        let mut accounts = vec![stashed("work", oauth("current", 2))];
+        reconcile(&fixture.ctx(), &mut accounts, Some("work")).expect("reconcile");
+
+        assert!(
+            fixture.creds.read().expect("read").is_none(),
+            "nothing to install, so nothing was"
+        );
     }
 
     #[test]

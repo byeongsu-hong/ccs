@@ -144,8 +144,10 @@ ccs pin work -- --continue  # anything after `--` is handed to Claude Code
 
 It picks an account the same way `ccs` does, then starts Claude Code on it. That
 session is the only thing that moves. Every other session stays on the account in
-use, and a later `ccs use` leaves the pinned one exactly where it is. The session
-says which account it is on wherever Claude Code shows a session name.
+use, and a later `ccs use` leaves the pinned one exactly where it is. Nothing
+displays the account on its own. `ccs status` inside the session names it, and
+`CLAUDE_CONFIG_DIR` points at the pen — which is named for the account — so a
+status line can keep the answer in front of you without asking the network.
 
 Run several at once, one terminal each, and you are working three accounts in
 parallel with three separate limit budgets.

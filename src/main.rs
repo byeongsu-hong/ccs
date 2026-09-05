@@ -12,6 +12,7 @@ mod picker;
 mod render;
 mod stash;
 mod usage;
+mod watch;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -66,7 +67,8 @@ fn run() -> Result<()> {
         Cmd::Pin { target, args } => cmd::pin(&ctx, target.as_deref(), &args),
         Cmd::Remove { target } => cmd::remove(&ctx, &target),
         Cmd::Status { json } => cmd::status(&ctx, json),
-        Cmd::Notify { off } => cmd::notify(&ctx, off),
+        Cmd::Notify { off, kinds } => cmd::notify(&ctx, off, &kinds),
+        Cmd::Watch { every, high } => cmd::watch(&ctx, std::time::Duration::from_secs(every), high),
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
     }
 }

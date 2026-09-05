@@ -16,8 +16,14 @@ USAGE
     ccs add --current        stash the account that is logged in right now
     ccs rm <account>         forget a stashed account
     ccs status               limits for the account currently in use
-    ccs notify [off]         from inside a Claude Code session: have every
-                             later switch announced in that session's chat
+    ccs notify [<kind>...]   from inside a Claude Code session: have notices
+                             delivered into that session's chat. Kinds:
+                             switch, session-high, session-reset, weekly-reset;
+                             all of them when none is named. `ccs notify off`
+                             stops them.
+    ccs watch                poll every account and raise session-high,
+                             session-reset and weekly-reset notices; runs
+                             until killed
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
@@ -31,6 +37,8 @@ OPTIONS
         --email <address>    pre-fill the login page (add)
         --console            log in with Console billing, not a subscription (add)
         --sso                force the SSO login flow (add)
+        --every <seconds>    poll interval (watch; default 300)
+        --high <percent>     session percentage that counts as high (watch; default 90)
     -h, --help               this text
     -V, --version            version
 ";
@@ -44,7 +52,8 @@ pub enum Cmd {
     Pin { target: Option<String>, args: Vec<String> },
     Remove { target: String },
     Status { json: bool },
-    Notify { off: bool },
+    Notify { off: bool, kinds: Vec<String> },
+    Watch { every: u64, high: f64 },
     Help,
     Version,
 }
@@ -58,7 +67,28 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "-V" | "--version" | "version" => Ok(Cmd::Version),
         "ls" | "list" => Ok(Cmd::List { json: has(&args[1..], "--json") }),
         "status" | "st" => Ok(Cmd::Status { json: has(&args[1..], "--json") }),
-        "notify" => Ok(Cmd::Notify { off: has(&args[1..], "off") }),
+        "notify" => {
+            let rest = &args[1..];
+            Ok(Cmd::Notify {
+                off: has(rest, "off"),
+                kinds: rest.iter().filter(|a| *a != "off").cloned().collect(),
+            })
+        }
+        "watch" => {
+            let rest = &args[1..];
+            let number = |flag: &str, fallback: f64| -> Result<f64> {
+                match value(rest, flag) {
+                    None => Ok(fallback),
+                    Some(v) => {
+                        v.parse().map_err(|_| anyhow::anyhow!("{flag} wants a number, not {v:?}"))
+                    }
+                }
+            };
+            Ok(Cmd::Watch {
+                every: number("--every", 300.0)? as u64,
+                high: number("--high", 90.0)?,
+            })
+        }
         "use" | "switch" => {
             let rest = &args[1..];
             let Some(target) = positional(rest) else {
@@ -108,7 +138,7 @@ fn value(args: &[String], flag: &str) -> Option<String> {
 }
 
 /// Flags that consume the argument after them.
-const VALUE_FLAGS: [&str; 2] = ["--name", "--email"];
+const VALUE_FLAGS: [&str; 4] = ["--name", "--email", "--every", "--high"];
 
 /// The first argument that is neither a flag nor a flag's value.
 fn positional(args: &[String]) -> Option<String> {

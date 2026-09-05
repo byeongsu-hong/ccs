@@ -30,10 +30,18 @@ out. Going back is another switch, not another login.
 
 **Live sessions.** A switch reaches sessions that are already running, mid-task,
 without a restart. That is the difference between "I'll switch accounts" being a
-two-second decision and being a five-minute interruption. A session that runs
-`ccs notify` from inside itself is also told, in its own conversation, which
-account it is now on — so the model knows its prompt cache just went cold and
-does not mistake the switch for a network hiccup. `ccs notify off` stops that.
+two-second decision and being a five-minute interruption.
+
+**Notices into a session.** A Claude Code session that runs `ccs notify` from
+inside itself gets told things in its own conversation: `switch` (which account
+it is now on, so the model knows its prompt cache just went cold), and — while
+`ccs watch` is running — `session-high` (the account in use has crossed 90% of
+its five-hour window), `session-reset` (an account's window came back, and
+whether its weekly resets sooner than the active one's) and `weekly-reset`.
+Name the kinds you want, or none for all of them; `ccs notify off` stops them.
+`ccs watch --every 300 --high 90` are the defaults. A session that bypasses
+permission prompts only accepts notices from its own process tree, so run
+`ccs watch` and `ccs use` from inside that session.
 
 **Pinning.** One session on one account, every other session left where it is.
 This is the feature that changes how you work — see below.

@@ -1,9 +1,10 @@
 //! Tell the sessions that asked about a switch, through the inbox each one
 //! listens on.
 //!
-//! A session subscribes with `ccs notify` from inside itself: Claude Code
-//! exports its inbox path as `CLAUDE_CODE_MESSAGING_SOCKET`, and that is what
-//! gets remembered. Every session also publishes `sessions/<pid>.<hash>.key`
+//! A session subscribes with `ccs notify` from inside itself, naming the
+//! kinds of notice it wants (see `watch::KINDS`): Claude Code exports its
+//! inbox path as `CLAUDE_CODE_MESSAGING_SOCKET`, and that is what gets
+//! remembered. Every session also publishes `sessions/<pid>.<hash>.key`
 //! under its configuration directory, holding the token its inbox expects.
 //!
 //! The wire format is Claude Code's own peer messaging: one auth line, one
@@ -12,6 +13,7 @@
 //! prompts holds a notice from a process outside its own tree for review, so
 //! `ccs use` is best run from the session that wants to hear about it.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -23,13 +25,20 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::fsx::write_atomic;
+use crate::watch::KINDS;
 
 const SOCKET_ENV: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
 const FILE: &str = "notify.json";
 const TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Add or drop the calling session from the list a switch reports to.
-pub fn subscribe(root: &Path, on: bool) -> Result<()> {
+type Subscribers = BTreeMap<String, Vec<String>>;
+
+/// Add the calling session to the list, for `kinds` (every kind when empty),
+/// or drop it.
+pub fn subscribe(root: &Path, on: bool, kinds: &[String]) -> Result<()> {
+    if let Some(bad) = kinds.iter().find(|k| !KINDS.contains(&k.as_str())) {
+        bail!("unknown notice kind {bad:?}; the kinds are {}", KINDS.join(", "));
+    }
     let sock = std::env::var(SOCKET_ENV).ok().filter(|s| !s.is_empty()).with_context(|| {
         format!("{SOCKET_ENV} is not set; run this from inside a Claude Code session")
     })?;
@@ -37,37 +46,49 @@ pub fn subscribe(root: &Path, on: bool) -> Result<()> {
         bail!("{sock} does not exist; is this session's inbox up?");
     }
     let mut subs = subscribers(root);
-    subs.retain(|s| s != &sock);
+    subs.remove(&sock);
     if on {
-        subs.push(sock.clone());
+        let kinds =
+            if kinds.is_empty() { KINDS.map(String::from).to_vec() } else { kinds.to_vec() };
+        println!("will notify {sock} of {}", kinds.join(", "));
+        subs.insert(sock, kinds);
+    } else {
+        println!("will no longer notify {sock}");
     }
-    save(root, &subs)?;
-    println!("{} {sock}", if on { "will notify" } else { "will no longer notify" });
-    Ok(())
+    save(root, &subs)
 }
 
-/// Push `text` to every subscriber still reachable. Returns how many took it;
-/// a subscriber whose inbox is gone is forgotten.
-pub fn broadcast(config: &Path, root: &Path, text: &str) -> usize {
-    let subs = subscribers(root);
-    if subs.is_empty() {
+/// Push a `kind` notice reading `text` to every subscriber to that kind still
+/// reachable. Returns how many took it; a subscriber whose inbox is gone is
+/// forgotten.
+pub fn broadcast(config: &Path, root: &Path, kind: &str, text: &str) -> usize {
+    let mut subs = subscribers(root);
+    let wanted: Vec<String> =
+        subs.iter().filter(|(_, k)| k.iter().any(|k| k == kind)).map(|(s, _)| s.clone()).collect();
+    if wanted.is_empty() {
         return 0;
     }
     let sessions = config.join("sessions");
-    let body = format!("<claude-peer-message from-name=\"ccs\">\n{text}\n</claude-peer-message>");
-    let (alive, dead): (Vec<_>, Vec<_>) =
-        subs.into_iter().partition(|sock| send(&sessions, sock, &body).is_some());
-    if !dead.is_empty() {
-        let _ = save(root, &alive);
+    let body = format!(
+        "<claude-peer-message from-name=\"ccs\">\nccs {kind}: {text}\n</claude-peer-message>"
+    );
+    let mut told = 0;
+    for sock in wanted {
+        if send(&sessions, &sock, &body).is_some() {
+            told += 1;
+        } else {
+            subs.remove(&sock);
+            let _ = save(root, &subs);
+        }
     }
-    alive.len()
+    told
 }
 
-fn subscribers(root: &Path) -> Vec<String> {
+fn subscribers(root: &Path) -> Subscribers {
     fs::read(root.join(FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-fn save(root: &Path, subs: &[String]) -> Result<()> {
+fn save(root: &Path, subs: &Subscribers) -> Result<()> {
     write_atomic(&root.join(FILE), &serde_json::to_vec_pretty(subs)?, 0o600)
 }
 

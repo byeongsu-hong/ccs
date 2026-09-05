@@ -7,6 +7,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use jiff::Timestamp;
@@ -23,6 +24,7 @@ use crate::picker::{self, Act, Outcome};
 use crate::render::{self, Entry, Style, Table, Verb};
 use crate::stash::{self, Stash};
 use crate::usage;
+use crate::watch;
 
 pub struct Ctx<'a> {
     pub creds: &'a dyn CredStore,
@@ -404,9 +406,38 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Subscribe (or unsubscribe) the calling Claude Code session to switch notices.
-pub fn notify(ctx: &Ctx, off: bool) -> Result<()> {
-    notify::subscribe(ctx.stash.root(), !off)
+/// Subscribe (or unsubscribe) the calling Claude Code session to notices.
+pub fn notify(ctx: &Ctx, off: bool, kinds: &[String]) -> Result<()> {
+    notify::subscribe(ctx.stash.root(), !off, kinds)
+}
+
+/// Poll every account on an interval and raise a notice for whatever changed.
+/// Runs until killed; each notice is echoed here as well as delivered.
+pub fn watch(ctx: &Ctx, every: Duration, high: f64) -> Result<()> {
+    let mut before = watch::Snapshot::new();
+    loop {
+        let mut accounts = stashed(ctx)?;
+        match survey(ctx, &mut accounts, Style::detect()) {
+            Ok((table, _)) => {
+                for event in watch::diff(&before, table.entries(), high) {
+                    let told = notify::broadcast(
+                        guarded(ctx.creds)?,
+                        ctx.stash.root(),
+                        event.kind,
+                        &event.text,
+                    );
+                    println!("{} {}: {}{}", stamp(), event.kind, event.text, heard(told));
+                }
+                before = watch::snapshot(table.entries());
+            }
+            Err(e) => eprintln!("{} poll failed: {}", stamp(), describe(&e)),
+        }
+        thread::sleep(every);
+    }
+}
+
+fn stamp() -> String {
+    Timestamp::now().strftime("%H:%M:%S").to_string()
 }
 
 pub fn pick(ctx: &Ctx) -> Result<()> {
@@ -594,8 +625,9 @@ fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<us
     let told = notify::broadcast(
         guarded(ctx.creds)?,
         ctx.stash.root(),
+        "switch",
         &format!(
-            "ccs switched this session's account to {} ({}). \
+            "this session's account is now {} ({}). \
              The API prompt cache is per account, so the next request re-prefills everything.",
             target.account.email, target.slug
         ),

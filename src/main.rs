@@ -6,6 +6,7 @@ mod fsx;
 mod lock;
 mod login;
 mod model;
+mod notify;
 mod pen;
 mod picker;
 mod render;

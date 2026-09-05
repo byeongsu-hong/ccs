@@ -9,6 +9,7 @@ mod model;
 mod pen;
 mod picker;
 mod render;
+mod sha256;
 mod stash;
 mod usage;
 
@@ -19,7 +20,7 @@ use anyhow::{Context, Result};
 
 use crate::api::Api;
 use crate::cli::Cmd;
-use crate::creds::FileStore;
+use crate::creds::Backend;
 use crate::stash::Stash;
 
 fn main() -> ExitCode {
@@ -48,11 +49,19 @@ fn run() -> Result<()> {
     let here = pen::Home { config: config_dir.clone(), global: global_config()? };
     let home = pen::home_of(&config_dir).unwrap_or(here);
 
-    let creds = FileStore::new(&config_dir);
+    let backend = Backend::detect();
+    let creds = backend.live(&config_dir);
     let stash = Stash::open(&home.config)?;
     let usage = usage::Cache::open(stash.root())?;
     let api = Api::new();
-    let ctx = cmd::Ctx { creds: &creds, stash: &stash, usage: &usage, api: &api, home: &home };
+    let ctx = cmd::Ctx {
+        creds: creds.as_ref(),
+        backend,
+        stash: &stash,
+        usage: &usage,
+        api: &api,
+        home: &home,
+    };
 
     match command {
         Cmd::Pick => cmd::pick(&ctx),

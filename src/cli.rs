@@ -20,7 +20,9 @@ USAGE
                              delivered into that session's chat. Kinds:
                              switch, session-high, session-reset, weekly-reset;
                              all of them when none is named. `ccs notify off`
-                             stops them.
+                             stops them. A session running with permission
+                             prompts bypassed adds --bypass, or it will hold
+                             every notice for review.
     ccs watch                poll every account and raise session-high,
                              session-reset and weekly-reset notices; runs
                              until killed
@@ -52,7 +54,7 @@ pub enum Cmd {
     Pin { target: Option<String>, args: Vec<String> },
     Remove { target: String },
     Status { json: bool },
-    Notify { off: bool, kinds: Vec<String> },
+    Notify { off: bool, kinds: Vec<String>, bypass: bool },
     Watch { every: u64, high: f64 },
     Help,
     Version,
@@ -71,7 +73,12 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
             let rest = &args[1..];
             Ok(Cmd::Notify {
                 off: has(rest, "off"),
-                kinds: rest.iter().filter(|a| *a != "off").cloned().collect(),
+                kinds: rest
+                    .iter()
+                    .filter(|a| *a != "off" && !a.starts_with("--"))
+                    .cloned()
+                    .collect(),
+                bypass: has(rest, "--bypass"),
             })
         }
         "watch" => {

@@ -43,6 +43,14 @@ Name the kinds you want, or none for all of them; `ccs notify off` stops them.
 permission prompts only accepts notices from its own process tree, so run
 `ccs watch` and `ccs use` from inside that session.
 
+**Rotation.** `ccs watch --rotate agent,work,robin` also switches for you: when
+the account in use is one of those and its session has run high (or its weekly
+is spent), the pooled account whose weekly window resets soonest and still has
+room takes over — quota about to be forfeited is burned first. An account in
+use that is not in the pool was chosen by hand and is never touched. Running
+sessions follow the switch like any other, and hear a `switch` notice if they
+asked.
+
 **Pinning.** One session on one account, every other session left where it is.
 This is the feature that changes how you work — see below.
 

@@ -77,7 +77,9 @@ fn run() -> Result<()> {
         Cmd::Remove { target } => cmd::remove(&ctx, &target),
         Cmd::Status { json } => cmd::status(&ctx, json),
         Cmd::Notify { off, kinds } => cmd::notify(&ctx, off, &kinds),
-        Cmd::Watch { every, high } => cmd::watch(&ctx, std::time::Duration::from_secs(every), high),
+        Cmd::Watch { every, high, rotate } => {
+            cmd::watch(&ctx, std::time::Duration::from_secs(every), high, &rotate)
+        }
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
     }
 }

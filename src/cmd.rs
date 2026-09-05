@@ -423,7 +423,17 @@ pub fn notify(ctx: &Ctx, off: bool, kinds: &[String]) -> Result<()> {
 
 /// Poll every account on an interval and raise a notice for whatever changed.
 /// Runs until killed; each notice is echoed here as well as delivered.
-pub fn watch(ctx: &Ctx, every: Duration, high: f64) -> Result<()> {
+pub fn watch(ctx: &Ctx, every: Duration, high: f64, rotate: &[String]) -> Result<()> {
+    let pool: Vec<String> = {
+        let accounts = stashed(ctx)?;
+        rotate
+            .iter()
+            .map(|n| stash::resolve(&accounts, n).map(|s| s.slug.clone()))
+            .collect::<Result<_>>()?
+    };
+    if !pool.is_empty() {
+        println!("{} rotating between {}", stamp(), pool.join(", "));
+    }
     let mut before = watch::Snapshot::new();
     loop {
         let mut accounts = stashed(ctx)?;
@@ -439,6 +449,21 @@ pub fn watch(ctx: &Ctx, every: Duration, high: f64) -> Result<()> {
                     println!("{} {}: {}{}", stamp(), event.kind, event.text, heard(told));
                 }
                 before = watch::snapshot(table.entries());
+                if let Some(next) = watch::rotate(table.entries(), &pool, high) {
+                    match stash::resolve(&accounts, &next.slug).cloned() {
+                        Ok(target) => match switch_to(ctx, &mut accounts, &target) {
+                            Ok(told) => println!(
+                                "{} rotate: switched to {} ({}){}",
+                                stamp(),
+                                target.account.email,
+                                target.slug,
+                                heard(told)
+                            ),
+                            Err(e) => eprintln!("{} rotate failed: {}", stamp(), describe(&e)),
+                        },
+                        Err(e) => eprintln!("{} rotate failed: {}", stamp(), describe(&e)),
+                    }
+                }
             }
             Err(e) => eprintln!("{} poll failed: {}", stamp(), describe(&e)),
         }

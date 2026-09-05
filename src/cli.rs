@@ -23,7 +23,10 @@ USAGE
                              stops them.
     ccs watch                poll every account and raise session-high,
                              session-reset and weekly-reset notices; runs
-                             until killed
+                             until killed. With --rotate, also switch away
+                             from a pooled account whose session has run
+                             high, to the pooled account whose weekly window
+                             resets soonest and still has room
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
@@ -39,6 +42,7 @@ OPTIONS
         --sso                force the SSO login flow (add)
         --every <seconds>    poll interval (watch; default 300)
         --high <percent>     session percentage that counts as high (watch; default 90)
+        --rotate <a>,<b>,... accounts to rotate between (watch); repeatable
     -h, --help               this text
     -V, --version            version
 ";
@@ -53,7 +57,7 @@ pub enum Cmd {
     Remove { target: String },
     Status { json: bool },
     Notify { off: bool, kinds: Vec<String> },
-    Watch { every: u64, high: f64 },
+    Watch { every: u64, high: f64, rotate: Vec<String> },
     Help,
     Version,
 }
@@ -87,6 +91,10 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
             Ok(Cmd::Watch {
                 every: number("--every", 300.0)? as u64,
                 high: number("--high", 90.0)?,
+                rotate: values(rest, "--rotate")
+                    .flat_map(|v| v.split(',').map(str::trim).map(String::from).collect::<Vec<_>>())
+                    .filter(|v| !v.is_empty())
+                    .collect(),
             })
         }
         "use" | "switch" => {
@@ -137,8 +145,13 @@ fn value(args: &[String], flag: &str) -> Option<String> {
     args.get(at + 1).cloned()
 }
 
+/// Every value following an occurrence of `flag`.
+fn values<'a>(args: &'a [String], flag: &'a str) -> impl Iterator<Item = &'a String> + 'a {
+    args.windows(2).filter(move |w| w[0] == flag).map(|w| &w[1])
+}
+
 /// Flags that consume the argument after them.
-const VALUE_FLAGS: [&str; 4] = ["--name", "--email", "--every", "--high"];
+const VALUE_FLAGS: [&str; 5] = ["--name", "--email", "--every", "--high", "--rotate"];
 
 /// The first argument that is neither a flag nor a flag's value.
 fn positional(args: &[String]) -> Option<String> {
@@ -272,6 +285,18 @@ mod tests {
         };
         assert_eq!(target, None);
         assert_eq!(args, ["resume"]);
+    }
+
+    #[test]
+    fn watch_collects_a_rotation_pool_from_commas_and_repeats() {
+        let Cmd::Watch { rotate, high, .. } =
+            parsed(&["watch", "--rotate", "a, b", "--high", "95", "--rotate", "c"])
+        else {
+            panic!("not a watch")
+        };
+        assert_eq!(rotate, ["a", "b", "c"]);
+        assert_eq!(high, 95.0);
+        assert!(matches!(parsed(&["watch"]), Cmd::Watch { rotate, .. } if rotate.is_empty()));
     }
 
     #[test]

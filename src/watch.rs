@@ -113,6 +113,37 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
     events
 }
 
+/// Which account in `pool` the active one should give way to, if any.
+///
+/// The active account keeps its place while it is in the pool with session
+/// headroom below `high` and weekly headroom at all. Once it has none, the
+/// pool member whose weekly window resets soonest takes over, so quota about
+/// to be forfeited is burned first; ties go to the emptier session. An active
+/// account outside the pool was chosen by hand and is left alone.
+pub fn rotate<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Option<&'a Entry> {
+    let active = entries.iter().find(|e| e.active)?;
+    if !pool.contains(&active.slug) || has_room(active, high) {
+        return None;
+    }
+    entries.iter().filter(|e| !e.active && pool.contains(&e.slug) && has_room(e, high)).min_by(
+        |a, b| {
+            let key = |e: &Entry| {
+                (
+                    limit(e, "weekly_all").and_then(at).unwrap_or(i64::MAX),
+                    limit(e, "session").map(|l| l.percent).unwrap_or(0.0) as i64,
+                )
+            };
+            key(a).cmp(&key(b))
+        },
+    )
+}
+
+fn has_room(e: &Entry, high: f64) -> bool {
+    e.limits.is_ok()
+        && limit(e, "session").is_none_or(|s| s.percent < high)
+        && limit(e, "weekly_all").is_none_or(|w| !w.exhausted())
+}
+
 /// A window came back when the reset it was heading for has passed and the
 /// limit no longer points at it.
 fn came_back(then: Option<i64>, now_at: Option<i64>, now: i64) -> bool {
@@ -211,6 +242,63 @@ mod tests {
         let c = [entry("a", true, (1.0, Some("2026-09-05T19:50:00Z")), Some(W1))];
         let events = diff_at(&snapshot(&a), &c, 90.0, secs("2026-09-05T14:51:00Z"));
         assert_eq!(events.iter().map(|e| e.kind).collect::<Vec<_>>(), ["session-reset"]);
+    }
+
+    fn pool(slugs: &[&str]) -> Vec<String> {
+        slugs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_active_account_with_headroom_keeps_its_place() {
+        let e = [
+            entry("a", true, (50.0, Some(T1)), Some(W1)),
+            entry("b", false, (0.0, None), Some(W0)),
+        ];
+        assert!(rotate(&e, &pool(&["a", "b"]), 90.0).is_none());
+    }
+
+    #[test]
+    fn a_high_session_gives_way_to_the_soonest_weekly_reset_with_room() {
+        let e = [
+            entry("a", true, (95.0, Some(T1)), Some(W1)),
+            entry("b", false, (10.0, Some(T1)), Some("2026-09-07T00:00:00Z")),
+            entry("c", false, (30.0, Some(T1)), Some(W0)),
+            entry("d", false, (0.0, None), Some("2026-09-01T00:00:00Z")),
+        ];
+        // d resets soonest of all but is not in the pool; c beats b on weekly.
+        assert_eq!(rotate(&e, &pool(&["a", "b", "c"]), 90.0).map(|e| e.slug.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn a_pool_member_without_room_is_skipped_and_ties_go_to_the_emptier_session() {
+        let e = [
+            entry("a", true, (95.0, Some(T1)), Some(W1)),
+            entry("b", false, (92.0, Some(T1)), Some(W0)),
+            entry("c", false, (30.0, Some(T1)), Some(W1)),
+            entry("d", false, (10.0, Some(T1)), Some(W1)),
+        ];
+        assert_eq!(
+            rotate(&e, &pool(&["a", "b", "c", "d"]), 90.0).map(|e| e.slug.as_str()),
+            Some("d")
+        );
+    }
+
+    #[test]
+    fn nobody_with_room_means_nobody_to_switch_to() {
+        let e = [
+            entry("a", true, (95.0, Some(T1)), Some(W1)),
+            entry("b", false, (100.0, Some(T1)), Some(W0)),
+        ];
+        assert!(rotate(&e, &pool(&["a", "b"]), 90.0).is_none());
+    }
+
+    #[test]
+    fn an_active_account_outside_the_pool_is_left_alone() {
+        let e = [
+            entry("x", true, (99.0, Some(T1)), Some(W1)),
+            entry("a", false, (0.0, None), Some(W0)),
+        ];
+        assert!(rotate(&e, &pool(&["a"]), 90.0).is_none());
     }
 
     #[test]

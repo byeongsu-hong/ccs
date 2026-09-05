@@ -66,6 +66,7 @@ fn run() -> Result<()> {
         Cmd::Pin { target, args } => cmd::pin(&ctx, target.as_deref(), &args),
         Cmd::Remove { target } => cmd::remove(&ctx, &target),
         Cmd::Status { json } => cmd::status(&ctx, json),
+        Cmd::Notify { off } => cmd::notify(&ctx, off),
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
     }
 }

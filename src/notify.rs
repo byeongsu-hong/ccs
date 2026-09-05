@@ -1,15 +1,16 @@
-//! Tell running Claude Code sessions about a switch, through the inbox each
-//! one listens on.
+//! Tell the sessions that asked about a switch, through the inbox each one
+//! listens on.
 //!
-//! Every session publishes `sessions/<pid>.json` (with its socket path) and
-//! `sessions/<pid>.<hash>.key` (with the token the inbox expects) under the
-//! configuration directory it runs against. Pinned sessions do so inside their
-//! pen, so a switch from outside never reaches them — which is right, since
-//! the switch never reached their credentials either.
+//! A session subscribes with `ccs notify` from inside itself: Claude Code
+//! exports its inbox path as `CLAUDE_CODE_MESSAGING_SOCKET`, and that is what
+//! gets remembered. Every session also publishes `sessions/<pid>.<hash>.key`
+//! under its configuration directory, holding the token its inbox expects.
 //!
 //! The wire format is Claude Code's own peer messaging: one auth line, one
 //! user-message line, done. It is undocumented, so a mismatch after an upgrade
-//! costs only the notice, never the switch.
+//! costs only the notice, never the switch. A session that bypasses permission
+//! prompts holds a notice from a process outside its own tree for review, so
+//! `ccs use` is best run from the session that wants to hear about it.
 
 use std::fs;
 use std::io::Write;
@@ -17,35 +18,65 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::fsx::write_atomic;
+
+const SOCKET_ENV: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
+const FILE: &str = "notify.json";
 const TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Push `text` to every reachable session registered under `config`. Returns
-/// how many took it; a session that is gone or refuses is skipped in silence.
-pub fn broadcast(config: &Path, text: &str) -> usize {
-    let dir = config.join("sessions");
-    let Ok(entries) = fs::read_dir(&dir) else { return 0 };
-    let body = format!("<claude-peer-message from-name=\"ccs\">\n{text}\n</claude-peer-message>");
-    entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            let pid = name.strip_suffix(".json")?;
-            if !pid.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let reg: Value = serde_json::from_slice(&fs::read(e.path()).ok()?).ok()?;
-            let sock = reg.get("messagingSocketPath")?.as_str()?.to_owned();
-            Some((pid.to_owned(), sock))
-        })
-        .filter(|(pid, sock)| send(&dir, pid, sock, &body).is_some())
-        .count()
+/// Add or drop the calling session from the list a switch reports to.
+pub fn subscribe(root: &Path, on: bool) -> Result<()> {
+    let sock = std::env::var(SOCKET_ENV).ok().filter(|s| !s.is_empty()).with_context(|| {
+        format!("{SOCKET_ENV} is not set; run this from inside a Claude Code session")
+    })?;
+    if on && !Path::new(&sock).exists() {
+        bail!("{sock} does not exist; is this session's inbox up?");
+    }
+    let mut subs = subscribers(root);
+    subs.retain(|s| s != &sock);
+    if on {
+        subs.push(sock.clone());
+    }
+    save(root, &subs)?;
+    println!("{} {sock}", if on { "will notify" } else { "will no longer notify" });
+    Ok(())
 }
 
-fn token(dir: &Path, pid: &str) -> Option<String> {
+/// Push `text` to every subscriber still reachable. Returns how many took it;
+/// a subscriber whose inbox is gone is forgotten.
+pub fn broadcast(config: &Path, root: &Path, text: &str) -> usize {
+    let subs = subscribers(root);
+    if subs.is_empty() {
+        return 0;
+    }
+    let sessions = config.join("sessions");
+    let body = format!("<claude-peer-message from-name=\"ccs\">\n{text}\n</claude-peer-message>");
+    let (alive, dead): (Vec<_>, Vec<_>) =
+        subs.into_iter().partition(|sock| send(&sessions, sock, &body).is_some());
+    if !dead.is_empty() {
+        let _ = save(root, &alive);
+    }
+    alive.len()
+}
+
+fn subscribers(root: &Path) -> Vec<String> {
+    fs::read(root.join(FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save(root: &Path, subs: &[String]) -> Result<()> {
+    write_atomic(&root.join(FILE), &serde_json::to_vec_pretty(subs)?, 0o600)
+}
+
+/// The token a session's inbox expects, from the key it published beside its
+/// registration. The key name carries the pid and a hash of the socket path;
+/// the pid alone is enough to pick it out.
+fn token(sessions: &Path, sock: &str) -> Option<String> {
+    let pid = Path::new(sock).file_stem()?.to_str()?;
     let prefix = format!("{pid}.");
-    fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+    fs::read_dir(sessions).ok()?.flatten().find_map(|e| {
         let name = e.file_name().into_string().ok()?;
         if !name.starts_with(&prefix) || !name.ends_with(".key") {
             return None;
@@ -55,8 +86,8 @@ fn token(dir: &Path, pid: &str) -> Option<String> {
     })
 }
 
-fn send(dir: &Path, pid: &str, sock: &str, body: &str) -> Option<()> {
-    let token = token(dir, pid)?;
+fn send(sessions: &Path, sock: &str, body: &str) -> Option<()> {
+    let token = token(sessions, sock)?;
     let mut s = UnixStream::connect(sock).ok()?;
     s.set_write_timeout(Some(TIMEOUT)).ok()?;
     let msg_id = format!("ccs-{}-{}", std::process::id(), crate::model::now_ms());

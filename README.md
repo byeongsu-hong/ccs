@@ -30,10 +30,10 @@ out. Going back is another switch, not another login.
 
 **Live sessions.** A switch reaches sessions that are already running, mid-task,
 without a restart. That is the difference between "I'll switch accounts" being a
-two-second decision and being a five-minute interruption. Each session is also
-told, in its own conversation, which account it is now on — so the model knows
-its prompt cache just went cold and does not mistake the switch for a network
-hiccup.
+two-second decision and being a five-minute interruption. A session that runs
+`ccs notify` from inside itself is also told, in its own conversation, which
+account it is now on — so the model knows its prompt cache just went cold and
+does not mistake the switch for a network hiccup. `ccs notify off` stops that.
 
 **Pinning.** One session on one account, every other session left where it is.
 This is the feature that changes how you work — see below.

@@ -404,6 +404,11 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Subscribe (or unsubscribe) the calling Claude Code session to switch notices.
+pub fn notify(ctx: &Ctx, off: bool) -> Result<()> {
+    notify::subscribe(ctx.stash.root(), !off)
+}
+
 pub fn pick(ctx: &Ctx) -> Result<()> {
     let mut accounts = stashed(ctx)?;
     // Switching is done from inside the picker, which stays up for it, so
@@ -508,7 +513,7 @@ impl picker::Accounts for Deck<'_, '_> {
         let told = switch_to(self.ctx, self.accounts, &target)?;
 
         let said = match overriding().as_slice() {
-            [] => format!("switched to {}, {}", target.account.email, heard(told)),
+            [] => format!("switched to {}{}", target.account.email, heard(told)),
             set => {
                 format!("switched to {}, but {} overrides it", target.account.email, set.join(", "))
             }
@@ -588,6 +593,7 @@ fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<us
     drop(_guard);
     let told = notify::broadcast(
         guarded(ctx.creds)?,
+        ctx.stash.root(),
         &format!(
             "ccs switched this session's account to {} ({}). \
              The API prompt cache is per account, so the next request re-prefills everything.",
@@ -602,15 +608,16 @@ fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<us
 /// the screen.
 fn report_switch(target: &Stashed, told: usize) {
     println!("switched to {} ({})", target.account.email, target.slug);
-    println!("{}; they pick it up on their next request", heard(told));
+    println!("running sessions pick this up on their next request{}", heard(told));
     warn_overridden();
 }
 
+/// How many subscribed sessions heard about it, for the tail of a report.
 fn heard(told: usize) -> String {
     match told {
-        0 => "no running session was reachable".into(),
-        1 => "told 1 running session".into(),
-        n => format!("told {n} running sessions"),
+        0 => String::new(),
+        1 => "; told 1 subscribed session".into(),
+        n => format!("; told {n} subscribed sessions"),
     }
 }
 

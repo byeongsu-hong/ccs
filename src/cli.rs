@@ -16,6 +16,8 @@ USAGE
     ccs add --current        stash the account that is logged in right now
     ccs rm <account>         forget a stashed account
     ccs status               limits for the account currently in use
+    ccs notify [off]         from inside a Claude Code session: have every
+                             later switch announced in that session's chat
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
@@ -42,6 +44,7 @@ pub enum Cmd {
     Pin { target: Option<String>, args: Vec<String> },
     Remove { target: String },
     Status { json: bool },
+    Notify { off: bool },
     Help,
     Version,
 }
@@ -55,6 +58,7 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "-V" | "--version" | "version" => Ok(Cmd::Version),
         "ls" | "list" => Ok(Cmd::List { json: has(&args[1..], "--json") }),
         "status" | "st" => Ok(Cmd::Status { json: has(&args[1..], "--json") }),
+        "notify" => Ok(Cmd::Notify { off: has(&args[1..], "off") }),
         "use" | "switch" => {
             let rest = &args[1..];
             let Some(target) = positional(rest) else {

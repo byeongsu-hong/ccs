@@ -218,6 +218,19 @@ renames it into place, so a reader sees either the old file or the new one and
 never a half-written one — and the rename freshens the mtime that running sessions
 are watching. That is the whole trick. There is no daemon and no IPC.
 
+**On macOS, where the credentials are not a file.** Claude Code keeps them in the
+login keychain there, reads that in preference to the file, and writes the file
+only when the keychain turns it away — so a switch written to the file would be a
+switch nothing reads. `ccs` writes the item instead, under the name Claude Code
+gives it: `Claude Code-credentials`, keyed to your login name. A session with no
+credentials file to watch compares the token in the keychain instead, so a switch
+reaches running sessions the same way it does anywhere else.
+
+The item is namespaced by configuration directory — `CLAUDE_CONFIG_DIR` decides
+which — which is what gives every pen credentials of its own, and what keeps a
+pinned session pinned. `ccs rm` takes an account's item away with its pen, and an
+interrupted `ccs add` leaves none behind.
+
 **Not fighting over the file.** Claude Code takes a lock beside the credentials
 file when it refreshes tokens. `ccs` takes the same lock, so a switch can't
 interleave with a refresh and lose one of the two writes.
@@ -315,6 +328,7 @@ account did.
 
 ```
 ~/.claude/.credentials.json     the live account, as Claude Code reads it
+                                — on macOS, the login keychain instead
 ~/.claude/ccs/accounts/*.json   one stashed account each, mode 0600
 ~/.claude/ccs/pens/<account>/   one pinned session's configuration each
 ~/.claude/ccs/usage/*.json      what each account last had left, and when
@@ -324,7 +338,14 @@ account did.
 
 **Those account files hold OAuth refresh tokens.** They are written `0600` inside a
 `0700` directory, and each one is worth exactly as much as a password. Don't sync
-them anywhere you wouldn't sync a password.
+them anywhere you wouldn't sync a password. That is as true on macOS, where the
+stash is these same files: the keychain holds the account in use and a pinned
+session's, and the stash behind them is on disk either way.
+
+A keychain item `ccs` creates for a pen is opened to the applications you run, the
+way the plain file already is to the processes you run — otherwise a pinned session
+would start by asking you to unlock something. The item Claude Code made for the
+account in use is updated in place and keeps the access it came with.
 
 A login directory left behind by an interrupted run is swept on the next `ccs add`.
 Each is named after the process that owns it, so a run still in flight is never
@@ -333,11 +354,13 @@ swept out from under itself.
 ## Environment
 
 `CLAUDE_CONFIG_DIR` is honoured the same way Claude Code honours it, which is what
-lets `ccs` work correctly from inside a pinned session. `CCS_CLAUDE_BINARY` points
-at a `claude` that isn't on `PATH`. `NO_COLOR` does what you expect.
+lets `ccs` work correctly from inside a pinned session, and on macOS what names the
+keychain item a session reads. `CLAUDE_SECURESTORAGE_CONFIG_DIR` is honoured there
+too, for the same reason. `CCS_CLAUDE_BINARY` points at a `claude` that isn't on
+`PATH`. `NO_COLOR` does what you expect.
 
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` take
-precedence over the credentials file for any session that inherits them — so a
+precedence over the stored credentials for any session that inherits them — so a
 session with one of those set ignores whatever account you switched to. `ccs` says
 so rather than letting you wonder.
 

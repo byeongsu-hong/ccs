@@ -5,7 +5,7 @@
 //! command stays testable against substitutes.
 
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::{Api, refreshed_oauth};
-use crate::creds::{self, CredStore, FileStore};
+use crate::creds::{self, Backend, CredStore};
 use crate::lock;
 use crate::login;
 use crate::model::{Account, CredsFile, Limit, Oauth, Stashed, plan_label};
@@ -28,6 +28,9 @@ use crate::watch;
 
 pub struct Ctx<'a> {
     pub creds: &'a dyn CredStore,
+    /// Where credentials are kept on this machine, for the stores this reaches
+    /// for itself: a pen's, and the one a login is captured from.
+    pub backend: Backend,
     pub stash: &'a Stash,
     /// Where a poll's findings are left for readers that cannot make one.
     pub usage: &'a usage::Cache,
@@ -95,7 +98,14 @@ fn freshen(api: &Api, oauth: &Oauth) -> Result<Option<Oauth>> {
 /// `installed` is the live credentials, and belongs here only when they are
 /// this account's.
 fn copies(ctx: &Ctx, entry: &Stashed, installed: Option<&CredsFile>) -> Result<Vec<Oauth>> {
-    let pen = FileStore::new(&pen::at(ctx.stash.root(), &entry.slug)).read()?;
+    // Only where there is a pen to read: a pen that was never built holds no
+    // copy, and asking after one costs a keychain lookup on the machines that
+    // keep credentials there.
+    let pen_dir = pen::at(ctx.stash.root(), &entry.slug);
+    let pen = match pen_dir.is_dir() {
+        true => ctx.backend.confined(&pen_dir).read()?,
+        false => None,
+    };
     Ok([
         Some(entry.account.oauth.clone()),
         installed.map(|file| file.oauth.clone()),
@@ -131,7 +141,7 @@ fn propagate(ctx: &Ctx, entry: &mut Stashed, oauth: &Oauth, live: Option<&str>) 
     }
     let pen = pen::at(ctx.stash.root(), &entry.slug);
     if pen.is_dir() {
-        install(&FileStore::new(&pen), oauth)?;
+        install(ctx.backend.confined(&pen).as_ref(), oauth)?;
     }
     Ok(())
 }
@@ -210,15 +220,10 @@ fn merged(current: Option<CredsFile>, oauth: &Oauth) -> CredsFile {
     }
 }
 
-/// The directory whose lock guards writes to a store's credentials, which is
-/// the one it keeps them in.
-fn guarded(store: &dyn CredStore) -> Result<&Path> {
-    store.path().parent().context("credentials path has no directory")
-}
-
-/// Install `oauth` into a credential store, under that lock.
+/// Install `oauth` into a credential store, under the lock that guards the
+/// configuration directory it answers for.
 fn install(store: &dyn CredStore, oauth: &Oauth) -> Result<()> {
-    let _guard = lock::acquire(guarded(store)?)?;
+    let _guard = lock::acquire(store.dir())?;
     let current = store.read()?;
     store.write(&merged(current, oauth))
 }
@@ -231,7 +236,7 @@ fn install(store: &dyn CredStore, oauth: &Oauth) -> Result<()> {
 /// holding, so it is mirrored back to them before anything else happens.
 fn in_use(ctx: &Ctx, hint: &str) -> Result<(CredsFile, Oauth)> {
     let Some(file) = ctx.creds.read()? else {
-        bail!("no credentials at {}; {hint}", ctx.creds.path().display());
+        bail!("no credentials in {}; {hint}", ctx.creds.describe());
     };
     let Some(oauth) = freshen(ctx.api, &file.oauth)? else {
         let oauth = file.oauth.clone();
@@ -302,7 +307,7 @@ pub fn add(ctx: &Ctx, name: Option<&str>, current: bool, options: &login::Option
         true => in_use(ctx, "sign in with `claude` before `ccs add --current`")?.1,
         false => {
             println!("logging in to another account; the one in use is not affected");
-            login::run(ctx.stash.root(), &claude_binary(), options)?
+            login::run(ctx.backend, ctx.stash.root(), &claude_binary(), options)?
         }
     };
     let recorded = record(ctx, oauth, name, Installed::from(current))?;
@@ -379,6 +384,11 @@ pub fn remove(ctx: &Ctx, needle: &str) -> Result<()> {
     if let Err(e) = pen::discard(ctx.stash.root(), &target.slug) {
         eprintln!("ccs: {}'s pen is still there: {}", target.slug, describe(&e));
     }
+    // The pen's credentials may not have been inside it, and what is left of
+    // them outlives the directory without a word.
+    if let Err(e) = ctx.backend.forget(&pen::at(ctx.stash.root(), &target.slug)) {
+        eprintln!("ccs: {}'s pinned credentials are still there: {}", target.slug, describe(&e));
+    }
     if let Err(e) = ctx.usage.forget(&target.slug) {
         eprintln!("ccs: {}'s last usage reading is still there: {}", target.slug, describe(&e));
     }
@@ -421,7 +431,7 @@ pub fn watch(ctx: &Ctx, every: Duration, high: f64) -> Result<()> {
             Ok((table, _)) => {
                 for event in watch::diff(&before, table.entries(), high) {
                     let told = notify::broadcast(
-                        guarded(ctx.creds)?,
+                        ctx.creds.dir(),
                         ctx.stash.root(),
                         event.kind,
                         &event.text,
@@ -614,7 +624,7 @@ fn identify_live(ctx: &Ctx, accounts: &[Stashed]) -> Result<Option<String>> {
 /// account is used. Capturing it on the way out is what keeps a stashed account
 /// usable without a fresh login.
 fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<usize> {
-    let _guard = lock::acquire(guarded(ctx.creds)?)?;
+    let _guard = lock::acquire(ctx.creds.dir())?;
     let live = ctx.creds.read()?;
     if let Some(live) = &live {
         capture_outgoing(ctx, accounts, live, &target.slug)?;
@@ -623,7 +633,7 @@ fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<us
     ctx.stash.set_active(&target.slug)?;
     drop(_guard);
     let told = notify::broadcast(
-        guarded(ctx.creds)?,
+        ctx.creds.dir(),
         ctx.stash.root(),
         "switch",
         &format!(
@@ -757,11 +767,12 @@ mod tests {
     use crate::picker::Accounts as _;
     use std::cell::RefCell;
     use std::fs;
+    use std::path::Path;
 
     /// Credentials held in memory rather than on disk, so a test can see what
     /// a command installed.
     struct Recorder {
-        path: PathBuf,
+        dir: PathBuf,
         held: RefCell<Option<CredsFile>>,
     }
 
@@ -775,8 +786,12 @@ mod tests {
             Ok(())
         }
 
-        fn path(&self) -> &Path {
-            &self.path
+        fn dir(&self) -> &Path {
+            &self.dir
+        }
+
+        fn describe(&self) -> String {
+            format!("{} (held in memory)", self.dir.display())
         }
     }
 
@@ -812,7 +827,7 @@ mod tests {
             fs::create_dir_all(&dir).expect("config directory");
             let stash = Stash::open(&dir).expect("stash");
             Self {
-                creds: Recorder { path: dir.join(".credentials.json"), held: RefCell::new(None) },
+                creds: Recorder { dir: dir.clone(), held: RefCell::new(None) },
                 usage: usage::Cache::open(stash.root()).expect("usage cache"),
                 stash,
                 api: Api::new(),
@@ -824,6 +839,9 @@ mod tests {
         fn ctx(&self) -> Ctx<'_> {
             Ctx {
                 creds: &self.creds,
+                // A test writes credentials where it can look at them, never
+                // into the keychain of whoever is running it.
+                backend: Backend::File,
                 stash: &self.stash,
                 usage: &self.usage,
                 api: &self.api,
@@ -837,8 +855,8 @@ mod tests {
             self.pen(slug).write(&CredsFile::new(oauth.clone())).expect("pen credentials");
         }
 
-        fn pen(&self, slug: &str) -> FileStore {
-            FileStore::new(&pen::at(self.stash.root(), slug))
+        fn pen(&self, slug: &str) -> Box<dyn CredStore> {
+            Backend::File.confined(&pen::at(self.stash.root(), slug))
         }
 
         /// The usage reading recorded for `slug`, if one was.

@@ -8,11 +8,11 @@
 use std::fs::{self, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use crate::creds::{self, CredStore, FileStore};
+use crate::creds::{self, Backend};
 use crate::model::Oauth;
 
 /// Prefix marking a throwaway login directory, so one left behind by an
@@ -32,29 +32,33 @@ pub struct Options {
 /// A throwaway config directory, destroyed on drop.
 struct Scratch {
     path: PathBuf,
+    /// The backend the login wrote through, so the credentials it minted are
+    /// destroyed along with the directory wherever they landed.
+    backend: Backend,
 }
 
 impl Scratch {
-    fn new(root: &Path) -> Result<Self> {
+    fn new(backend: Backend, root: &Path) -> Result<Self> {
         let path = root.join(format!("{SCRATCH}{}", std::process::id()));
         fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
         fs::set_permissions(&path, Permissions::from_mode(SCRATCH_MODE))
             .with_context(|| format!("securing {}", path.display()))?;
-        Ok(Self { path })
+        Ok(Self { path, backend })
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        let _ = self.backend.forget(&self.path);
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 
 /// Run an interactive login in a throwaway directory and hand back what it
 /// minted. The terminal belongs to the child for the duration.
-pub fn run(root: &Path, binary: &str, options: &Options) -> Result<Oauth> {
-    sweep(root);
-    let scratch = Scratch::new(root)?;
+pub fn run(backend: Backend, root: &Path, binary: &str, options: &Options) -> Result<Oauth> {
+    sweep(backend, root);
+    let scratch = Scratch::new(backend, root)?;
 
     let mut command = Command::new(binary);
     command.args(["auth", "login"]).env("CLAUDE_CONFIG_DIR", &scratch.path);
@@ -80,20 +84,21 @@ pub fn run(root: &Path, binary: &str, options: &Options) -> Result<Oauth> {
         bail!("`{binary} auth login` did not complete; nothing was stashed");
     }
 
-    let Some(file) = FileStore::new(&scratch.path).read()? else {
+    let Some(file) = backend.confined(&scratch.path).read()? else {
         bail!("the login finished but left no credentials behind; nothing was stashed");
     };
     Ok(file.oauth)
 }
 
 /// Remove throwaway directories belonging to runs that are over. They can hold
-/// a credentials file, so they do not get to linger.
-fn sweep(root: &Path) {
+/// credentials, so they do not get to linger.
+fn sweep(backend: Backend, root: &Path) {
     let Ok(entries) = fs::read_dir(root) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
         if abandoned(name) {
+            let _ = backend.forget(&path);
             let _ = fs::remove_dir_all(&path);
         }
     }
@@ -104,7 +109,26 @@ fn sweep(root: &Path) {
 /// concurrent run's directory from being swept out from under it.
 fn abandoned(name: &str) -> bool {
     let Some(pid) = name.strip_prefix(SCRATCH) else { return false };
-    !Path::new("/proc").join(pid).exists()
+    !running(pid)
+}
+
+/// Whether a process is still there.
+///
+/// `/proc` answers this where there is one; where there is not, signal zero is
+/// the same question asked of the kernel directly. Anything unanswerable is
+/// taken for alive, because sweeping a directory a live login is using would
+/// take its credentials out from under it.
+fn running(pid: &str) -> bool {
+    if Path::new("/proc").is_dir() {
+        return Path::new("/proc").join(pid).exists();
+    }
+    Command::new("/bin/kill")
+        .args(["-0", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -142,7 +166,8 @@ mod tests {
     #[test]
     fn a_login_that_exits_non_zero_stashes_nothing() {
         let root = temp_root("nonzero");
-        let error = run(&root, "false", &Options::default()).unwrap_err().to_string();
+        let error =
+            run(Backend::File, &root, "false", &Options::default()).unwrap_err().to_string();
         assert!(error.contains("did not complete"), "{error}");
         let _ = fs::remove_dir_all(&root);
     }
@@ -150,7 +175,7 @@ mod tests {
     #[test]
     fn a_login_that_mints_nothing_is_reported_rather_than_passing_silently() {
         let root = temp_root("nothing");
-        let error = run(&root, "true", &Options::default()).unwrap_err().to_string();
+        let error = run(Backend::File, &root, "true", &Options::default()).unwrap_err().to_string();
         assert!(error.contains("no credentials"), "{error}");
         let _ = fs::remove_dir_all(&root);
     }
@@ -158,7 +183,9 @@ mod tests {
     #[test]
     fn a_missing_binary_names_itself_and_the_override() {
         let root = temp_root("missing");
-        let error = run(&root, "/nonexistent/claude", &Options::default()).unwrap_err().to_string();
+        let error = run(Backend::File, &root, "/nonexistent/claude", &Options::default())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("/nonexistent/claude"), "{error}");
         assert!(error.contains("CCS_CLAUDE_BINARY"), "{error}");
         let _ = fs::remove_dir_all(&root);
@@ -167,7 +194,7 @@ mod tests {
     #[test]
     fn a_failed_login_leaves_no_scratch_directory_behind() {
         let root = temp_root("cleanup");
-        let _ = run(&root, "false", &Options::default());
+        let _ = run(Backend::File, &root, "false", &Options::default());
         let leftovers: Vec<_> = fs::read_dir(&root)
             .expect("read root")
             .flatten()
@@ -182,7 +209,7 @@ mod tests {
         let root = temp_root("scratch");
 
         let path = {
-            let scratch = Scratch::new(&root).expect("scratch");
+            let scratch = Scratch::new(Backend::File, &root).expect("scratch");
             let mode = fs::metadata(&scratch.path).expect("stat").permissions().mode();
             assert_eq!(mode & 0o777, SCRATCH_MODE);
             scratch.path.clone()

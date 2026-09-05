@@ -13,7 +13,8 @@
 //! `ccs use` is best run from the session that wants to hear about it.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -102,5 +103,12 @@ fn send(sessions: &Path, sock: &str, body: &str) -> Option<()> {
             "msg_id": msg_id,
         })
     );
-    s.write_all(lines.as_bytes()).ok()
+    s.write_all(lines.as_bytes()).ok()?;
+    // Stay alive until the inbox has looked at the message: it vets the sender
+    // by walking its process ancestry in /proc, and a sender that has already
+    // exited by then is treated as a stranger and held for review.
+    let _ = s.shutdown(Shutdown::Write);
+    let _ = s.set_read_timeout(Some(TIMEOUT));
+    let _ = s.read(&mut [0; 64]);
+    Some(())
 }

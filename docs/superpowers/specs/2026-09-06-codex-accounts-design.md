@@ -67,8 +67,8 @@ its provider's rows.
   &codex::Client`. `live`, `identify`, `install`, `copies`, `propagate`,
   `switch_to`, `probe`, `record` branch on the account's provider. `ccs pin`
   launches the selected account's client. Codex copies are identified by their
-  ChatGPT account ID, including pins switched in place. Refreshes propagate to
-  matching copies; a pin switch or capture leaves the global pointer alone.
+  ChatGPT workspace ID and user email, including pins switched in place. Refreshes
+  propagate to matching copies; a pin switch or capture leaves the global pointer alone.
   `ccs status` reports each provider that has live credentials; --codex/--claude
   selects one, and --cached reads its last poll without refreshing credentials.
 - `src/login.rs` — `run` gains the provider: a Codex login runs `codex

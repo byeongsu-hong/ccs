@@ -227,12 +227,22 @@ fn codex_copies(ctx: &Ctx, entry: &Stashed) -> Result<Vec<codex::Store>> {
         let store = codex::Store::at(&directory, Some(&directory));
         let held = store.read()?.and_then(|file| file.oauth());
         let belongs_to_account =
-            held.as_ref().and_then(Oauth::account_id) == Some(entry.account.uuid.as_str());
+            held.as_ref().is_some_and(|oauth| codex_account_matches(entry, oauth));
         if belongs_to_account {
             stores.push(store);
         }
     }
     Ok(stores)
+}
+
+/// A workspace can contain several users. Its account id alone cannot
+/// identify which user's credentials a stashed login owns.
+fn codex_account_matches(entry: &Stashed, oauth: &Oauth) -> bool {
+    let same_workspace = oauth.account_id() == Some(entry.account.uuid.as_str());
+    let identity = oauth.id_token().and_then(|token| codex::identity(token).ok());
+    let same_user =
+        identity.is_some_and(|who| who.email.eq_ignore_ascii_case(&entry.account.email));
+    same_workspace && same_user
 }
 
 /// The most recently minted of some copies of one account's credentials.
@@ -347,10 +357,9 @@ fn identify(
 ) -> Option<String> {
     let live = live?;
     if provider == Provider::Codex {
-        let account_id = live.account_id()?;
         return accounts
             .iter()
-            .find(|a| a.account.provider == provider && a.account.uuid == account_id)
+            .find(|a| a.account.provider == provider && codex_account_matches(a, live))
             .map(|a| a.slug.clone());
     }
     let matched = accounts.iter().filter(|a| a.account.provider == provider).find(|a| {
@@ -1532,6 +1541,8 @@ mod tests {
         let mut entry = stashed(slug, oauth);
         entry.account.provider = Provider::Codex;
         entry.account.uuid = entry.account.oauth.account_id().expect("account id").to_string();
+        entry.account.email =
+            codex::identity(entry.account.oauth.id_token().unwrap()).unwrap().email;
         entry
     }
 
@@ -2134,6 +2145,38 @@ mod tests {
         fixture.stash.set_active(Provider::Codex, "g").unwrap();
         let unknown = codex_oauth("r-other", LATER + 1, "other@x");
         assert!(identify(&fixture.ctx(), &[g], Provider::Codex, Some(&unknown)).is_none());
+    }
+
+    #[test]
+    fn users_sharing_a_codex_workspace_never_share_credentials() {
+        let fixture = Fixture::new("codex-shared-workspace");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        let mut other_oauth = codex_oauth("r-other", LATER, "other@x");
+        other_oauth
+            .extra
+            .insert("accountId".into(), serde_json::Value::String(g.account.uuid.clone()));
+        let other = codex_stashed("other", other_oauth);
+        fixture.stash.save("g", &g.account).unwrap();
+        fixture.stash.save("other", &other.account).unwrap();
+        let g_path = pen_for(&fixture.ctx(), &g, &Live::default()).unwrap();
+        let other_path = pen_for(&fixture.ctx(), &other, &Live::default()).unwrap();
+        let accounts = vec![g.clone(), other.clone()];
+        assert_eq!(
+            identify(&fixture.ctx(), &accounts, Provider::Codex, Some(&other.account.oauth))
+                .as_deref(),
+            Some("other")
+        );
+        let mut other = other;
+        let mut fresh = other.account.oauth.clone();
+        fresh.refresh_token = "r-other-fresh".into();
+        propagate(&fixture.ctx(), &mut other, &fresh, &Live::default()).unwrap();
+        let g_store = codex::Store::at(&g_path, Some(&g_path));
+        let other_store = codex::Store::at(&other_path, Some(&other_path));
+        assert_eq!(g_store.read().unwrap().unwrap().oauth().unwrap().refresh_token, "r-g");
+        assert_eq!(
+            other_store.read().unwrap().unwrap().oauth().unwrap().refresh_token,
+            "r-other-fresh"
+        );
     }
 
     #[test]

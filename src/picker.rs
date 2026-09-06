@@ -6,7 +6,7 @@
 //! is something done *to* the list — the marker moves and the same table is
 //! still there, free to be used again.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -14,7 +14,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute, queue};
 
-use crate::model::Health;
+use crate::model::{Health, Provider};
 use crate::render::{self, Style, Table, Verb};
 
 /// How the picker was closed.
@@ -66,9 +66,10 @@ struct Screen;
 impl Screen {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode().context("entering raw mode")?;
+        let screen = Self;
         execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)
             .context("entering alternate screen")?;
-        Ok(Self)
+        Ok(screen)
     }
 }
 
@@ -76,6 +77,45 @@ impl Drop for Screen {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+pub fn interactive() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+pub fn provider(action: &str) -> Result<Option<Provider>> {
+    select(action, &Provider::ALL.map(|p| (p.label(), p)))
+}
+
+/// A short choice before a command starts. Cancellation leaves the command
+/// unstarted; the screen is restored before a login child takes the terminal.
+pub fn select<T: Copy>(title: &str, choices: &[(&str, T)]) -> Result<Option<T>> {
+    if choices.is_empty() {
+        return Ok(None);
+    }
+    let _screen = Screen::enter()?;
+    let style = Style::colored();
+    let mut at = 0;
+    loop {
+        let mut lines = vec![format!("  {}", style.bold(title)), String::new()];
+        for (index, (label, _)) in choices.iter().enumerate() {
+            let marker = if index == at { ">" } else { " " };
+            lines.push(format!("  {marker} {label}"));
+        }
+        lines.push(String::new());
+        lines.push(style.dim("  up/down select   enter choose   esc/q cancel"));
+        paint(&lines.join("\n"))?;
+        let Event::Key(key) = event::read().context("reading provider choice")? else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match decide(key, Some(at), choices.len()) {
+            Step::Move(next) => at = next,
+            Step::Confirm(index) => return Ok(Some(choices[index].1)),
+            Step::Unselect | Step::Quit => return Ok(None),
+            Step::Refresh | Step::Ignore => {}
+        }
     }
 }
 
@@ -301,11 +341,7 @@ fn frame(
     polled: Instant,
     verb: Verb,
 ) -> String {
-    let mut lines = vec![format!("  {}", table.header())];
-    for index in 0..table.len() {
-        let marker = if at == Some(index) { "> " } else { "  " };
-        lines.push(format!("{marker}{}", table.row(index)));
-    }
+    let mut lines = table.lines(at);
     // With no row selected there is nothing to detail, and the gap it leaves
     // is the plainest signal that `enter` has nothing to act on.
     if let Some(entry) = at.and_then(|at| table.entries().get(at)) {

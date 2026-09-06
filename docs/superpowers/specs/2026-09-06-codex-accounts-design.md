@@ -3,7 +3,7 @@
 ## Goal
 
 Stash, read and switch OpenAI Codex (ChatGPT subscription) accounts the way
-Claude accounts are handled today, side by side in the same table, picker,
+Claude accounts are handled today, in separate sections of the same picker,
 watcher, menu bar app and gateway. Two live slots — Claude Code's credentials
 and Codex's `auth.json` — each with its own account in use, switched
 independently.
@@ -47,8 +47,11 @@ or `refresh_token` — copies, newest, propagate, reconcile — works unchanged.
 `codex`.
 
 `Entry` (table rows) and the JSON views carry `provider`. The plan label of a
-Codex account is prefixed, `codex pro`, so the table reads without a column.
-Two rows can be `active`, one per provider; marking one active unmarks only
+Codex account remains prefixed, `codex pro`, for existing JSON/menu bar consumers.
+The terminal table groups accounts by provider, then email, matching numeric
+account resolution. Claude has its own dynamic limit columns. Codex shows a
+Shared row and additional named pool rows per account, with window columns.
+Two accounts can be `active`, one per provider; marking one active unmarks only
 its provider's rows.
 
 ## Modules
@@ -61,8 +64,9 @@ its provider's rows.
   JWT claim reading, `Client` (refresh, usage), and `limits(&Usage)` mapping
   windows to `Limit`s: a window of 18000s is `session`, 604800s is
   `weekly_all`, anything else `<n>s`; each `additional_rate_limits` entry
-  becomes one scoped limit named after `limit_name`, taking its weekly
-  window (or its only one). `reset_at` becomes RFC 3339.
+  retains every reported window, scoped by `limit_name`. Nullable or missing
+  additional pools are accepted. `reset_at` becomes RFC 3339. Old cached scoped
+  windows lack a duration and are labeled `CACHED WINDOW` until refreshed.
 - `src/cmd.rs` — `Ctx` gains `codex: &dyn codex::Creds` and `codex_api:
   &codex::Client`. `live`, `identify`, `install`, `copies`, `propagate`,
   `switch_to`, `probe`, `record` branch on the account's provider. `ccs pin`
@@ -92,8 +96,12 @@ its provider's rows.
       "openai-codex": { "baseUrl": "http://127.0.0.1:4141/backend-api", "apiKey": "!ccs serve --key codex" } } }
   ```
 
-- `src/cli.rs` — `ccs add --codex`, `ccs add --current --codex`, `ccs serve
-  --key [codex]`.
+- `src/cli.rs`, `src/main.rs`, `src/picker.rs` — interactive provider menus for
+  add/capture, status (including both), notify and gateway key commands. Flags
+  bypass menus. Noninteractive add requires a selector; JSON/piped status keeps
+  both providers, and piped gateway key keeps its existing Claude default.
+  Cancellation restores the terminal before any command action. Claude login
+  flags are validated after provider selection and before credentials are read.
 - `app/` — `Account.provider` decoded; rows show the provider in the plan
   text already. No other change.
 
@@ -119,9 +127,10 @@ status-line customization and per-turn token accounting.
 - `src/watch.rs`: every event carries its provider. High usage and reset
   comparisons use that provider's active account, and delivery routes accordingly.
 - `src/cli.rs`: --codex/--claude selects status or notice provider. Notification
-  auto-detection uses the Claude inbox variable first, then CODEX_THREAD_ID;
-  nested clients can select explicitly. --cached on status selects the account
-  from its live file and reads the existing cache, including the poll timestamp.
+  auto-detection requires exactly one of the Claude inbox variable and
+  CODEX_THREAD_ID; nested clients select explicitly or through the terminal menu.
+  --cached on status selects the account from its live file and reads the existing
+  cache, including the poll timestamp.
 
 Codex queue support was checked through the installed CLI 0.153.4 help. Clients
 without that command can use cached status but cannot subscribe to queued notices.

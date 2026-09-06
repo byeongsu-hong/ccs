@@ -441,10 +441,7 @@ pub fn list(ctx: &Ctx, json: bool, cached: bool) -> Result<()> {
             return Ok(());
         }
         let table = Table::build(readings.into_iter().map(|r| r.entry).collect(), Style::detect());
-        println!("{}", table.header());
-        for index in 0..table.len() {
-            println!("{}", table.row(index));
-        }
+        println!("{}", table.lines(None).join("\n"));
         return Ok(());
     }
     let mut accounts = stashed(ctx)?;
@@ -452,10 +449,7 @@ pub fn list(ctx: &Ctx, json: bool, cached: bool) -> Result<()> {
     if json {
         return emit_json(&table);
     }
-    println!("{}", table.header());
-    for index in 0..table.len() {
-        println!("{}", table.row(index));
-    }
+    println!("{}", table.lines(None).join("\n"));
     Ok(())
 }
 
@@ -519,7 +513,12 @@ pub fn status(ctx: &Ctx, json: bool, cached: bool, provider: Option<Provider>) -
             println!();
         }
         let entry = &reading.entry;
-        println!("{}  {}", style.bold(&entry.email), style.dim(&entry.plan));
+        println!(
+            "{} · {}  {}",
+            entry.provider.label(),
+            style.bold(&entry.email),
+            style.dim(&entry.plan)
+        );
         for line in render::detail(entry, style) {
             println!("{line}");
         }
@@ -630,12 +629,13 @@ pub fn add(
     current: bool,
     options: &login::Options,
 ) -> Result<()> {
+    options.validate(provider)?;
     let oauth = match (provider, current) {
         (Provider::Claude, true) => {
             in_use(ctx, "sign in with `claude` before `ccs add --current`")?.1
         }
         (Provider::Claude, false) => {
-            println!("logging in to another account; the one in use is not affected");
+            println!("logging in to another Claude Code account; the one in use is not affected");
             login::run(ctx.backend, ctx.stash.root(), &claude_binary(), options)?
         }
         (Provider::Codex, true) => {
@@ -651,8 +651,10 @@ pub fn add(
     let (email, slug) = (&recorded.stashed.account.email, &recorded.stashed.slug);
 
     match current {
-        true => println!("{verb} the account in use, {email}, as {slug}"),
-        false => println!("{verb} {email} as {slug}; `ccs use {slug}` to switch to it"),
+        true => println!("{verb} the {provider} account in use, {email}, as {slug}"),
+        false => println!(
+            "{verb} {provider} account {email} as {slug}; `ccs use {slug}` to switch to it"
+        ),
     }
     Ok(())
 }
@@ -1214,7 +1216,7 @@ fn choose(ctx: &Ctx, accounts: &mut [Stashed], verb: Verb) -> Result<Option<Stas
 fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
     let accounts = ctx.stash.list()?;
     if accounts.is_empty() {
-        bail!("no accounts stashed yet; log in with `claude` then run `ccs add`");
+        bail!("no accounts stashed yet; run `ccs add` and choose Claude Code or Codex");
     }
     Ok(accounts)
 }

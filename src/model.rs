@@ -38,6 +38,13 @@ pub enum Provider {
 
 impl Provider {
     pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
 }
 
 impl fmt::Display for Provider {
@@ -247,8 +254,17 @@ impl Limit {
     /// The column this limit belongs under.
     pub fn column(&self) -> String {
         if let Some(model) = self.model_name() {
-            return model.to_string();
+            return match self.kind.as_str() {
+                // Claude's scoped limits have always named their model alone.
+                "weekly_scoped" => model.to_string(),
+                _ => format!("{model} {}", self.window()),
+            };
         }
+        self.window()
+    }
+
+    /// The window independently of any model sharing it.
+    pub fn window(&self) -> String {
         match self.kind.as_str() {
             "session" => "session".to_string(),
             "weekly_all" => "weekly".to_string(),

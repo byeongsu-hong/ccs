@@ -1,18 +1,48 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="859" height="278" viewBox="0 0 859 278" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14.0">
-  <title>ccs</title>
-  <rect width="859" height="278" rx="10" fill="#0d1117"/>
-  <rect width="859" height="44" rx="10" fill="#161b22"/>
-  <rect y="34" width="859" height="10" fill="#161b22"/>
-  <circle cx="22" cy="24" r="5.5" fill="#ff5f57"/><circle cx="40" cy="24" r="5.5" fill="#febc2e"/><circle cx="58" cy="24" r="5.5" fill="#28c840"/>
-  <text x="429" y="28" fill="#7d8590" font-size="12" text-anchor="middle">ccs</text>
-  <g>
-    <text xml:space="preserve"><tspan x="22.0 30.4" y="56.0" fill="#c9d1d9">  </tspan><tspan x="38.8 47.2 55.6 64.0 72.4 80.8 89.2 97.6 106.0 114.4 122.8 131.2 139.6 148.0 156.4 164.8 173.2 181.6 190.0 198.4 206.8 215.2 223.6 232.0 240.4 248.8 257.2 265.6 274.0 282.4 290.8 299.2 307.6 316.0 324.4 332.8 341.2 349.6 358.0 366.4 374.8 383.2 391.6 400.0 408.4 416.8 425.2 433.6 442.0 450.4 458.8 467.2 475.6 484.0 492.4 500.8 509.2 517.6 526.0 534.4 542.8 551.2 559.6 568.0 576.4 584.8 593.2 601.6 610.0 618.4 626.8 635.2 643.6 652.0 660.4 668.8 677.2 685.6 694.0 702.4 710.8 719.2 727.6 736.0" y="56.0" fill="#7d8590">   ACCOUNT              PLAN    SESSION           WEEKLY            FABLE           </tspan></text>
-    <text xml:space="preserve"><tspan x="22.0 30.4" y="76.0" fill="#c9d1d9">&gt; </tspan><tspan x="38.8 47.2 55.6 64.0 72.4 80.8 89.2 97.6 106.0 114.4 122.8 131.2 139.6 148.0 156.4 164.8 173.2 181.6 190.0 198.4 206.8 215.2 223.6 232.0 240.4 248.8 257.2 265.6 274.0 282.4" y="76.0" fill="#7d8590"> 1 you@example.com      max20x</tspan><tspan x="290.8 299.2" y="76.0" fill="#c9d1d9">  </tspan><tspan x="307.6 316.0 324.4 332.8 341.2 349.6 358.0 366.4 374.8 383.2 391.6 400.0 408.4 416.8 425.2 433.6" y="76.0" fill="#3fb950">█░░░  10% 3h54m </tspan><tspan x="442.0 450.4" y="76.0" fill="#c9d1d9">  </tspan><tspan x="458.8 467.2 475.6 484.0 492.4 500.8 509.2 517.6 526.0 534.4 542.8 551.2 559.6 568.0 576.4 584.8" y="76.0" fill="#3fb950">███░  55% 6h24m </tspan><tspan x="593.2 601.6" y="76.0" fill="#c9d1d9">  </tspan><tspan x="610.0 618.4 626.8 635.2 643.6 652.0 660.4 668.8 677.2 685.6 694.0 702.4 710.8 719.2 727.6 736.0" y="76.0" fill="#f85149">████ 100% 6h24m </tspan><tspan x="744.4 752.8 761.2 769.6 778.0 786.4 794.8 803.2 811.6 820.0 828.4" y="76.0" fill="#e6edf3" font-weight="600">  &lt;- active</tspan></text>
-    <text xml:space="preserve"><tspan x="22.0 30.4 38.8 47.2 55.6 64.0 72.4 80.8 89.2 97.6 106.0 114.4 122.8 131.2 139.6 148.0 156.4 164.8 173.2 181.6 190.0 198.4 206.8 215.2 223.6 232.0 240.4 248.8 257.2 265.6 274.0 282.4 290.8 299.2" y="96.0" fill="#c9d1d9">   2 you+alt@example.com  max5x   </tspan><tspan x="307.6 316.0 324.4 332.8 341.2 349.6 358.0 366.4 374.8 383.2 391.6 400.0 408.4 416.8 425.2 433.6" y="96.0" fill="#3fb950">░░░░   0%       </tspan><tspan x="442.0 450.4" y="96.0" fill="#c9d1d9">  </tspan><tspan x="458.8 467.2 475.6 484.0 492.4 500.8 509.2 517.6 526.0 534.4 542.8 551.2 559.6 568.0 576.4 584.8" y="96.0" fill="#3fb950">█░░░  18% 2d11h </tspan><tspan x="593.2 601.6" y="96.0" fill="#c9d1d9">  </tspan><tspan x="610.0 618.4 626.8 635.2 643.6 652.0 660.4 668.8 677.2 685.6 694.0 702.4 710.8 719.2 727.6 736.0" y="96.0" fill="#3fb950">█░░░  22% 2d11h </tspan></text>
-    <text xml:space="preserve"><tspan x="22.0 30.4 38.8 47.2 55.6 64.0 72.4 80.8 89.2 97.6 106.0 114.4 122.8 131.2 139.6 148.0 156.4 164.8 173.2 181.6 190.0 198.4 206.8 215.2 223.6 232.0 240.4 248.8 257.2 265.6 274.0 282.4 290.8 299.2" y="116.0" fill="#c9d1d9">   3 team@example.org     pro     </tspan><tspan x="307.6 316.0 324.4 332.8 341.2 349.6 358.0 366.4 374.8 383.2 391.6 400.0 408.4 416.8 425.2 433.6" y="116.0" fill="#3fb950">███░  61% 1h44m </tspan><tspan x="442.0 450.4" y="116.0" fill="#c9d1d9">  </tspan><tspan x="458.8 467.2 475.6 484.0 492.4 500.8 509.2 517.6 526.0 534.4 542.8 551.2 559.6 568.0 576.4 584.8" y="116.0" fill="#d29922">████  88% 5d19h </tspan><tspan x="593.2 601.6" y="116.0" fill="#c9d1d9">  </tspan><tspan x="610.0 618.4 626.8 635.2 643.6 652.0 660.4 668.8 677.2 685.6 694.0 702.4 710.8 719.2 727.6 736.0" y="116.0" fill="#3fb950">███░  70% 5d19h </tspan></text>
-    <text xml:space="preserve"><tspan x="22.0 30.4 38.8 47.2 55.6 64.0 72.4 80.8 89.2 97.6 106.0 114.4 122.8 131.2 139.6 148.0 156.4 164.8 173.2 181.6 190.0 198.4 206.8 215.2 223.6 232.0 240.4 248.8 257.2 265.6 274.0 282.4 290.8 299.2 307.6 316.0 324.4 332.8 341.2 349.6 358.0 366.4 374.8 383.2 391.6 400.0 408.4" y="156.0" fill="#3fb950">  session          █░░░  10%   resets in 3h 54m</tspan></text>
-    <text xml:space="preserve"><tspan x="22.0 30.4 38.8 47.2 55.6 64.0 72.4 80.8 89.2 97.6 106.0 114.4 122.8 131.2 139.6 148.0 156.4 164.8 173.2 181.6 190.0 198.4 206.8 215.2 223.6 232.0 240.4 248.8 257.2 265.6 274.0 282.4 290.8 299.2 307.6 316.0 324.4 332.8 341.2 349.6 358.0 366.4 374.8 383.2 391.6 400.0 408.4" y="176.0" fill="#3fb950">  weekly           ███░  55%   resets in 6h 24m</tspan></text>
-    <text xml:space="preserve"><tspan x="22.0 30.4 38.8 47.2 55.6 64.0 72.4 80.8 89.2 97.6 106.0 114.4 122.8 131.2 139.6 148.0 156.4 164.8 173.2 181.6 190.0 198.4 206.8 215.2 223.6 232.0 240.4 248.8 257.2 265.6 274.0 282.4 290.8 299.2 307.6 316.0 324.4 332.8 341.2 349.6 358.0 366.4 374.8 383.2 391.6 400.0 408.4 416.8 425.2 433.6 442.0 450.4 458.8 467.2 475.6" y="196.0" fill="#f85149">  Fable            ████ 100%   resets in 6h 24m   spent</tspan></text>
-    <text xml:space="preserve"><tspan x="22.0 30.4 38.8 47.2 55.6 64.0 72.4 80.8 89.2 97.6 106.0 114.4 122.8 131.2 139.6 148.0 156.4 164.8 173.2 181.6 190.0 198.4 206.8 215.2 223.6 232.0 240.4 248.8 257.2 265.6 274.0 282.4 290.8 299.2 307.6 316.0 324.4 332.8 341.2 349.6 358.0 366.4 374.8 383.2 391.6 400.0 408.4 416.8 425.2 433.6 442.0 450.4 458.8 467.2 475.6 484.0 492.4 500.8 509.2 517.6 526.0 534.4 542.8 551.2 559.6 568.0 576.4 584.8 593.2 601.6 610.0 618.4 626.8 635.2 643.6 652.0 660.4 668.8 677.2 685.6 694.0 702.4 710.8 719.2 727.6 736.0 744.4 752.8 761.2" y="236.0" fill="#7d8590">  up/down select   enter switch   esc unselect   r refresh   q quit      updated just now</tspan></text>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" width="850" height="288" viewBox="0 0 850 288" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, DejaVu Sans Mono, monospace" font-size="14">
+<title>ccs: Claude Code and Codex usage in separate sections</title>
+<desc>Claude session, weekly and Fable columns. Codex shared quota and additional named pools with five-hour and weekly windows. Example readings.</desc>
+<rect width="850" height="288" rx="10" fill="#0d1117"/>
+<path d="M10 0H840Q850 0 850 10V44H0V10Q0 0 10 0" fill="#161b22"/>
+<circle cx="22" cy="24" r="5.5" fill="#ff5f57"/><circle cx="40" cy="24" r="5.5" fill="#febc2e"/><circle cx="58" cy="24" r="5.5" fill="#28c840"/>
+<text x="425.0" y="28" fill="#7d8590" font-size="12" text-anchor="middle">ccs · Claude Code &amp; Codex</text>
+<text xml:space="preserve" fill="#c9d1d9" font-weight="600">
+<tspan x="22.0" y="68">  Claude Code</tspan>
+</text>
+<text xml:space="preserve" fill="#7d8590">
+<tspan x="22.0" y="88">     ACCOUNT        PLAN    SESSION           WEEKLY            FABLE</tspan>
+</text>
+<text xml:space="preserve" fill="#c9d1d9">
+<tspan x="22.0" y="108">   1 z@claude.test  max20x  </tspan>
+<tspan x="257.2" y="108" fill="#3fb950">█░░░  10% 3h54m</tspan>
+<tspan x="383.2" y="108">   </tspan>
+<tspan x="408.4" y="108" fill="#3fb950">███░  55% 3h54m</tspan>
+<tspan x="534.4" y="108">   </tspan>
+<tspan x="559.6" y="108" fill="#f85149">████ 100% 3h54m</tspan>
+</text>
+<text xml:space="preserve" fill="#c9d1d9" font-weight="600">
+<tspan x="22.0" y="148">  Codex</tspan>
+</text>
+<text xml:space="preserve" fill="#7d8590">
+<tspan x="22.0" y="168">     ACCOUNT       PLAN       POOL                 5H                WEEKLY</tspan>
+</text>
+<text xml:space="preserve" fill="#c9d1d9">
+<tspan x="22.0" y="188">   2 a@codex.test  codex pro  Shared               </tspan>
+<tspan x="450.4" y="188" fill="#3fb950">█░░░  16% 3h54m</tspan>
+<tspan x="576.4" y="188">   </tspan>
+<tspan x="601.6" y="188" fill="#3fb950">██░░  29% 3h54m</tspan>
+<tspan x="727.6" y="188">   &lt;- active</tspan>
+</text>
+<text xml:space="preserve" fill="#c9d1d9">
+<tspan x="22.0" y="208">                              Another model pool   —                 </tspan>
+<tspan x="601.6" y="208" fill="#3fb950">██░░  37% 3h54m</tspan>
+</text>
+<text xml:space="preserve" fill="#c9d1d9">
+<tspan x="22.0" y="228">                              GPT-5.3-Codex-Spark  </tspan>
+<tspan x="450.4" y="228" fill="#3fb950">█░░░   1% 3h54m</tspan>
+<tspan x="576.4" y="228">   </tspan>
+<tspan x="601.6" y="228" fill="#3fb950">█░░░   2% 3h54m</tspan>
+</text>
+<text xml:space="preserve" fill="#7d8590">
+<tspan x="22.0" y="268">  up/down select   r refresh   q quit      updated just now</tspan>
+</text>
 </svg>

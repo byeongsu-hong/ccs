@@ -74,11 +74,10 @@ impl Session {
     ) -> Result<Self> {
         let socket = std::env::var(SOCKET_ENV).ok().filter(|s| !s.is_empty());
         let thread = std::env::var("CODEX_THREAD_ID").ok().filter(|s| !s.is_empty());
-        let provider = provider.unwrap_or(match (&socket, &thread) {
-            (Some(_), _) => Provider::Claude,
-            (_, Some(_)) => Provider::Codex,
-            _ => Provider::Claude,
-        });
+        let provider = match provider {
+            Some(provider) => provider,
+            None => calling_provider(socket.as_deref(), thread.as_deref())?,
+        };
         match provider {
             Provider::Claude => Ok(Self::Claude {
                 socket: socket.with_context(|| {
@@ -102,6 +101,17 @@ impl Session {
                 })
             }
         }
+    }
+}
+
+fn calling_provider(socket: Option<&str>, thread: Option<&str>) -> Result<Provider> {
+    match (socket, thread) {
+        (Some(_), None) => Ok(Provider::Claude),
+        (None, Some(_)) => Ok(Provider::Codex),
+        (Some(_), Some(_)) => bail!(
+            "both clients' session variables are set; use --claude or --codex without a terminal"
+        ),
+        (None, None) => bail!("run `ccs notify` from inside a Claude Code or Codex session"),
     }
 }
 
@@ -359,6 +369,7 @@ fn send(sessions: &Path, sock: &str, body: &str, mode: Option<&str>) -> Option<(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -394,6 +405,14 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn only_an_unambiguous_session_environment_selects_a_provider() {
+        assert_eq!(calling_provider(Some("socket"), None).unwrap(), Provider::Claude);
+        assert_eq!(calling_provider(None, Some("thread")).unwrap(), Provider::Codex);
+        assert!(calling_provider(Some("socket"), Some("thread")).is_err());
+        assert!(calling_provider(None, None).is_err());
     }
 
     #[test]

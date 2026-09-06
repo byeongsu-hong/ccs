@@ -84,7 +84,14 @@ struct Limit: Decodable, Equatable, Identifiable {
     }
 }
 
+/// Whose account: each provider has a live slot of its own.
+enum Provider: String, Decodable, Equatable {
+    case claude, codex
+}
+
 struct Account: Decodable, Identifiable, Equatable {
+    /// Absent in a listing from before there was a choice.
+    var provider: Provider
     var slug: String
     var email: String
     var plan: String
@@ -94,12 +101,13 @@ struct Account: Decodable, Identifiable, Equatable {
     var polledAt: Date?
 
     enum CodingKeys: String, CodingKey {
-        case slug, email, plan, active, limits
+        case provider, slug, email, plan, active, limits
         case polledAt = "polled_at"
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decodeIfPresent(Provider.self, forKey: .provider) ?? .claude
         slug = try container.decode(String.self, forKey: .slug)
         email = try container.decode(String.self, forKey: .email)
         plan = try container.decode(String.self, forKey: .plan)
@@ -115,6 +123,13 @@ struct Account: Decodable, Identifiable, Equatable {
 
 func decodeAccounts(_ data: Data) throws -> [Account] {
     try JSONDecoder().decode([Account].self, from: data)
+}
+
+/// The Claude account in use: the one whose session the bar shows, since
+/// each provider has an account in use and Claude's is the one with a
+/// five-hour window.
+func activeClaude(_ accounts: [Account]) -> Account? {
+    accounts.first { $0.active && $0.provider == .claude }
 }
 
 /// The API stamps reset times with six fractional digits, which Foundation's

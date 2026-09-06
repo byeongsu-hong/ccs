@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 
-use crate::model::Limit;
+use crate::model::{Limit, Provider};
 use crate::render::{Entry, until};
 
 /// The notices a session can subscribe to. `switch` is raised by `ccs use`;
@@ -57,9 +57,14 @@ pub fn diff(before: &Snapshot, entries: &[Entry], high: f64) -> Vec<Event> {
 }
 
 fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Event> {
-    let active_weekly = entries.iter().find(|e| e.active).and_then(|e| at(limit(e, "weekly_all")?));
+    // Notices go into Claude Code sessions and are about Claude accounts:
+    // the account in use they compare against is the Claude one, and a
+    // Codex row is not theirs to hear about.
+    let claude = |e: &&Entry| e.provider == Provider::Claude;
+    let active_weekly =
+        entries.iter().filter(claude).find(|e| e.active).and_then(|e| at(limit(e, "weekly_all")?));
     let mut events = Vec::new();
-    for e in entries {
+    for e in entries.iter().filter(claude) {
         if e.limits.is_err() {
             continue;
         }
@@ -126,14 +131,35 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
 /// A switch is only made to an account `HYSTERESIS` points clear of the mark,
 /// so a rolling window that has just dipped under it does not pull the active
 /// account straight back.
-pub fn rotate<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Option<&'a Entry> {
-    let active = entries.iter().find(|e| e.active)?;
+#[cfg(test)]
+fn rotate<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Option<&'a Entry> {
+    rotate_within(entries, Provider::Claude, pool, high)
+}
+
+/// Every switch worth making: one per provider at most, each decided among
+/// that provider's rows alone, since each has an account in use of its own.
+pub fn rotations<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Vec<&'a Entry> {
+    Provider::ALL.iter().filter_map(|p| rotate_within(entries, *p, pool, high)).collect()
+}
+
+fn rotate_within<'a>(
+    entries: &'a [Entry],
+    provider: Provider,
+    pool: &[String],
+    high: f64,
+) -> Option<&'a Entry> {
+    let active = entries.iter().find(|e| e.active && e.provider == provider)?;
     if active.limits.is_err() || !pool.contains(&active.slug) || has_room(active, high) {
         return None;
     }
     entries
         .iter()
-        .filter(|e| !e.active && pool.contains(&e.slug) && has_room(e, high - HYSTERESIS))
+        .filter(|e| {
+            e.provider == provider
+                && !e.active
+                && pool.contains(&e.slug)
+                && has_room(e, high - HYSTERESIS)
+        })
         .min_by(|a, b| {
             let key = |e: &Entry| {
                 (
@@ -199,12 +225,75 @@ mod tests {
             scope: None,
         };
         Entry {
+            provider: Provider::Claude,
             slug: slug.into(),
             email: format!("{slug}@x"),
             plan: "max".into(),
             active,
             limits: Ok(vec![lim("session", session.0, session.1), lim("weekly_all", 10.0, weekly)]),
         }
+    }
+
+    fn codex_entry(slug: &str, active: bool, weekly: f64) -> Entry {
+        let mut entry = entry(slug, active, (0.0, None), None);
+        entry.provider = Provider::Codex;
+        entry.limits = Ok(vec![Limit {
+            kind: "weekly_all".into(),
+            percent: weekly,
+            severity: None,
+            resets_at: None,
+            scope: None,
+        }]);
+        entry
+    }
+
+    /// Notices go into Claude Code sessions, about Claude accounts; a Codex
+    /// row running high is not theirs to hear, and the weekly a reset is
+    /// compared against is the active Claude account's, whichever row sorts
+    /// first.
+    #[test]
+    fn notices_are_about_claude_rows_only() {
+        let before: Snapshot = [
+            (
+                "a".to_string(),
+                Seen { session_pct: Some(10.0), session_resets_at: None, weekly_resets_at: None },
+            ),
+            (
+                "gpt".to_string(),
+                Seen { session_pct: Some(10.0), session_resets_at: None, weekly_resets_at: None },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut gpt = codex_entry("gpt", true, 95.0);
+        gpt.limits = Ok(vec![Limit {
+            kind: "session".into(),
+            percent: 95.0,
+            severity: None,
+            resets_at: None,
+            scope: None,
+        }]);
+        let now = entry("a", true, (95.0, None), None);
+        let events = diff_at(&before, &[gpt, now], 90.0, 0);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].text.contains("a@x"), "{}", events[0].text);
+    }
+
+    /// Each provider rotates among its own rows: a spent Claude account
+    /// hands over to a Claude account, never to a Codex one, and the other
+    /// way round.
+    #[test]
+    fn rotation_keeps_to_each_providers_own_rows() {
+        let rows = vec![
+            entry("a", true, (99.0, None), Some(W1)),
+            entry("b", false, (5.0, None), Some(W0)),
+            codex_entry("gpt", true, 100.0),
+            codex_entry("gpt2", false, 10.0),
+        ];
+        let pool = ["a", "b", "gpt", "gpt2"].map(String::from).to_vec();
+        let moves: Vec<&str> =
+            rotations(&rows, &pool, 90.0).iter().map(|e| e.slug.as_str()).collect();
+        assert_eq!(moves, ["b", "gpt2"]);
     }
 
     const T1: &str = "2026-09-05T14:50:00Z";

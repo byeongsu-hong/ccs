@@ -39,7 +39,7 @@ final class Store: ObservableObject {
         Task { await refresh() }
     }
 
-    var active: Account? { accounts.first { $0.active } }
+    var active: Account? { activeClaude(accounts) }
 
     /// The label for the menu bar: the active account's session percentage.
     var label: String {

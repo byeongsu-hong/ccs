@@ -1,6 +1,7 @@
 mod api;
 mod cli;
 mod cmd;
+mod codex;
 mod creds;
 mod fsx;
 mod lock;
@@ -24,6 +25,7 @@ use anyhow::{Context, Result};
 use crate::api::Api;
 use crate::cli::Cmd;
 use crate::creds::Backend;
+use crate::model::Provider;
 use crate::stash::Stash;
 
 fn main() -> ExitCode {
@@ -57,12 +59,17 @@ fn run() -> Result<()> {
     let stash = Stash::open(&home.config)?;
     let usage = usage::Cache::open(stash.root())?;
     let api = Api::new();
+    let codex_home = std::env::var_os("CODEX_HOME").filter(|d| !d.is_empty()).map(PathBuf::from);
+    let codex_store = codex::Store::at(&self::home()?, codex_home.as_deref());
+    let codex_api = codex::Client::new();
     let ctx = cmd::Ctx {
         creds: creds.as_ref(),
         backend,
         stash: &stash,
         usage: &usage,
         api: &api,
+        codex: &codex_store,
+        codex_api: &codex_api,
         home: &home,
     };
 
@@ -70,9 +77,10 @@ fn run() -> Result<()> {
         Cmd::Pick => cmd::pick(&ctx),
         Cmd::List { json, cached } => cmd::list(&ctx, json, cached),
         Cmd::Use { target, force } => cmd::use_account(&ctx, &target, force),
-        Cmd::Add { name, current, email, console, sso } => {
+        Cmd::Add { name, current, email, console, sso, codex } => {
             let options = login::Options { email, console, sso };
-            cmd::add(&ctx, name.as_deref(), current, &options)
+            let provider = if codex { Provider::Codex } else { Provider::Claude };
+            cmd::add(&ctx, provider, name.as_deref(), current, &options)
         }
         Cmd::Pin { target, args } => cmd::pin(&ctx, target.as_deref(), &args),
         Cmd::Remove { target } => cmd::remove(&ctx, &target),
@@ -82,7 +90,7 @@ fn run() -> Result<()> {
             cmd::watch(&ctx, std::time::Duration::from_secs(every), high, &rotate)
         }
         Cmd::Serve { port, rotate } => cmd::serve(&ctx, port, &rotate),
-        Cmd::ServeKey => cmd::serve_key(&ctx),
+        Cmd::ServeKey { provider } => cmd::serve_key(&ctx, provider),
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
     }
 }

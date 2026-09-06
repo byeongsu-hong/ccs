@@ -9,7 +9,7 @@ use std::io::IsTerminal;
 
 use jiff::Timestamp;
 
-use crate::model::{Health, Limit};
+use crate::model::{Health, Limit, Provider};
 
 /// Width of a usage bar, in cells.
 const BAR: usize = 4;
@@ -29,6 +29,7 @@ const BOLD: &str = "\x1b[1m";
 /// What the table needs to know about one account. Deliberately free of stash
 /// and API types so the table stays a pure formatter.
 pub struct Entry {
+    pub provider: Provider,
     pub slug: String,
     pub email: String,
     pub plan: String,
@@ -129,15 +130,22 @@ impl Table {
         &self.entries
     }
 
-    /// Move the active marker onto `slug`.
+    /// Move the active marker onto `slug`, among the rows of its provider:
+    /// each provider has an account in use, and a switch in one slot leaves
+    /// the other's marker where it was.
     ///
     /// This is the whole of what installing an account changes about a table
     /// already on screen: which one the live credentials belong to. No limit
     /// moves because a switch spends nothing, so a re-poll would cost a request
     /// per account to redraw the same numbers.
     pub fn mark_active(&mut self, slug: &str) {
+        // An account the table does not hold — logged in behind its back —
+        // takes the marker off every row, since nothing on screen is it.
+        let provider = self.entries.iter().find(|e| e.slug == slug).map(|e| e.provider);
         for entry in &mut self.entries {
-            entry.active = entry.slug == slug;
+            if provider.is_none_or(|p| entry.provider == p) {
+                entry.active = entry.slug == slug;
+            }
         }
     }
 
@@ -349,6 +357,7 @@ mod tests {
 
     fn entry(email: &str, limits: Vec<Limit>) -> Entry {
         Entry {
+            provider: Provider::Claude,
             slug: email.replace('@', "_at_"),
             email: email.into(),
             plan: "max20x".into(),
@@ -409,6 +418,7 @@ mod tests {
     #[test]
     fn an_unreadable_account_reports_no_limits_rather_than_pretending() {
         let broken = Entry {
+            provider: Provider::Claude,
             slug: "a".into(),
             email: "a@x.com".into(),
             plan: "?".into(),
@@ -422,6 +432,7 @@ mod tests {
     #[test]
     fn a_row_shows_the_failure_instead_of_empty_bars() {
         let broken = Entry {
+            provider: Provider::Claude,
             slug: "a".into(),
             email: "a@x.com".into(),
             plan: "?".into(),
@@ -435,6 +446,7 @@ mod tests {
     #[test]
     fn a_row_that_could_not_be_read_still_says_it_is_the_account_in_use() {
         let broken = Entry {
+            provider: Provider::Claude,
             slug: "a".into(),
             email: "a@x.com".into(),
             plan: "?".into(),

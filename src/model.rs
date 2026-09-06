@@ -1,6 +1,8 @@
 //! Domain types: the credential blob Claude Code stores on disk, the OAuth
 //! API's responses, and the health verdicts derived from them.
 
+use std::fmt;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,45 @@ const WARN_PCT: f64 = 80.0;
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+// ── providers ────────────────────────────────────────────────────────────────
+
+/// Whose account this is. Each provider has a live slot of its own — Claude
+/// Code's credentials, Codex's `auth.json` — and an account in use in it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        })
+    }
+}
+
+impl FromStr for Provider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            other => Err(format!("unknown provider {other:?}; claude or codex")),
+        }
+    }
 }
 
 // ── credentials on disk ──────────────────────────────────────────────────────
@@ -56,6 +97,17 @@ impl Oauth {
     pub fn rate_limit_tier(&self) -> Option<&str> {
         self.extra.get("rateLimitTier").and_then(Value::as_str)
     }
+
+    /// A Codex account's identity token, carried alongside the pair every
+    /// provider has; it names the account and its plan.
+    pub fn id_token(&self) -> Option<&str> {
+        self.extra.get("idToken").and_then(Value::as_str)
+    }
+
+    /// A Codex account's ChatGPT account id, which every request names.
+    pub fn account_id(&self) -> Option<&str> {
+        self.extra.get("accountId").and_then(Value::as_str)
+    }
 }
 
 /// Claude Code's credentials file as a whole.
@@ -79,6 +131,9 @@ impl CredsFile {
 /// needed to become it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
+    /// Absent in every stash file written before there was a choice.
+    #[serde(default)]
+    pub provider: Provider,
     pub email: String,
     pub uuid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,9 +145,15 @@ pub struct Account {
 }
 
 impl Account {
+    /// The plan, prefixed with the provider for every provider but the first,
+    /// so a table of both reads without a column for it.
     pub fn plan_label(&self) -> String {
         let tier = self.rate_limit_tier.as_deref().or_else(|| self.oauth.rate_limit_tier());
-        plan_label(tier, self.plan.as_deref())
+        let plan = plan_label(tier, self.plan.as_deref());
+        match self.provider {
+            Provider::Claude => plan,
+            other => format!("{other} {plan}"),
+        }
     }
 }
 
@@ -315,6 +376,38 @@ mod tests {
     fn a_plan_label_falls_back_to_the_plan_then_to_a_question_mark() {
         assert_eq!(plan_label(None, Some("pro")), "pro");
         assert_eq!(plan_label(None, None), "?");
+    }
+
+    /// Every stash file written before there was a second provider names
+    /// none, and is a Claude account.
+    #[test]
+    fn an_account_without_a_provider_is_a_claude_account() {
+        let raw = r#"{"email":"a@x","uuid":"u","added_at":"t","oauth":{"accessToken":"a",
+            "refreshToken":"r","expiresAt":1}}"#;
+        let account: Account = serde_json::from_str(raw).expect("parses");
+        assert_eq!(account.provider, Provider::Claude);
+        let back = serde_json::to_value(&account).expect("serialises");
+        assert_eq!(back["provider"], "claude");
+    }
+
+    #[test]
+    fn a_codex_account_names_its_provider_and_keeps_its_tokens_in_the_same_shape() {
+        let raw = r#"{"provider":"codex","email":"a@x","uuid":"acct","added_at":"t",
+            "oauth":{"accessToken":"a","refreshToken":"r","expiresAt":1,
+            "idToken":"id.tok.en","accountId":"acct"}}"#;
+        let account: Account = serde_json::from_str(raw).expect("parses");
+        assert_eq!(account.provider, Provider::Codex);
+        assert_eq!(account.oauth.id_token(), Some("id.tok.en"));
+        assert_eq!(account.oauth.account_id(), Some("acct"));
+        assert_eq!(account.plan_label(), "codex ?");
+    }
+
+    #[test]
+    fn a_provider_reads_and_prints_as_its_lowercase_name() {
+        assert_eq!(Provider::Codex.to_string(), "codex");
+        assert_eq!("codex".parse::<Provider>().expect("parses"), Provider::Codex);
+        assert_eq!("claude".parse::<Provider>().expect("parses"), Provider::Claude);
+        assert!("gemini".parse::<Provider>().is_err());
     }
 
     #[test]

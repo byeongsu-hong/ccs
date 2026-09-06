@@ -2,6 +2,8 @@
 
 use anyhow::{Result, bail};
 
+use crate::model::Provider;
+
 pub const HELP: &str = "\
 ccs - Claude Code account switcher
 
@@ -14,6 +16,8 @@ USAGE
     ccs add                  log in to another account and stash it, without
                              disturbing the account in use
     ccs add --current        stash the account that is logged in right now
+    ccs add --codex          the same two, for a Codex (ChatGPT) account: log
+                             in to another, or stash the one `codex` is using
     ccs rm <account>         forget a stashed account
     ccs status               limits for the account currently in use
     ccs notify [<kind>...]   from inside a Claude Code session: have notices
@@ -35,7 +39,8 @@ USAGE
                              to paste into pi. With --rotate, a request the
                              account in use is too limited to answer is sent
                              again as the next pooled account
-    ccs serve --key          print the key a client presents to the gateway
+    ccs serve --key [codex]  print the key a client presents to the gateway,
+                             for Claude or for Codex
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
@@ -51,6 +56,7 @@ OPTIONS
         --email <address>    pre-fill the login page (add)
         --console            log in with Console billing, not a subscription (add)
         --sso                force the SSO login flow (add)
+        --codex              a Codex account rather than a Claude one (add)
         --every <seconds>    poll interval (watch; default 300)
         --high <percent>     session percentage that counts as high (watch; default 90)
         --rotate <a>,<b>,... accounts to rotate between (watch) or fall over
@@ -63,16 +69,49 @@ OPTIONS
 #[derive(Debug, Clone)]
 pub enum Cmd {
     Pick,
-    List { json: bool, cached: bool },
-    Use { target: String, force: bool },
-    Add { name: Option<String>, current: bool, email: Option<String>, console: bool, sso: bool },
-    Pin { target: Option<String>, args: Vec<String> },
-    Remove { target: String },
-    Status { json: bool },
-    Notify { off: bool, kinds: Vec<String>, bypass: bool },
-    Watch { every: u64, high: f64, rotate: Vec<String> },
-    Serve { port: u16, rotate: Vec<String> },
-    ServeKey,
+    List {
+        json: bool,
+        cached: bool,
+    },
+    Use {
+        target: String,
+        force: bool,
+    },
+    Add {
+        name: Option<String>,
+        current: bool,
+        email: Option<String>,
+        console: bool,
+        sso: bool,
+        codex: bool,
+    },
+    Pin {
+        target: Option<String>,
+        args: Vec<String>,
+    },
+    Remove {
+        target: String,
+    },
+    Status {
+        json: bool,
+    },
+    Notify {
+        off: bool,
+        kinds: Vec<String>,
+        bypass: bool,
+    },
+    Watch {
+        every: u64,
+        high: f64,
+        rotate: Vec<String>,
+    },
+    Serve {
+        port: u16,
+        rotate: Vec<String>,
+    },
+    ServeKey {
+        provider: Provider,
+    },
     Help,
     Version,
 }
@@ -119,7 +158,13 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "serve" | "gateway" => {
             let rest = &args[1..];
             if has(rest, "--key") {
-                return Ok(Cmd::ServeKey);
+                let provider = match value(rest, "--key") {
+                    Some(named) if !named.starts_with('-') => {
+                        named.parse().map_err(anyhow::Error::msg)?
+                    }
+                    _ => Provider::Claude,
+                };
+                return Ok(Cmd::ServeKey { provider });
             }
             let port = match value(rest, "--port") {
                 None => 4141,
@@ -139,12 +184,20 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         }
         "add" | "capture" => {
             let rest = &args[1..];
+            if has(rest, "--codex") {
+                for flag in ["--email", "--console", "--sso"] {
+                    if has(rest, flag) {
+                        bail!("{flag} steers Claude's login page; a Codex login has none");
+                    }
+                }
+            }
             Ok(Cmd::Add {
                 name: value(rest, "--name"),
                 current: has(rest, "--current"),
                 email: value(rest, "--email"),
                 console: has(rest, "--console"),
                 sso: has(rest, "--sso"),
+                codex: has(rest, "--codex"),
             })
         }
         "pin" | "confine" => {
@@ -273,6 +326,18 @@ mod tests {
         assert!(matches!(parsed(&["add"]), Cmd::Add { name: None, .. }));
     }
 
+    /// The login-page flags steer Claude's page; a Codex login has none
+    /// to steer, so asking for both is a mistake said out loud.
+    #[test]
+    fn add_refuses_login_page_flags_with_codex() {
+        let words = ["add", "--codex", "--email", "me@x.com"].map(String::from);
+        assert!(parse(words.into_iter()).is_err());
+        assert!(matches!(
+            parsed(&["add", "--codex", "--current"]),
+            Cmd::Add { codex: true, current: true, .. }
+        ));
+    }
+
     #[test]
     fn add_forwards_the_flags_that_steer_the_login_page() {
         let Cmd::Add { email, console, sso, .. } =
@@ -362,8 +427,19 @@ mod tests {
     }
 
     #[test]
-    fn serve_key_only_prints_the_key() {
-        assert!(matches!(parsed(&["serve", "--key"]), Cmd::ServeKey));
+    fn serve_key_only_prints_the_key_of_the_provider_named() {
+        assert!(matches!(
+            parsed(&["serve", "--key"]),
+            Cmd::ServeKey { provider: Provider::Claude }
+        ));
+        assert!(matches!(
+            parsed(&["serve", "--key", "codex"]),
+            Cmd::ServeKey { provider: Provider::Codex }
+        ));
+        assert!(
+            parse(["serve".to_string(), "--key".to_string(), "gemini".to_string()].into_iter())
+                .is_err()
+        );
     }
 
     #[test]

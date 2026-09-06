@@ -119,9 +119,10 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
             }
             let port = match value(rest, "--port") {
                 None => 4141,
-                Some(v) => {
-                    v.parse().map_err(|_| anyhow::anyhow!("--port wants a port, not {v:?}"))?
-                }
+                Some(v) => match v.parse() {
+                    Ok(0) | Err(_) => bail!("--port wants a port, not {v:?}"),
+                    Ok(port) => port,
+                },
             };
             Ok(Cmd::Serve { port, rotate: pool(rest) })
         }
@@ -351,6 +352,14 @@ mod tests {
     #[test]
     fn serve_key_only_prints_the_key() {
         assert!(matches!(parsed(&["serve", "--key"]), Cmd::ServeKey));
+    }
+
+    #[test]
+    fn serve_refuses_port_zero_since_the_snippet_could_not_name_it() {
+        assert!(
+            parse(["serve".to_string(), "--port".to_string(), "0".to_string()].into_iter())
+                .is_err()
+        );
     }
 
     #[test]

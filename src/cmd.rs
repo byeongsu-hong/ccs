@@ -557,16 +557,29 @@ impl Desk<'_> {
     /// A session may have refreshed them already, leaving the stash behind on
     /// a spent refresh token; the copies are brought level before one is
     /// presented to the server.
+    ///
+    /// A refresh that fails may still be a race lost to such a session, one
+    /// that presented the same refresh token a moment earlier: the copies
+    /// are levelled once more, and only a copy that is still spent is a
+    /// failure.
     fn hand_out(&self, slug: &str, accounts: &mut [Stashed], live: Option<&str>) -> Result<Grant> {
         let position = accounts.iter().position(|a| a.slug == slug).context("no such account")?;
-        if accounts[position].account.oauth.needs_refresh() {
-            reconcile(self.ctx, accounts, live)?;
+        if !accounts[position].account.oauth.needs_refresh() {
+            return Ok(grant_of(&accounts[position]));
         }
-        let entry = &mut accounts[position];
-        if let Some(oauth) = freshen(self.ctx.api, &entry.account.oauth)? {
-            propagate(self.ctx, entry, &oauth, live)?;
+        reconcile(self.ctx, accounts, live)?;
+        let refreshed = freshen(self.ctx.api, &accounts[position].account.oauth);
+        match refreshed {
+            Ok(Some(oauth)) => propagate(self.ctx, &mut accounts[position], &oauth, live)?,
+            Ok(None) => {}
+            Err(e) => {
+                reconcile(self.ctx, accounts, live)?;
+                if accounts[position].account.oauth.needs_refresh() {
+                    return Err(e);
+                }
+            }
         }
-        Ok(grant_of(entry))
+        Ok(grant_of(&accounts[position]))
     }
 }
 
@@ -1332,6 +1345,23 @@ mod tests {
         let renewed = desk.stale(&old).expect("answers").expect("a newer copy");
         assert_eq!(renewed.token, "access-r-b-2");
         // ...and the stash was brought up to date while it was at it.
+        assert_eq!(fixture.tokens("b").0, "r-b-2");
+    }
+
+    /// A stash copy that has expired may already have been superseded by the
+    /// session's own refresh. The newer copy is what gets handed out, and no
+    /// refresh is attempted on the spent one.
+    #[test]
+    fn a_spent_stash_copy_is_brought_level_before_any_refresh_is_attempted() {
+        let fixture = desk_fixture("desk-level", Some("b"), &[]);
+        let spent = stashed("b", oauth("r-b", 0));
+        fixture.stash.save(&spent.slug, &spent.account).expect("stash");
+        fixture.creds.write(&CredsFile::new(oauth("r-b-2", LATER))).expect("live");
+        let ctx = fixture.ctx();
+
+        let grant = Desk { ctx: &ctx, pool: &fixture.pool }.grant(&[]).expect("grants");
+
+        assert_eq!(grant.token, "access-r-b-2");
         assert_eq!(fixture.tokens("b").0, "r-b-2");
     }
 

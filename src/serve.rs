@@ -42,10 +42,13 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 /// remade for the connection upstream rather than forwarded. The client's
 /// credentials go with them, since the account's replace them, and its accepted
 /// encodings, since the reply is passed on as bytes and has to arrive as such.
-const NOT_FORWARDED: [&str; 10] = [
+/// `expect` in particular would have the client's `100-continue` waited out
+/// upstream, on a body that has already been read whole here.
+const NOT_FORWARDED: [&str; 14] = [
     "host",
     "authorization",
     "x-api-key",
+    "proxy-authorization",
     "content-length",
     "transfer-encoding",
     "connection",
@@ -53,6 +56,9 @@ const NOT_FORWARDED: [&str; 10] = [
     "accept-encoding",
     "proxy-connection",
     "upgrade",
+    "expect",
+    "te",
+    "trailer",
 ];
 
 /// One request as the client sent it, body and all.
@@ -172,10 +178,7 @@ pub fn write_response(
     headers: &[(String, String)],
     body: &mut impl Read,
 ) -> io::Result<()> {
-    write!(out, "HTTP/1.1 {status} {}\r\n", reason(status))?;
-    for (name, value) in headers {
-        write!(out, "{name}: {value}\r\n")?;
-    }
+    write_status(out, status, headers)?;
     out.write_all(b"transfer-encoding: chunked\r\n\r\n")?;
     let mut buffer = [0; 16 * 1024];
     loop {
@@ -194,6 +197,32 @@ pub fn write_response(
     out.flush()
 }
 
+/// Write a response that carries no body — a `HEAD`'s, or one whose status
+/// says so — with nothing after the headers, since a client will not read
+/// past them and framing there would be taken for the next response.
+pub fn write_head(
+    out: &mut impl Write,
+    status: u16,
+    headers: &[(String, String)],
+) -> io::Result<()> {
+    write_status(out, status, headers)?;
+    out.write_all(b"\r\n")?;
+    out.flush()
+}
+
+fn write_status(out: &mut impl Write, status: u16, headers: &[(String, String)]) -> io::Result<()> {
+    write!(out, "HTTP/1.1 {status} {}\r\n", reason(status))?;
+    for (name, value) in headers {
+        write!(out, "{name}: {value}\r\n")?;
+    }
+    Ok(())
+}
+
+/// Whether a response to `method` with `status` has a body at all.
+fn bodiless(method: &str, status: u16) -> bool {
+    method.eq_ignore_ascii_case("HEAD") || matches!(status, 100..=199 | 204 | 304)
+}
+
 /// Write a whole response at once: a refusal, or an error of this gateway's own.
 pub fn write_error(out: &mut impl Write, status: u16, kind: &str, message: &str) -> io::Result<()> {
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
@@ -209,10 +238,14 @@ pub fn error_body(kind: &str, message: &str) -> String {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        204 => "No Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        413 => "Payload Too Large",
+        422 => "Unprocessable Entity",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -251,10 +284,11 @@ pub trait Accounts {
 const NOT_RELAYED: [&str; 5] =
     ["content-length", "transfer-encoding", "content-encoding", "connection", "keep-alive"];
 
-/// How long to wait for a connection, and for the head of a response. A body
-/// gets no deadline: a streamed completion runs for as long as it runs.
+/// How long to wait for a connection. Nothing after that has a deadline: a
+/// streamed completion runs for as long as it runs, and a cap on the response
+/// head would be measured against the body too, cutting a long answer short.
+/// A client that wants to give up sooner has its own clock.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The API a request is relayed to.
 pub struct Upstream {
@@ -274,8 +308,9 @@ impl Upstream {
         let config = ureq::Agent::config_builder()
             .timeout_global(None)
             .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_recv_response(Some(RESPONSE_TIMEOUT))
             .http_status_as_error(false)
+            // What the API says is what the client hears, a redirect included.
+            .max_redirects(0)
             // The client's own user agent is forwarded; failing that, none.
             .user_agent("")
             // Bytes are relayed as they come, so the answer has to be plain.
@@ -333,9 +368,9 @@ pub fn answer(
         return Ok(Outcome::refused(404));
     }
 
-    let mut tried: Vec<String> = Vec::new();
-    let mut renewed = false;
-    let mut grant = match accounts.grant(&tried) {
+    let mut outcome = Outcome::refused(0);
+    let mut renewed: Vec<String> = Vec::new();
+    let mut grant = match accounts.grant(&outcome.tried) {
         Ok(grant) => grant,
         Err(why) => {
             write_error(out, 503, "api_error", &why)?;
@@ -343,33 +378,46 @@ pub fn answer(
         }
     };
     loop {
+        outcome.slug = Some(grant.slug.clone());
         let mut reply = match upstream.send(request, &grant.token) {
             Ok(reply) => reply,
             Err(e) => {
                 let why = format!("the API could not be reached: {e:#}");
                 write_error(out, 502, "api_error", &why)?;
-                return Ok(Outcome { status: 502, slug: Some(grant.slug), tried });
+                outcome.status = 502;
+                return Ok(outcome);
             }
         };
         match reply.status {
             429 => {
-                tried.push(grant.slug.clone());
-                if let Ok(next) = accounts.grant(&tried) {
-                    grant = next;
-                    continue;
+                outcome.tried.push(grant.slug.clone());
+                match accounts.grant(&outcome.tried) {
+                    Ok(next) => {
+                        grant = next;
+                        continue;
+                    }
+                    Err(why) => outcome.failed = Some(why),
                 }
             }
-            401 if !renewed => {
-                renewed = true;
-                if let Ok(Some(next)) = accounts.stale(&grant) {
-                    grant = next;
-                    continue;
+            401 if !renewed.contains(&grant.slug) => {
+                renewed.push(grant.slug.clone());
+                match accounts.stale(&grant) {
+                    Ok(Some(next)) => {
+                        grant = next;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(why) => outcome.failed = Some(why),
                 }
             }
             _ => {}
         }
-        write_response(out, reply.status, &reply.headers, &mut reply.body)?;
-        return Ok(Outcome { status: reply.status, slug: Some(grant.slug), tried });
+        outcome.status = reply.status;
+        match bodiless(&request.method, reply.status) {
+            true => write_head(out, reply.status, &reply.headers)?,
+            false => write_response(out, reply.status, &reply.headers, &mut reply.body)?,
+        }
+        return Ok(outcome);
     }
 }
 
@@ -381,11 +429,15 @@ pub struct Outcome {
     pub slug: Option<String>,
     /// Accounts found limited along the way.
     pub tried: Vec<String>,
+    /// Why the stash could not help further, when it was asked and could not:
+    /// a pool with nobody left, or an account whose renewal failed. The
+    /// client hears the API's own answer; this is for the log.
+    pub failed: Option<String>,
 }
 
 impl Outcome {
     fn refused(status: u16) -> Self {
-        Self { status, slug: None, tried: Vec::new() }
+        Self { status, slug: None, tried: Vec::new(), failed: None }
     }
 }
 
@@ -480,14 +532,19 @@ fn logged(request: &Request, outcome: &Outcome, took: std::time::Duration) -> St
         line.push_str(&format!(" ({} limited)", outcome.tried.join(", ")));
     }
     line.push_str(&format!(" {:.1}s", took.as_secs_f64()));
+    if let Some(why) = &outcome.failed {
+        line.push_str(&format!("\n{stamp}   could not fall over: {why}"));
+    }
     line
 }
 
 /// The gateway key: minted the first time it is asked for, read back after.
+/// A file holding anything but a whole key is replaced: a truncated one
+/// would be a key anyone could guess.
 pub fn key(root: &Path) -> Result<String> {
     let path = root.join(KEY_FILE);
     match fs::read_to_string(&path) {
-        Ok(held) if held.trim().starts_with(KEY_PREFIX) => return Ok(held.trim().to_string()),
+        Ok(held) if whole(held.trim()) => return Ok(held.trim().to_string()),
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
@@ -495,6 +552,12 @@ pub fn key(root: &Path) -> Result<String> {
     let minted = generate_key();
     write_atomic(&path, format!("{minted}\n").as_bytes(), KEY_MODE)?;
     Ok(minted)
+}
+
+/// Whether `key` is one this minted: the prefix and 32 hexadecimal digits.
+fn whole(key: &str) -> bool {
+    key.strip_prefix(KEY_PREFIX)
+        .is_some_and(|suffix| suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A key pi will take for an OAuth token, with enough behind the prefix that
@@ -593,6 +656,9 @@ mod tests {
              Content-Length: 2\r\n\
              Connection: keep-alive\r\n\
              Accept-Encoding: gzip, br\r\n\
+             Expect: 100-continue\r\n\
+             TE: trailers\r\n\
+             Proxy-Authorization: Basic x\r\n\
              anthropic-beta: oauth-2025-04-20\r\n\
              User-Agent: claude-cli/2.0.0\r\n\
              \r\n{}",
@@ -625,6 +691,31 @@ mod tests {
         let mode = std::fs::metadata(root.join("gateway.key")).expect("file").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_key_file_that_is_not_a_whole_key_is_replaced_rather_than_trusted() {
+        let root = std::env::temp_dir().join(format!("ccs-serve-badkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("gateway.key"), "sk-ant-oat-ccs-\n").expect("write");
+
+        let minted = key(&root).expect("mints");
+        let suffix = minted.strip_prefix("sk-ant-oat-ccs-").expect("prefix");
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.bytes().all(|b| b.is_ascii_hexdigit()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_response_that_carries_no_body_is_written_without_framing() {
+        let mut out = Vec::new();
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        write_head(&mut out, 204, &headers).expect("writes");
+        let text = String::from_utf8(out).expect("ascii");
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"), "{text}");
+        assert!(!text.contains("transfer-encoding"), "{text}");
+        assert!(text.ends_with("application/json\r\n\r\n"), "{text}");
     }
 
     #[test]
@@ -691,6 +782,7 @@ mod tests {
                 write!(
                     writer,
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                     location: /elsewhere\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 )
@@ -706,8 +798,10 @@ mod tests {
         grants: Vec<Grant>,
         asked_to_avoid: RefCell<Vec<Vec<String>>>,
         marked_stale: RefCell<Vec<String>>,
-        /// What a stale report is answered with, when anything.
-        renewed: Option<Grant>,
+        /// What a stale report on each account is answered with, when anything.
+        renewed: Vec<Grant>,
+        /// Why falling over to the pool fails, when it does.
+        broken: Option<String>,
     }
 
     fn grant(slug: &str) -> Grant {
@@ -721,6 +815,9 @@ mod tests {
     impl Accounts for Pool {
         fn grant(&self, avoid: &[String]) -> Result<Grant, String> {
             self.asked_to_avoid.borrow_mut().push(avoid.to_vec());
+            if let (false, Some(why)) = (avoid.is_empty(), &self.broken) {
+                return Err(why.clone());
+            }
             self.grants
                 .iter()
                 .find(|g| !avoid.contains(&g.slug))
@@ -730,7 +827,7 @@ mod tests {
 
         fn stale(&self, grant: &Grant) -> Result<Option<Grant>, String> {
             self.marked_stale.borrow_mut().push(grant.slug.clone());
-            Ok(self.renewed.clone())
+            Ok(self.renewed.iter().find(|g| g.slug == grant.slug).cloned())
         }
     }
 
@@ -761,9 +858,25 @@ mod tests {
     }
 
     fn answered(request: &Request, upstream: &Upstream, pool: &Pool) -> (u16, String) {
+        let (status, body, _) = answered_fully(request, upstream, pool);
+        (status, body)
+    }
+
+    fn answered_fully(
+        request: &Request,
+        upstream: &Upstream,
+        pool: &Pool,
+    ) -> (u16, String, Outcome) {
         let mut out = Vec::new();
-        answer(request, KEY, upstream, pool, &mut out).expect("answers");
-        parse_response(&out)
+        let outcome = answer(request, KEY, upstream, pool, &mut out).expect("answers");
+        let (status, body) = parse_response(&out);
+        (status, body, outcome)
+    }
+
+    fn renewed(slug: &str) -> Grant {
+        let mut renewed = grant(slug);
+        renewed.token = format!("tok-{slug}-2");
+        renewed
     }
 
     #[test]
@@ -829,10 +942,11 @@ mod tests {
     #[test]
     fn a_rejected_token_is_renewed_once_and_the_request_tried_again() {
         let (up, seen) = upstream(vec![(401, r#"{"auth":"no"}"#), (200, r#"{"id":"ok"}"#)]);
-        let mut renewed = grant("work");
-        renewed.token = "tok-work-2".into();
-        let pool =
-            Pool { grants: vec![grant("work")], renewed: Some(renewed), ..Default::default() };
+        let pool = Pool {
+            grants: vec![grant("work")],
+            renewed: vec![renewed("work")],
+            ..Default::default()
+        };
 
         let (status, _) = answered(&post("/v1/messages", KEY), &up, &pool);
 
@@ -840,6 +954,81 @@ mod tests {
         let seen = seen.lock().expect("lock");
         assert_eq!(seen[1].bearer.as_deref(), Some("tok-work-2"));
         assert_eq!(*pool.marked_stale.borrow(), vec!["work".to_string()]);
+    }
+
+    #[test]
+    fn each_account_gets_its_own_renewal_when_the_pool_is_walked() {
+        let script = vec![(401, "{}"), (429, "{}"), (401, "{}"), (200, r#"{"id":"ok"}"#)];
+        let (up, seen) = upstream(script);
+        let pool = Pool {
+            grants: vec![grant("work"), grant("alt")],
+            renewed: vec![renewed("work"), renewed("alt")],
+            ..Default::default()
+        };
+
+        let (status, _) = answered(&post("/v1/messages", KEY), &up, &pool);
+
+        assert_eq!(status, 200);
+        let bearers: Vec<_> = seen.lock().expect("lock").iter().map(|s| s.bearer.clone()).collect();
+        let expected =
+            ["tok-work", "tok-work-2", "tok-alt", "tok-alt-2"].map(|t| Some(t.to_string()));
+        assert_eq!(bearers, expected);
+    }
+
+    #[test]
+    fn a_pool_that_cannot_take_over_is_said_so_in_the_outcome() {
+        let (up, _) = upstream(vec![(429, r#"{"rate":"limited"}"#)]);
+        let pool = Pool {
+            grants: vec![grant("work")],
+            broken: Some("alt no longer refreshes".into()),
+            ..Default::default()
+        };
+
+        let (status, _, outcome) = answered_fully(&post("/v1/messages", KEY), &up, &pool);
+
+        assert_eq!(status, 429);
+        assert_eq!(outcome.failed.as_deref(), Some("alt no longer refreshes"));
+    }
+
+    #[test]
+    fn a_redirect_is_relayed_rather_than_followed() {
+        let (up, seen) = upstream(vec![(302, "")]);
+        let pool = Pool { grants: vec![grant("work")], ..Default::default() };
+
+        let (status, _) = answered(&post("/v1/messages", KEY), &up, &pool);
+
+        assert_eq!(status, 302);
+        assert_eq!(seen.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn a_head_request_is_answered_without_a_body_or_its_framing() {
+        let (up, _) = upstream(vec![(200, "")]);
+        let pool = Pool { grants: vec![grant("work")], ..Default::default() };
+        let head = request(&format!(
+            "HEAD /v1/models HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {KEY}\r\n\r\n"
+        ));
+
+        let mut out = Vec::new();
+        answer(&head, KEY, &up, &pool, &mut out).expect("answers");
+
+        let text = String::from_utf8(out).expect("ascii");
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(!text.contains("transfer-encoding"), "{text}");
+        assert!(text.ends_with("\r\n\r\n") && !text.ends_with("0\r\n\r\n"), "{text}");
+    }
+
+    #[test]
+    fn a_no_content_answer_is_relayed_without_framing() {
+        let (up, _) = upstream(vec![(204, "")]);
+        let pool = Pool { grants: vec![grant("work")], ..Default::default() };
+
+        let mut out = Vec::new();
+        answer(&post("/v1/messages", KEY), KEY, &up, &pool, &mut out).expect("answers");
+
+        let text = String::from_utf8(out).expect("ascii");
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"), "{text}");
+        assert!(!text.contains("transfer-encoding"), "{text}");
     }
 
     #[test]

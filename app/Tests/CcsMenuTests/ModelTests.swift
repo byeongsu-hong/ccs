@@ -17,18 +17,37 @@ final class ModelTests: XCTestCase {
           "scope": {"model": {"display_name": "Fable"}}}
        ]},
       {"slug": "alt_at_example.com", "email": "alt@example.com", "plan": "pro", "active": false,
-       "limits": [{"kind": "session", "percent": 100.0, "severity": null, "resets_at": null, "scope": null}]}
+       "limits": [{"kind": "session", "percent": 100.0, "severity": null, "resets_at": null, "scope": null}]},
+      {"provider": "codex", "slug": "codex-gpt_at_example.com", "email": "gpt@example.com", "plan": "codex pro", "active": true,
+       "limits": [{"kind": "weekly_all", "percent": 100.0, "severity": null, "resets_at": null, "scope": null}]}
     ]
     """.data(using: .utf8)!
 
     func testAListingDecodesIntoAccountsWithTheirLimits() throws {
         let accounts = try decodeAccounts(Self.listing)
-        XCTAssertEqual(accounts.map(\.slug), ["you_at_example.com", "alt_at_example.com"])
+        XCTAssertEqual(accounts.map(\.slug), ["you_at_example.com", "alt_at_example.com", "codex-gpt_at_example.com"])
         XCTAssertEqual(accounts[0].email, "you@example.com")
         XCTAssertEqual(accounts[0].plan, "max20x")
         XCTAssertTrue(accounts[0].active)
         XCTAssertEqual(accounts[0].limits.count, 3)
         XCTAssertEqual(accounts[0].limits[2].percent, 52)
+    }
+
+    /// Each provider has an account in use; a listing without a provider
+    /// is a Claude one, and the Codex row says so.
+    func testAnAccountNamesItsProviderAndDefaultsToClaude() throws {
+        let accounts = try decodeAccounts(Self.listing)
+        XCTAssertEqual(accounts[0].provider, .claude)
+        XCTAssertEqual(accounts[2].provider, .codex)
+        XCTAssertEqual(accounts[2].email, "gpt@example.com")
+    }
+
+    /// Two rows can be active, one per provider; the menu bar shows the
+    /// Claude session, since that is the one with a five-hour window.
+    func testTheActiveClaudeAccountIsTheOneOnTheBar() throws {
+        let accounts = try decodeAccounts(Self.listing)
+        XCTAssertEqual(activeClaude(accounts)?.slug, "you_at_example.com")
+        XCTAssertEqual(accounts.filter(\.active).count, 2)
     }
 
     func testColumnsFollowTheCli() throws {

@@ -117,16 +117,24 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
 ///
 /// The active account keeps its place while it is in the pool with session
 /// headroom below `high` and weekly headroom at all. Once it has none, the
-/// pool member whose weekly window resets soonest takes over, so quota about
-/// to be forfeited is burned first; ties go to the emptier session. An active
-/// account outside the pool was chosen by hand and is left alone.
+/// pool member whose weekly window resets soonest and still has room takes
+/// over, so quota about to be forfeited is burned first; ties go to the
+/// emptier session. An active account outside the pool was chosen by hand and
+/// is left alone, and so is one whose standing could not be read this poll: a
+/// failed probe is not an empty account.
+///
+/// A switch is only made to an account `HYSTERESIS` points clear of the mark,
+/// so a rolling window that has just dipped under it does not pull the active
+/// account straight back.
 pub fn rotate<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Option<&'a Entry> {
     let active = entries.iter().find(|e| e.active)?;
-    if !pool.contains(&active.slug) || has_room(active, high) {
+    if active.limits.is_err() || !pool.contains(&active.slug) || has_room(active, high) {
         return None;
     }
-    entries.iter().filter(|e| !e.active && pool.contains(&e.slug) && has_room(e, high)).min_by(
-        |a, b| {
+    entries
+        .iter()
+        .filter(|e| !e.active && pool.contains(&e.slug) && has_room(e, high - HYSTERESIS))
+        .min_by(|a, b| {
             let key = |e: &Entry| {
                 (
                     limit(e, "weekly_all").and_then(at).unwrap_or(i64::MAX),
@@ -134,9 +142,11 @@ pub fn rotate<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Option<&'
                 )
             };
             key(a).cmp(&key(b))
-        },
-    )
+        })
 }
+
+/// How far under the high mark an account must be before it is switched to.
+const HYSTERESIS: f64 = 15.0;
 
 fn has_room(e: &Entry, high: f64) -> bool {
     e.limits.is_ok()
@@ -281,6 +291,25 @@ mod tests {
             rotate(&e, &pool(&["a", "b", "c", "d"]), 90.0).map(|e| e.slug.as_str()),
             Some("d")
         );
+    }
+
+    #[test]
+    fn an_account_just_under_the_mark_is_not_switched_to() {
+        let e = [
+            entry("a", true, (96.0, Some(T1)), Some(W1)),
+            entry("b", false, (80.0, Some(T1)), Some(W0)),
+            entry("c", false, (70.0, Some(T1)), Some(W1)),
+        ];
+        // b's weekly is sooner, but 80 is within HYSTERESIS of 90; c is clear.
+        assert_eq!(rotate(&e, &pool(&["a", "b", "c"]), 90.0).map(|e| e.slug.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn an_active_account_whose_probe_failed_is_not_mistaken_for_an_empty_one() {
+        let mut a = entry("a", true, (0.0, None), Some(W1));
+        a.limits = Err("429".into());
+        let e = [a, entry("b", false, (0.0, None), Some(W0))];
+        assert!(rotate(&e, &pool(&["a", "b"]), 90.0).is_none());
     }
 
     #[test]

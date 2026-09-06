@@ -44,6 +44,8 @@ final class Delegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        Task { @MainActor in Self.store?.shutdown() }
+        // Synchronously: the process is gone the moment this returns, and a
+        // task queued for later would never run, leaving the children behind.
+        MainActor.assumeIsolated { Self.store?.shutdown() }
     }
 }

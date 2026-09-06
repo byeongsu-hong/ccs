@@ -17,7 +17,7 @@ use crate::api::{Api, refreshed_oauth};
 use crate::creds::{self, Backend, CredStore};
 use crate::lock;
 use crate::login;
-use crate::model::{Account, CredsFile, Limit, Oauth, Stashed, plan_label};
+use crate::model::{Account, CredsFile, Limit, Oauth, Provider, Stashed, plan_label};
 use crate::notify;
 use crate::pen;
 use crate::picker::{self, Act, Outcome};
@@ -208,7 +208,7 @@ fn identify(ctx: &Ctx, accounts: &[Stashed], live: Option<&CredsFile>) -> Option
     if let Some(entry) = matched {
         return Some(entry.slug.clone());
     }
-    let recorded = ctx.stash.active()?;
+    let recorded = ctx.stash.active(Provider::Claude)?;
     accounts.iter().any(|a| a.slug == recorded).then_some(recorded)
 }
 
@@ -290,10 +290,10 @@ struct Cached {
 /// against the live credentials would cost a keychain read per call.
 fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
     let accounts = stashed(ctx)?;
-    let live = ctx.stash.active();
     accounts
         .iter()
         .map(|account| {
+            let live = ctx.stash.active(account.account.provider);
             let reading = ctx.usage.read(&account.slug)?;
             let (limits, polled_at) = match reading {
                 Some(reading) => (Ok(reading.limits), Some(reading.polled_at)),
@@ -413,6 +413,7 @@ fn record(ctx: &Ctx, oauth: Oauth, name: Option<&str>, installed: Installed) -> 
     let organization = profile.organization.as_ref();
 
     let account = Account {
+        provider: Provider::Claude,
         email: profile.account.email,
         uuid: profile.account.uuid,
         plan: organization.and_then(|o| o.organization_type.clone()),
@@ -422,7 +423,7 @@ fn record(ctx: &Ctx, oauth: Oauth, name: Option<&str>, installed: Installed) -> 
     };
     ctx.stash.save(&slug, &account)?;
     if installed == Installed::Yes {
-        ctx.stash.set_active(&slug)?;
+        ctx.stash.set_active(account.provider, &slug)?;
     }
     Ok(Recorded { stashed: Stashed { slug, account }, replaced })
 }
@@ -576,7 +577,11 @@ impl Desk<'_> {
     /// switch writes, and is cheap; the live credentials are read only when
     /// it points nowhere.
     fn live(&self, accounts: &[Stashed]) -> Result<Option<String>> {
-        let recorded = self.ctx.stash.active().filter(|s| accounts.iter().any(|a| a.slug == *s));
+        let recorded = self
+            .ctx
+            .stash
+            .active(Provider::Claude)
+            .filter(|s| accounts.iter().any(|a| a.slug == *s));
         match recorded {
             Some(slug) => Ok(Some(slug)),
             None => identify_live(self.ctx, accounts),
@@ -844,7 +849,7 @@ fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<us
         capture_outgoing(ctx, accounts, live, &target.slug)?;
     }
     ctx.creds.write(&merged(live, &target.account.oauth))?;
-    ctx.stash.set_active(&target.slug)?;
+    ctx.stash.set_active(target.account.provider, &target.slug)?;
     drop(_guard);
     let told = notify::broadcast(
         ctx.creds.dir(),
@@ -1110,6 +1115,7 @@ mod tests {
         Stashed {
             slug: slug.into(),
             account: Account {
+                provider: Provider::Claude,
                 email: format!("{slug}@example.com"),
                 uuid: "u".into(),
                 plan: None,
@@ -1243,7 +1249,7 @@ mod tests {
         assert!(said.contains("b@example.com"), "{said}");
         assert_eq!(deck.switched.expect("recorded for the terminal").0.slug, "b");
         assert_eq!(fixture.tokens("b").1.as_deref(), Some("b1"));
-        assert_eq!(fixture.stash.active().as_deref(), Some("b"));
+        assert_eq!(fixture.stash.active(Provider::Claude).as_deref(), Some("b"));
     }
 
     #[test]
@@ -1264,7 +1270,7 @@ mod tests {
         let fixture = Fixture::new("round-trip");
         let mut accounts = vec![stashed("a", oauth("a-old", 1)), stashed("b", oauth("b1", 1))];
         stash_all(&fixture, &accounts);
-        fixture.stash.set_active("a").expect("active");
+        fixture.stash.set_active(Provider::Claude, "a").expect("active");
         // A session on `a` refreshed the live credentials after the picker last
         // polled, so what the picker is holding for `a` is already spent.
         fixture.creds.write(&CredsFile::new(oauth("a-new", 2))).expect("live");
@@ -1320,7 +1326,7 @@ mod tests {
             let entry = stashed(slug, oauth(&format!("r-{slug}"), 0));
             fixture.stash.save(&entry.slug, &entry.account).expect("stash");
         }
-        fixture.stash.set_active("b").expect("active");
+        fixture.stash.set_active(Provider::Claude, "b").expect("active");
         fixture.usage.record("a", &[limit!("session", 42.0)]).expect("records");
 
         let entries = cached_entries(&fixture.ctx()).expect("lists");
@@ -1360,7 +1366,7 @@ mod tests {
             fixture.stash.save(&entry.slug, &entry.account).expect("stash");
         }
         if let Some(slug) = active {
-            fixture.stash.set_active(slug).expect("active");
+            fixture.stash.set_active(Provider::Claude, slug).expect("active");
         }
         fixture.pool = pool.iter().map(|s| s.to_string()).collect();
         fixture

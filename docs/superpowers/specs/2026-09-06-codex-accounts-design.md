@@ -14,8 +14,9 @@ independently.
   `~/.codex/auth.json`): `{auth_mode: "chatgpt", OPENAI_API_KEY, tokens:
   {id_token, access_token, refresh_token, account_id}, last_refresh}`. It
   honours `CODEX_HOME`, so a login can be run in a throwaway directory as
-  `ccs add` already does with `CLAUDE_CONFIG_DIR`. It reloads the file when it
-  changes ("guarded reload"), so a switch reaches running sessions.
+  `ccs add` already does with `CLAUDE_CONFIG_DIR`. Writing the file does not
+  establish when every running Codex client adopts it: verify with `/status`
+  and resume if the session still reports its previous account.
 - Identity is in the `id_token` claims: `email`, and under
   `https://api.openai.com/auth`: `chatgpt_account_id`, `chatgpt_plan_type`.
   The access token's `exp` claim is its expiry.
@@ -64,9 +65,12 @@ its provider's rows.
   window (or its only one). `reset_at` becomes RFC 3339.
 - `src/cmd.rs` — `Ctx` gains `codex: &dyn codex::Creds` and `codex_api:
   &codex::Client`. `live`, `identify`, `install`, `copies`, `propagate`,
-  `switch_to`, `probe`, `record` branch on the account's provider. Pens,
-  notices and `ccs pin` stay Claude-only; `ccs pin` on a Codex account says
-  so. `ccs status` reports each provider that has live credentials.
+  `switch_to`, `probe`, `record` branch on the account's provider. `ccs pin`
+  launches the selected account's client. Codex copies are identified by their
+  ChatGPT account ID, including pins switched in place. Refreshes propagate to
+  matching copies; a pin switch or capture leaves the global pointer alone.
+  `ccs status` reports each provider that has live credentials; --codex/--claude
+  selects one, and --cached reads its last poll without refreshing credentials.
 - `src/login.rs` — `run` gains the provider: a Codex login runs `codex
   login` with `CODEX_HOME` pointed at the scratch directory.
 - `src/watch.rs` — `rotate` runs per provider, over that provider's rows and
@@ -95,5 +99,31 @@ its provider's rows.
 
 ## Out of scope
 
-Pins and Claude Code notices for Codex accounts; pointing Codex CLI itself at
-the gateway; a WebSocket relay; API-key (`auth_mode: apikey`) logins.
+Pointing Codex CLI itself at the gateway; a WebSocket relay; API-key
+(`auth_mode: apikey`) logins; OS credential-store integration; native Codex
+status-line customization and per-turn token accounting.
+
+## Session integration
+
+- `src/pen.rs`: a Codex pin records its source home in `.ccs-codex-pen.json`,
+  shares only configuration through symlinks, and keeps auth and runtime state
+  private. Codex launches with `CODEX_HOME` and file credential storage.
+  Removing an account removes matching pinned credentials, preserving history.
+- `src/notify.rs`: Codex subscriptions live in `notify-codex.json`, separately
+  from Claude's existing inbox registrations. A subscription records its thread,
+  home, executable and kinds. Registration checks `queue --help` for thread and
+  message support. Delivery invokes that executable with literal arguments,
+  under the registered home, and reports failure without dropping subscriptions.
+  Claude registrations retain their permission attestation and now remember
+  their key directory. Switch notices are confined to the home that changed.
+- `src/watch.rs`: every event carries its provider. High usage and reset
+  comparisons use that provider's active account, and delivery routes accordingly.
+- `src/cli.rs`: --codex/--claude selects status or notice provider. Notification
+  auto-detection uses the Claude inbox variable first, then CODEX_THREAD_ID;
+  nested clients can select explicitly. --cached on status selects the account
+  from its live file and reads the existing cache, including the poll timestamp.
+
+Codex queue support was checked through the installed CLI 0.153.4 help. Clients
+without that command can use cached status but cannot subscribe to queued notices.
+Subscriptions are opt-in conversation messages; they do not install hooks, alter
+permissions, or translate Claude's configuration into Codex configuration.

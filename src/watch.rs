@@ -28,6 +28,7 @@ pub type Snapshot = HashMap<String, Seen>;
 /// A notice: which kind, and the line to deliver.
 #[derive(Debug, PartialEq)]
 pub struct Event {
+    pub provider: Provider,
     pub kind: &'static str,
     pub text: String,
 }
@@ -57,14 +58,12 @@ pub fn diff(before: &Snapshot, entries: &[Entry], high: f64) -> Vec<Event> {
 }
 
 fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Event> {
-    // Notices go into Claude Code sessions and are about Claude accounts:
-    // the account in use they compare against is the Claude one, and a
-    // Codex row is not theirs to hear about.
-    let claude = |e: &&Entry| e.provider == Provider::Claude;
-    let active_weekly =
-        entries.iter().filter(claude).find(|e| e.active).and_then(|e| at(limit(e, "weekly_all")?));
     let mut events = Vec::new();
-    for e in entries.iter().filter(claude) {
+    for e in entries {
+        let active_weekly = entries
+            .iter()
+            .find(|active| active.active && active.provider == e.provider)
+            .and_then(|active| at(limit(active, "weekly_all")?));
         if e.limits.is_err() {
             continue;
         }
@@ -78,6 +77,7 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
             && was.and_then(|w| w.session_pct).is_none_or(|p| p < high)
         {
             events.push(Event {
+                provider: e.provider,
                 kind: "session-high",
                 text: format!(
                     "{} session at {:.0}%{}; weekly {}",
@@ -97,6 +97,7 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
                 _ => "",
             };
             events.push(Event {
+                provider: e.provider,
                 kind: "session-reset",
                 text: format!(
                     "{} session window reset; weekly {}{sooner}",
@@ -110,6 +111,7 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
             && came_back(w.weekly_resets_at, weekly.and_then(at), now)
         {
             events.push(Event {
+                provider: e.provider,
                 kind: "weekly-reset",
                 text: format!("{} weekly window reset", e.email),
             });
@@ -247,12 +249,9 @@ mod tests {
         entry
     }
 
-    /// Notices go into Claude Code sessions, about Claude accounts; a Codex
-    /// row running high is not theirs to hear, and the weekly a reset is
-    /// compared against is the active Claude account's, whichever row sorts
-    /// first.
+    /// Both providers produce events; delivery uses the provider on each event.
     #[test]
-    fn notices_are_about_claude_rows_only() {
+    fn notices_name_the_provider_they_belong_to() {
         let before: Snapshot = [
             (
                 "a".to_string(),
@@ -275,8 +274,10 @@ mod tests {
         }]);
         let now = entry("a", true, (95.0, None), None);
         let events = diff_at(&before, &[gpt, now], 90.0, 0);
-        assert_eq!(events.len(), 1);
-        assert!(events[0].text.contains("a@x"), "{}", events[0].text);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].provider, Provider::Codex);
+        assert_eq!(events[1].provider, Provider::Claude);
+        assert!(events[1].text.contains("a@x"), "{}", events[1].text);
     }
 
     /// Each provider rotates among its own rows: a spent Claude account

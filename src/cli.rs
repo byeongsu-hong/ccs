@@ -5,12 +5,12 @@ use anyhow::{Result, bail};
 use crate::model::Provider;
 
 pub const HELP: &str = "\
-ccs - Claude Code account switcher
+ccs - Claude Code and Codex account switcher
 
 USAGE
     ccs                      pick an account interactively
     ccs ls                   every stashed account and what it has left
-    ccs use <account>        switch to an account; running sessions follow
+    ccs use <account>        switch that provider's login to an account
     ccs pin [<account>]      start a session confined to one account, leaving
                              every other session on the account in use
     ccs add                  log in to another account and stash it, without
@@ -20,13 +20,14 @@ USAGE
                              in to another, or stash the one `codex` is using
     ccs rm <account>         forget a stashed account
     ccs status               limits for the account currently in use
-    ccs notify [<kind>...]   from inside a Claude Code session: have notices
+    ccs notify [<kind>...]   from inside Claude Code or Codex: have notices
                              delivered into that session's chat. Kinds:
                              switch, session-high, session-reset, weekly-reset;
                              all of them when none is named. `ccs notify off`
-                             stops them. A session running with permission
+                             stops them. A Claude session with permission
                              prompts bypassed adds --bypass, or it will hold
-                             every notice for review.
+                             every notice for review. Codex uses `codex queue`;
+                             --codex or --claude selects the calling client.
     ccs watch                poll every account and raise session-high,
                              session-reset and weekly-reset notices; runs
                              until killed. With --rotate, also switch away
@@ -45,18 +46,19 @@ USAGE
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
 
-    Anything after `--` is passed on to Claude Code: `ccs pin -- --continue`.
+    Anything after `--` is passed on to the selected client: `ccs pin -- --continue`.
 
 OPTIONS
     -f, --force              switch even to an account with no headroom left
         --json               machine-readable output (ls, status)
-        --cached             what the last poll wrote down, without polling (ls);
+        --cached             what the last poll wrote down, without polling (ls, status);
                              `ccs watch` is what keeps that current
         --name <slug>        stash under this name instead of the email (add)
         --email <address>    pre-fill the login page (add)
         --console            log in with Console billing, not a subscription (add)
         --sso                force the SSO login flow (add)
-        --codex              a Codex account rather than a Claude one (add)
+        --codex              a Codex account (add), or only Codex (status, notify)
+        --claude             only Claude (status, notify)
         --every <seconds>    poll interval (watch; default 300)
         --high <percent>     session percentage that counts as high (watch; default 90)
         --rotate <a>,<b>,... accounts to rotate between (watch) or fall over
@@ -94,11 +96,14 @@ pub enum Cmd {
     },
     Status {
         json: bool,
+        cached: bool,
+        provider: Option<Provider>,
     },
     Notify {
         off: bool,
         kinds: Vec<String>,
         bypass: bool,
+        provider: Option<Provider>,
     },
     Watch {
         every: u64,
@@ -116,6 +121,15 @@ pub enum Cmd {
     Version,
 }
 
+fn selected_provider(args: &[String]) -> Result<Option<Provider>> {
+    match (has(args, "--claude"), has(args, "--codex")) {
+        (true, true) => bail!("choose one provider: --claude or --codex"),
+        (true, false) => Ok(Some(Provider::Claude)),
+        (false, true) => Ok(Some(Provider::Codex)),
+        (false, false) => Ok(None),
+    }
+}
+
 pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
     let args: Vec<String> = args.collect();
     let Some(head) = args.first() else { return Ok(Cmd::Pick) };
@@ -126,7 +140,11 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "ls" | "list" => {
             Ok(Cmd::List { json: has(&args[1..], "--json"), cached: has(&args[1..], "--cached") })
         }
-        "status" | "st" => Ok(Cmd::Status { json: has(&args[1..], "--json") }),
+        "status" | "st" => Ok(Cmd::Status {
+            json: has(&args[1..], "--json"),
+            cached: has(&args[1..], "--cached"),
+            provider: selected_provider(&args[1..])?,
+        }),
         "notify" => {
             let rest = &args[1..];
             Ok(Cmd::Notify {
@@ -137,6 +155,7 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
                     .cloned()
                     .collect(),
                 bypass: has(rest, "--bypass"),
+                provider: selected_provider(rest)?,
             })
         }
         "watch" => {
@@ -273,6 +292,32 @@ mod tests {
 
     fn parsed(words: &[&str]) -> Cmd {
         parse(words.iter().map(|w| w.to_string())).expect("parses")
+    }
+
+    #[test]
+    fn status_selects_a_provider_and_can_read_without_polling() {
+        assert!(matches!(
+            parsed(&["status", "--codex", "--cached", "--json"]),
+            Cmd::Status { json: true, cached: true, provider: Some(Provider::Codex) }
+        ));
+        assert!(matches!(parsed(&["status"]), Cmd::Status { cached: false, provider: None, .. }));
+        assert!(parse(["status", "--claude", "--codex"].map(String::from).into_iter()).is_err());
+    }
+
+    #[test]
+    fn notify_can_select_codex_without_treating_the_flag_as_a_kind() {
+        let Cmd::Notify { off, kinds, provider, .. } =
+            parsed(&["notify", "--codex", "session-high"])
+        else {
+            panic!("notify")
+        };
+        assert!(!off);
+        assert_eq!(kinds, ["session-high"]);
+        assert_eq!(provider, Some(Provider::Codex));
+        assert!(matches!(
+            parsed(&["notify", "off", "--codex"]),
+            Cmd::Notify { off: true, provider: Some(Provider::Codex), .. }
+        ));
     }
 
     #[test]

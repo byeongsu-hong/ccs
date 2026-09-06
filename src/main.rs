@@ -1,6 +1,7 @@
 mod api;
 mod cli;
 mod cmd;
+mod codex;
 mod creds;
 mod fsx;
 mod lock;

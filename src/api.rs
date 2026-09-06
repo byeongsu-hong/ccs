@@ -58,6 +58,9 @@ pub struct Refreshed {
     /// Seconds.
     #[serde(default)]
     pub expires_in: Option<i64>,
+    /// Codex's endpoint rotates the identity token too.
+    #[serde(default)]
+    pub id_token: Option<String>,
 }
 
 impl Api {
@@ -188,6 +191,7 @@ mod tests {
             access_token: "new-access".into(),
             refresh_token: Some("new-refresh".into()),
             expires_in: Some(3600),
+            id_token: None,
         };
         let folded = refreshed_oauth(&previous(), &next);
         assert_eq!(folded.access_token, "new-access");
@@ -200,14 +204,19 @@ mod tests {
             access_token: "new-access".into(),
             refresh_token: None,
             expires_in: Some(60),
+            id_token: None,
         };
         assert_eq!(refreshed_oauth(&previous(), &next).refresh_token, "old-refresh");
     }
 
     #[test]
     fn refreshing_preserves_every_field_the_response_is_silent_about() {
-        let next =
-            Refreshed { access_token: "new".into(), refresh_token: None, expires_in: Some(60) };
+        let next = Refreshed {
+            access_token: "new".into(),
+            refresh_token: None,
+            expires_in: Some(60),
+            id_token: None,
+        };
         let folded = refreshed_oauth(&previous(), &next);
         assert_eq!(folded.scopes, ["user:inference"]);
         assert_eq!(folded.subscription_type.as_deref(), Some("max"));
@@ -216,8 +225,12 @@ mod tests {
 
     #[test]
     fn a_stated_lifetime_is_honoured() {
-        let next =
-            Refreshed { access_token: "new".into(), refresh_token: None, expires_in: Some(3600) };
+        let next = Refreshed {
+            access_token: "new".into(),
+            refresh_token: None,
+            expires_in: Some(3600),
+            id_token: None,
+        };
         let slack = (refreshed_oauth(&previous(), &next).expires_at - now_ms() - 3_600_000).abs();
         assert!(slack < 5_000, "expiry should track the stated lifetime, off by {slack}ms");
     }
@@ -242,7 +255,12 @@ mod tests {
 
     #[test]
     fn a_missing_lifetime_falls_back_short_rather_than_optimistic() {
-        let next = Refreshed { access_token: "new".into(), refresh_token: None, expires_in: None };
+        let next = Refreshed {
+            access_token: "new".into(),
+            refresh_token: None,
+            expires_in: None,
+            id_token: None,
+        };
         let folded = refreshed_oauth(&previous(), &next);
         assert!(folded.expires_at <= now_ms() + FALLBACK_LIFETIME_MS);
         assert!(folded.expires_at > now_ms());

@@ -134,14 +134,22 @@ and log in there before choosing Codex in `ccs add --current`. See
 [Codex authentication](https://developers.openai.com/codex/auth/).
 `ccs pin` selects file credentials for its Codex launch.
 
-Codex's `Shared` row shows the main quota; additional named pools appear below
-it. Every reported window is retained, including both five-hour and weekly
-windows when present. Spark is one possible extra pool, not the whole Codex
-quota or a fixed list of supported models. A model without a separate reported
-pool does not get an invented per-model meter. Window durations come from the
-response, so a missing five-hour window is shown as absent, not as zero usage.
-The backend distinguishes the main quota from optional named pools in its
-[usage response schema](https://github.com/openai/codex/blob/main/codex-rs/codex-backend-openapi-models/src/models/rate_limit_status_payload.rs).
+Codex shows the reported shared quota windows and a model availability column
+when the backend supplies one. `Astra` appears alongside those windows, in the
+same place that model-specific limits occupy in the Claude section. Its cell
+says `available`, `unavailable`, or `back 1h30m` when a future availability time
+is reported. It adds `credits unlock` when the response says credits would
+provide access. Missing availability is `unknown`; an elapsed countdown never
+overrides the backend's availability flag.
+
+Astra's availability is distinct from a percentage-based quota. No separate
+GPT-5.6 or Astra percentage is invented. Spark is hidden from terminal tables,
+text status and switch warnings. JSON and the usage cache retain its readings,
+along with `model_usage` metadata for every reported model. Other named quota
+pools appear on continuation rows with a `POOL` column when needed. Every
+reported window is retained, including both five-hour and weekly windows when
+present; missing windows appear as absent. The backend describes quota windows
+in its [usage response schema](https://github.com/openai/codex/blob/main/codex-rs/codex-backend-openapi-models/src/models/rate_limit_status_payload.rs).
 
 Old cached Codex readings that lost a named pool's window duration appear under
 `CACHED WINDOW` until the next poll replaces them. Refresh with `r` in the picker
@@ -218,31 +226,29 @@ For example, the Claude section:
    2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h
    3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   ███░  70% 5d19h
 
-  session          █░░░  10%   resets in 3h 54m
-  weekly           ███░  55%   resets in 6h 24m
-  Fable            ████ 100%   resets in 6h 24m   spent
-
   up/down select   enter switch   esc unselect   r refresh   q quit      updated just now
 ```
 
-The Codex section has a pool column and window columns instead:
+The Codex section shows its quota windows and model availability:
 
 ```text
   Codex
-     ACCOUNT          PLAN       POOL                 5H                WEEKLY
-   4 you@example.com  codex pro  Shared               █░░░  16% 3h54m   ██░░  29% 2d11h   <- active
-                                 GPT-5.3-Codex-Spark  █░░░   1% 3h54m   █░░░   2% 2d11h
+     ACCOUNT              PLAN       WEEKLY            ASTRA
+   4 you@example.com      codex pro  ██░░  29% 2d11h   available         <- active
+   5 you+alt@example.com  codex pro  ███░  65% 2d11h   back 1h30m
 ```
 
-Additional pool names come from the API and are displayed the same way. Pool
-rows belong to the account above them; only accounts are selectable.
+Additional pool names and model IDs come from the API. Pool rows belong to the
+account above them; only accounts are selectable. Switching to an account with
+an unavailable model prompts for confirmation, just as a spent quota does.
+Watcher notices and rotation continue to follow shared quota windows.
 
-Arrows or `j`/`k` move, `home`/`end` jump to the ends, and the block under the
-table details whichever account you are sitting on. `enter` asks before it does
-anything, and says what is spent if anything is:
+Arrows or `j`/`k` move and `home`/`end` jump to the ends. The table carries the
+readings; the footer carries keys and confirmations. `ccs status` shows detailed
+readings separately. `enter` asks before it does anything and names restrictions:
 
 ```
-  you@example.com on Claude Code has no Fable left. Switch anyway? [y/n]
+  you@example.com on Claude Code: no Fable left. Switch anyway? [y/n]
 ```
 
 Answering yes switches, and the picker stays where it is — the active marker moves

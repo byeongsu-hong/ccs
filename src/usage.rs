@@ -21,7 +21,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::fsx::write_atomic;
-use crate::model::Limit;
+use crate::model::UsageResponse;
 
 /// Readings sit beside the stash, which is owner-only; what an account has
 /// spent is nobody else's business either.
@@ -34,7 +34,8 @@ pub struct Reading {
     /// When this was fetched, RFC 3339. A reader deciding whether to trust a
     /// reading has to be told its age, because nothing in the limits says.
     pub polled_at: String,
-    pub limits: Vec<Limit>,
+    #[serde(flatten)]
+    pub usage: UsageResponse,
 }
 
 pub struct Cache {
@@ -55,8 +56,8 @@ impl Cache {
     /// One file per account rather than one file of accounts, so two runs
     /// polling at once record their own readings instead of landing on each
     /// other's.
-    pub fn record(&self, slug: &str, limits: &[Limit]) -> Result<()> {
-        let reading = Reading { polled_at: Timestamp::now().to_string(), limits: limits.to_vec() };
+    pub fn record(&self, slug: &str, usage: &UsageResponse) -> Result<()> {
+        let reading = Reading { polled_at: Timestamp::now().to_string(), usage: usage.clone() };
         let body = serde_json::to_vec_pretty(&reading).context("serialising a usage reading")?;
         write_atomic(&self.at(slug), &body, FILE_MODE)
     }
@@ -136,19 +137,50 @@ mod tests {
             limit!("session", 3.0, resets = "2026-01-01T00:00:00Z"),
             limit!("weekly_scoped", 100.0, model = "Fable", severity = "critical"),
         ];
-        fixture.cache.record("you_at_example.com", &limits).expect("records");
+        fixture.cache.record("you_at_example.com", &limits.into()).expect("records");
 
         let back = fixture.read("you_at_example.com");
-        assert_eq!(back.limits.len(), 2);
-        assert_eq!(back.limits[0].resets_at.as_deref(), Some("2026-01-01T00:00:00Z"));
-        assert_eq!(back.limits[1].model_name(), Some("Fable"));
-        assert_eq!(back.limits[1].severity.as_deref(), Some("critical"));
+        assert_eq!(back.usage.limits.len(), 2);
+        assert_eq!(back.usage.limits[0].resets_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(back.usage.limits[1].model_name(), Some("Fable"));
+        assert_eq!(back.usage.limits[1].severity.as_deref(), Some("critical"));
+    }
+
+    #[test]
+    fn availability_round_trips_but_is_not_carried_over_when_no_longer_reported() {
+        let fixture = Fixture::new("availability");
+        for at in [serde_json::json!("2026-09-07T03:00:00Z"), serde_json::json!(1788750000_i64)] {
+            let raw = serde_json::json!({"limits": [], "model_usage": {"gpt-6-astra": {
+                "available": false, "available_at": at, "credits_would_enable": true
+            }}});
+            let usage: UsageResponse = serde_json::from_value(raw.clone()).unwrap();
+            fixture.cache.record("a", &usage).expect("records model gate");
+            let back = fixture.cache.read("a").unwrap().unwrap();
+            assert_eq!(serde_json::to_value(back.usage).unwrap(), raw);
+            let file: serde_json::Value =
+                serde_json::from_slice(&fs::read(fixture.cache.at("a")).unwrap()).unwrap();
+            assert!(file.get("limits").is_some(), "existing cache field stays at the root");
+            assert_eq!(file["model_usage"], raw["model_usage"]);
+        }
+        fixture.cache.record("a", &UsageResponse::default()).expect("fresh response");
+        assert!(fixture.read("a").usage.model_usage.is_none());
+    }
+
+    #[test]
+    fn an_older_cache_does_not_imply_any_model_is_available() {
+        let reading: Reading = serde_json::from_value(serde_json::json!({
+            "polled_at": "2026-09-07T00:00:00Z",
+            "limits": [{"kind": "weekly_all", "percent": 12}]
+        }))
+        .expect("old cache");
+        assert_eq!(reading.usage.limits[0].percent, 12.0);
+        assert!(reading.usage.model_usage.is_none());
     }
 
     #[test]
     fn a_reading_is_stamped_with_a_time_a_reader_can_parse() {
         let fixture = Fixture::new("stamp");
-        fixture.cache.record("a", &[limit!("session", 3.0)]).expect("records");
+        fixture.cache.record("a", &vec![limit!("session", 3.0)].into()).expect("records");
 
         let stamped = fixture.read("a").polled_at;
         let parsed: Timestamp = stamped.parse().unwrap_or_else(|e| panic!("{stamped}: {e}"));
@@ -158,28 +190,28 @@ mod tests {
     #[test]
     fn recording_again_replaces_the_reading_rather_than_adding_one() {
         let fixture = Fixture::new("replace");
-        fixture.cache.record("a", &[limit!("session", 3.0)]).expect("records");
-        fixture.cache.record("a", &[limit!("session", 40.0)]).expect("records again");
+        fixture.cache.record("a", &vec![limit!("session", 3.0)].into()).expect("records");
+        fixture.cache.record("a", &vec![limit!("session", 40.0)].into()).expect("records again");
 
         let back = fixture.read("a");
-        assert_eq!(back.limits.len(), 1);
-        assert_eq!(back.limits[0].percent, 40.0);
+        assert_eq!(back.usage.limits.len(), 1);
+        assert_eq!(back.usage.limits[0].percent, 40.0);
     }
 
     #[test]
     fn one_accounts_reading_never_lands_on_anothers() {
         let fixture = Fixture::new("apart");
-        fixture.cache.record("a", &[limit!("session", 3.0)]).expect("records a");
-        fixture.cache.record("b", &[limit!("session", 90.0)]).expect("records b");
+        fixture.cache.record("a", &vec![limit!("session", 3.0)].into()).expect("records a");
+        fixture.cache.record("b", &vec![limit!("session", 90.0)].into()).expect("records b");
 
-        assert_eq!(fixture.read("a").limits[0].percent, 3.0);
-        assert_eq!(fixture.read("b").limits[0].percent, 90.0);
+        assert_eq!(fixture.read("a").usage.limits[0].percent, 3.0);
+        assert_eq!(fixture.read("b").usage.limits[0].percent, 90.0);
     }
 
     #[test]
     fn a_reading_is_owner_only_like_the_stash_beside_it() {
         let fixture = Fixture::new("mode");
-        fixture.cache.record("a", &[limit!("session", 3.0)]).expect("records");
+        fixture.cache.record("a", &vec![limit!("session", 3.0)].into()).expect("records");
 
         let path = fixture.root.join("usage/a.json");
         let mode = fs::metadata(&path).expect("exists").permissions().mode();
@@ -189,7 +221,7 @@ mod tests {
     #[test]
     fn forgetting_an_account_takes_its_reading_with_it() {
         let fixture = Fixture::new("forget");
-        fixture.cache.record("a", &[limit!("session", 3.0)]).expect("records");
+        fixture.cache.record("a", &vec![limit!("session", 3.0)].into()).expect("records");
         fixture.cache.forget("a").expect("forgets");
         assert!(!fixture.exists("a"));
     }
@@ -197,10 +229,10 @@ mod tests {
     #[test]
     fn a_reading_can_be_read_back_by_something_that_cannot_poll() {
         let fixture = Fixture::new("readback");
-        fixture.cache.record("a", &[limit!("session", 42.0)]).expect("records");
+        fixture.cache.record("a", &vec![limit!("session", 42.0)].into()).expect("records");
 
         let back = fixture.cache.read("a").expect("reads").expect("a reading");
-        assert_eq!(back.limits[0].percent, 42.0);
+        assert_eq!(back.usage.limits[0].percent, 42.0);
         assert!(!back.polled_at.is_empty());
     }
 

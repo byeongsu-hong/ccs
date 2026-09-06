@@ -26,7 +26,8 @@ independently.
   expires_in[, id_token]}`.
 - Usage: `GET https://chatgpt.com/backend-api/wham/usage` with the bearer and
   `chatgpt-account-id` → `{email, plan_type, rate_limit: {primary_window,
-  secondary_window}, additional_rate_limits: [{limit_name, rate_limit}]}`,
+  secondary_window}, additional_rate_limits: [{limit_name, rate_limit}],
+  model_usage: {model_id: {available, available_at, credits_would_enable}}}`,
   each window `{used_percent, limit_window_seconds, reset_at}`.
 - pi/Aside's `openai-codex` provider sends `Authorization: Bearer <key>` and a
   `chatgpt-account-id` header it reads out of the key, which it takes for a
@@ -49,8 +50,13 @@ or `refresh_token` — copies, newest, propagate, reconcile — works unchanged.
 `Entry` (table rows) and the JSON views carry `provider`. The plan label of a
 Codex account remains prefixed, `codex pro`, for existing JSON/menu bar consumers.
 The terminal table groups accounts by provider, then email, matching numeric
-account resolution. Claude has its own dynamic limit columns. Codex shows a
-Shared row and additional named pool rows per account, with window columns.
+account resolution. Claude has its own dynamic limit columns. Codex shows
+shared quota windows and additional named pool rows per account. Model
+availability has its own columns: `gpt-6-astra` is labeled Astra, while other
+IDs retain their names. Availability is independent of numeric quota windows.
+Spark is hidden from human-facing terminal output and selection warnings; raw
+JSON/cache data retain it. The POOL column appears only when a visible named
+quota pool exists. Missing model availability is unknown, not available.
 Two accounts can be `active`, one per provider; marking one active unmarks only
 its provider's rows.
 
@@ -67,6 +73,16 @@ its provider's rows.
   retains every reported window, scoped by `limit_name`. Nullable or missing
   additional pools are accepted. `reset_at` becomes RFC 3339. Old cached scoped
   windows lack a duration and are labeled `CACHED WINDOW` until refreshed.
+  `model_usage` is carried through normalization, polling, cache and JSON. Older
+  cache files without it still read. A fresh response replaces the complete
+  snapshot; failed probes preserve the previous snapshot and timestamp.
+- `src/render.rs` — Astra availability displays available/unavailable, a future
+  countdown when supplied, and a credits-unlock hint when reported. RFC 3339
+  strings and Unix seconds are accepted for the optional timestamp. A past or
+  unreadable timestamp never flips the availability flag. An unavailable model
+  adds a selection warning; it does not trigger shared-quota rotation/notices.
+  The picker has only account rows and a keys/confirmation footer; detailed
+  limit prose remains in `ccs status`.
 - `src/cmd.rs` — `Ctx` gains `codex: &dyn codex::Creds` and `codex_api:
   &codex::Client`. `live`, `identify`, `install`, `copies`, `propagate`,
   `switch_to`, `probe`, `record` branch on the account's provider. `ccs pin`

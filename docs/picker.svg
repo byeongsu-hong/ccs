@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="850" height="288" viewBox="0 0 850 288" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, DejaVu Sans Mono, monospace" font-size="14">
+<svg xmlns="http://www.w3.org/2000/svg" width="850" height="268" viewBox="0 0 850 268" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, DejaVu Sans Mono, monospace" font-size="14">
 <title>ccs: Claude Code and Codex usage in separate sections</title>
-<desc>Claude session, weekly and Fable columns. Codex shared quota and additional named pools with five-hour and weekly windows. Example readings.</desc>
-<rect width="850" height="288" rx="10" fill="#0d1117"/>
+<desc>Example readings: Claude session, weekly and Fable columns; Codex weekly quota and Astra availability. The footer shows keys without repeating the selected account’s limits.</desc>
+<rect width="850" height="268" rx="10" fill="#0d1117"/>
 <path d="M10 0H840Q850 0 850 10V44H0V10Q0 0 10 0" fill="#161b22"/>
 <circle cx="22" cy="24" r="5.5" fill="#ff5f57"/><circle cx="40" cy="24" r="5.5" fill="#febc2e"/><circle cx="58" cy="24" r="5.5" fill="#28c840"/>
 <text x="425.0" y="28" fill="#7d8590" font-size="12" text-anchor="middle">ccs · Claude Code &amp; Codex</text>
@@ -9,40 +9,37 @@
 <tspan x="22.0" y="68">  Claude Code</tspan>
 </text>
 <text xml:space="preserve" fill="#7d8590">
-<tspan x="22.0" y="88">     ACCOUNT        PLAN    SESSION           WEEKLY            FABLE</tspan>
+<tspan x="22.0" y="88">     ACCOUNT        PLAN    SESSION           WEEKLY            FABLE           </tspan>
 </text>
 <text xml:space="preserve" fill="#c9d1d9">
-<tspan x="22.0" y="108">   1 z@claude.test  max20x  </tspan>
+<tspan x="22.0" y="108">&gt;  1 z@claude.test  max20x  </tspan>
 <tspan x="257.2" y="108" fill="#3fb950">█░░░  10% 3h54m</tspan>
 <tspan x="383.2" y="108">   </tspan>
 <tspan x="408.4" y="108" fill="#3fb950">███░  55% 3h54m</tspan>
 <tspan x="534.4" y="108">   </tspan>
 <tspan x="559.6" y="108" fill="#f85149">████ 100% 3h54m</tspan>
+<tspan x="685.6" y="108"> </tspan>
 </text>
 <text xml:space="preserve" fill="#c9d1d9" font-weight="600">
 <tspan x="22.0" y="148">  Codex</tspan>
 </text>
 <text xml:space="preserve" fill="#7d8590">
-<tspan x="22.0" y="168">     ACCOUNT       PLAN       POOL                 5H                WEEKLY</tspan>
+<tspan x="22.0" y="168">     ACCOUNT       PLAN       WEEKLY            ASTRA           </tspan>
 </text>
 <text xml:space="preserve" fill="#c9d1d9">
-<tspan x="22.0" y="188">   2 a@codex.test  codex pro  Shared               </tspan>
-<tspan x="450.4" y="188" fill="#3fb950">█░░░  16% 3h54m</tspan>
-<tspan x="576.4" y="188">   </tspan>
-<tspan x="601.6" y="188" fill="#3fb950">██░░  29% 3h54m</tspan>
-<tspan x="727.6" y="188">   &lt;- active</tspan>
+<tspan x="22.0" y="188">   2 a@codex.test  codex pro  </tspan>
+<tspan x="274.0" y="188" fill="#3fb950">██░░  29% 2d6h</tspan>
+<tspan x="391.6" y="188">    </tspan>
+<tspan x="425.2" y="188" fill="#3fb950">available</tspan>
+<tspan x="500.8" y="188">         &lt;- active</tspan>
 </text>
 <text xml:space="preserve" fill="#c9d1d9">
-<tspan x="22.0" y="208">                              Another model pool   —                 </tspan>
-<tspan x="601.6" y="208" fill="#3fb950">██░░  37% 3h54m</tspan>
-</text>
-<text xml:space="preserve" fill="#c9d1d9">
-<tspan x="22.0" y="228">                              GPT-5.3-Codex-Spark  </tspan>
-<tspan x="450.4" y="228" fill="#3fb950">█░░░   1% 3h54m</tspan>
-<tspan x="576.4" y="228">   </tspan>
-<tspan x="601.6" y="228" fill="#3fb950">█░░░   2% 3h54m</tspan>
+<tspan x="22.0" y="208">   3 b@codex.test  codex pro  </tspan>
+<tspan x="274.0" y="208" fill="#3fb950">███░  65% 2d6h</tspan>
+<tspan x="391.6" y="208">    </tspan>
+<tspan x="425.2" y="208" fill="#f85149">back 1h31m</tspan>
 </text>
 <text xml:space="preserve" fill="#7d8590">
-<tspan x="22.0" y="268">  up/down select   r refresh   q quit      updated just now</tspan>
+<tspan x="22.0" y="248">  up/down select   enter switch   esc unselect   r refresh   q quit      updated just now</tspan>
 </text>
 </svg>

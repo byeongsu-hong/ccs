@@ -36,7 +36,7 @@ pub struct Event {
 pub fn snapshot(entries: &[Entry]) -> Snapshot {
     entries
         .iter()
-        .filter(|e| e.limits.is_ok())
+        .filter(|e| e.usage.is_ok())
         .map(|e| {
             let session = limit(e, "session");
             (
@@ -64,7 +64,7 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
             .iter()
             .find(|active| active.active && active.provider == e.provider)
             .and_then(|active| at(limit(active, "weekly_all")?));
-        if e.limits.is_err() {
+        if e.usage.is_err() {
             continue;
         }
         let was = before.get(&e.slug);
@@ -151,7 +151,7 @@ fn rotate_within<'a>(
     high: f64,
 ) -> Option<&'a Entry> {
     let active = entries.iter().find(|e| e.active && e.provider == provider)?;
-    if active.limits.is_err() || !pool.contains(&active.slug) || has_room(active, high) {
+    if active.usage.is_err() || !pool.contains(&active.slug) || has_room(active, high) {
         return None;
     }
     entries
@@ -177,7 +177,7 @@ fn rotate_within<'a>(
 const HYSTERESIS: f64 = 15.0;
 
 fn has_room(e: &Entry, high: f64) -> bool {
-    e.limits.is_ok()
+    e.usage.is_ok()
         && limit(e, "session").is_none_or(|s| s.percent < high)
         && limit(e, "weekly_all").is_none_or(|w| !w.exhausted())
 }
@@ -232,20 +232,23 @@ mod tests {
             email: format!("{slug}@x"),
             plan: "max".into(),
             active,
-            limits: Ok(vec![lim("session", session.0, session.1), lim("weekly_all", 10.0, weekly)]),
+            usage: Ok(
+                vec![lim("session", session.0, session.1), lim("weekly_all", 10.0, weekly)].into()
+            ),
         }
     }
 
     fn codex_entry(slug: &str, active: bool, weekly: f64) -> Entry {
         let mut entry = entry(slug, active, (0.0, None), None);
         entry.provider = Provider::Codex;
-        entry.limits = Ok(vec![Limit {
+        entry.usage = Ok(vec![Limit {
             kind: "weekly_all".into(),
             percent: weekly,
             severity: None,
             resets_at: None,
             scope: None,
-        }]);
+        }]
+        .into());
         entry
     }
 
@@ -265,13 +268,14 @@ mod tests {
         .into_iter()
         .collect();
         let mut gpt = codex_entry("gpt", true, 95.0);
-        gpt.limits = Ok(vec![Limit {
+        gpt.usage = Ok(vec![Limit {
             kind: "session".into(),
             percent: 95.0,
             severity: None,
             resets_at: None,
             scope: None,
-        }]);
+        }]
+        .into());
         let now = entry("a", true, (95.0, None), None);
         let events = diff_at(&before, &[gpt, now], 90.0, 0);
         assert_eq!(events.len(), 2);
@@ -397,7 +401,7 @@ mod tests {
     #[test]
     fn an_active_account_whose_probe_failed_is_not_mistaken_for_an_empty_one() {
         let mut a = entry("a", true, (0.0, None), Some(W1));
-        a.limits = Err("429".into());
+        a.usage = Err("429".into());
         let e = [a, entry("b", false, (0.0, None), Some(W0))];
         assert!(rotate(&e, &pool(&["a", "b"]), 90.0).is_none());
     }

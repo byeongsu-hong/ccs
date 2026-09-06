@@ -7,6 +7,7 @@
 //! ChatGPT account id alongside. Everything that keeps an account's copies in
 //! step is shared; only what is read and written at the edges lives here.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,9 @@ use serde_json::{Map, Value, json};
 
 use crate::api::Refreshed;
 use crate::fsx::write_atomic;
-use crate::model::{Limit, LimitModel, LimitScope, Oauth, now_ms};
+use crate::model::{
+    Limit, LimitModel, LimitScope, ModelAvailability, Oauth, UsageResponse, now_ms,
+};
 
 /// Codex CLI's own OAuth client, which its refresh tokens were minted for.
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -314,6 +317,14 @@ pub struct Usage {
     pub rate_limit: Option<RateLimit>,
     #[serde(default)]
     pub additional_rate_limits: Option<Vec<NamedLimit>>,
+    #[serde(default)]
+    pub model_usage: Option<BTreeMap<String, ModelAvailability>>,
+}
+
+impl From<Usage> for UsageResponse {
+    fn from(usage: Usage) -> Self {
+        Self { limits: limits(&usage), model_usage: usage.model_usage }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -634,6 +645,35 @@ mod tests {
         assert_eq!(limits[0].resets_at.as_deref(), Some("2026-09-07T03:04:54Z"));
         assert_eq!(limits[1].kind, "weekly_all");
         assert_eq!(limits[1].percent, 29.0);
+    }
+
+    #[test]
+    fn model_availability_survives_normalization_without_becoming_a_quota() {
+        for available in [true, false] {
+            let mut raw: Value = serde_json::from_str(USAGE).expect("fixture");
+            let gate = json!({"gpt-6-astra": {
+                "available": available, "available_at": null, "credits_would_enable": false
+            }});
+            raw["model_usage"] = gate.clone();
+            let usage: Usage = serde_json::from_value(raw).expect("availability");
+            let normalized = UsageResponse::from(usage);
+            assert_eq!(normalized.limits.len(), 4);
+            assert_eq!(normalized.limits[0].percent, 16.0);
+            assert_eq!(serde_json::to_value(normalized.model_usage).unwrap(), gate);
+        }
+    }
+
+    #[test]
+    fn unreported_model_availability_stays_unknown() {
+        for raw in [json!({}), json!({"model_usage": null})] {
+            let usage: Usage = serde_json::from_value(raw).expect("optional metadata");
+            assert!(UsageResponse::from(usage).model_usage.is_none());
+        }
+        let usage: Usage = serde_json::from_value(json!({
+            "model_usage": {"future-model": {"credits_would_enable": true}}
+        }))
+        .expect("partial metadata");
+        assert_eq!(usage.model_usage.unwrap()["future-model"].available, None);
     }
 
     #[test]

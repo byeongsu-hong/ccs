@@ -4,12 +4,12 @@
 //! in code, so a newly scoped model shows up on its own.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 
 use jiff::Timestamp;
 
-use crate::model::{Health, Limit, Provider};
+use crate::model::{Health, Limit, ModelAvailability, Provider, UsageResponse};
 
 /// Width of a usage bar, in cells.
 const BAR: usize = 4;
@@ -36,28 +36,59 @@ pub struct Entry {
     pub active: bool,
     /// The account's limits, or why they could not be read. One field rather
     /// than two, so "has limits" and "failed" cannot both be true at once.
-    pub limits: Result<Vec<Limit>, String>,
+    pub usage: Result<UsageResponse, String>,
 }
 
 impl Entry {
     /// The limits that were readable; empty when the probe failed.
     pub fn known(&self) -> &[Limit] {
-        self.limits.as_deref().unwrap_or(&[])
+        self.usage.as_ref().map(|u| u.limits.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn models(&self) -> Option<&BTreeMap<String, ModelAvailability>> {
+        self.usage.as_ref().ok()?.model_usage.as_ref()
+    }
+
+    fn visible_limits(&self) -> impl Iterator<Item = &Limit> {
+        self.known()
+            .iter()
+            .filter(|l| l.model_name().is_none_or(|name| !hidden_model(self.provider, name)))
+    }
+
+    fn visible_models(&self) -> impl Iterator<Item = (&str, &ModelAvailability)> {
+        self.models()
+            .filter(|_| self.provider == Provider::Codex)
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| !hidden_model(self.provider, name))
+            .map(|(name, status)| (name.as_str(), status))
     }
 
     /// The worst standing across this account's limits, which is what decides
     /// whether it is still worth switching to.
     pub fn health(&self) -> Health {
-        self.known().iter().map(Limit::health).fold(Health::Ok, |worst, h| match (worst, h) {
+        if self.visible_models().any(|(_, status)| status.available == Some(false)) {
+            return Health::Critical;
+        }
+        self.visible_limits().map(Limit::health).fold(Health::Ok, |worst, h| match (worst, h) {
             (Health::Critical, _) | (_, Health::Critical) => Health::Critical,
             (Health::Warn, _) | (_, Health::Warn) => Health::Warn,
             _ => Health::Ok,
         })
     }
 
-    /// Limits with nothing left on them, named for a human.
-    pub fn exhausted(&self) -> Vec<String> {
-        self.known().iter().filter(|l| l.exhausted()).map(|l| self.limit_label(l)).collect()
+    /// Reasons to check before selecting this account. Availability is stated
+    /// as a gate, never as an invented percentage or a spent quota window.
+    pub fn restrictions(&self) -> Vec<String> {
+        self.visible_limits()
+            .filter(|l| l.exhausted())
+            .map(|l| format!("no {} left", self.limit_label(l)))
+            .chain(
+                self.visible_models()
+                    .filter(|(_, status)| status.available == Some(false))
+                    .map(|(name, _)| format!("{} unavailable", model_label(name))),
+            )
+            .collect()
     }
 
     fn limit_label(&self, limit: &Limit) -> String {
@@ -122,6 +153,7 @@ struct Section {
     email_width: usize,
     plan_width: usize,
     pool_width: usize,
+    models: Vec<String>,
 }
 
 pub struct Table {
@@ -146,19 +178,32 @@ impl Table {
                     accounts.iter().map(|e| e.plan.len()).max().unwrap_or(0).max("PLAN".len());
                 let pool_width = accounts
                     .iter()
-                    .flat_map(|e| e.known())
+                    .filter(|e| e.provider == Provider::Codex)
+                    .flat_map(|e| e.visible_limits())
                     .filter_map(Limit::model_name)
                     .map(str::len)
                     .max()
-                    .unwrap_or(0)
-                    .max("Shared".len());
+                    .map(|width| width.max("Shared".len()))
+                    .unwrap_or(0);
+                let models: BTreeSet<_> = accounts
+                    .iter()
+                    .flat_map(|e| e.visible_models())
+                    .map(|(name, _)| name.to_string())
+                    .collect();
                 let columns = match provider {
                     Provider::Claude => columns_of(accounts.iter().copied()),
-                    Provider::Codex => {
-                        ordered_columns(accounts.iter().flat_map(|e| e.known()).map(codex_window))
-                    }
+                    Provider::Codex => ordered_columns(
+                        accounts.iter().flat_map(|e| e.visible_limits()).map(codex_window),
+                    ),
                 };
-                Some(Section { provider, columns, email_width, plan_width, pool_width })
+                Some(Section {
+                    provider,
+                    columns,
+                    email_width,
+                    plan_width,
+                    pool_width,
+                    models: models.into_iter().collect(),
+                })
             })
             .collect();
         Self { sections, entries, style }
@@ -211,12 +256,23 @@ impl Table {
             .map(|c| format!("{:<width$}", c.to_uppercase(), width = CELL.max(c.len())))
             .collect::<Vec<_>>()
             .join("  ");
-        let pool = match section.provider {
-            Provider::Claude => String::new(),
-            Provider::Codex => format!("{:<width$}  ", "POOL", width = section.pool_width),
+        let pool = match section.pool_width {
+            0 => String::new(),
+            width => format!("{:<width$}  ", "POOL"),
         };
+        let models = section
+            .models
+            .iter()
+            .map(|name| {
+                format!(
+                    "  {:<width$}",
+                    model_label(name).to_uppercase(),
+                    width = self.model_width(section, name)
+                )
+            })
+            .collect::<String>();
         self.style.dim(&format!(
-            "   {:<ew$}  {:<pw$}  {pool}{cells}",
+            "   {:<ew$}  {:<pw$}  {pool}{cells}{models}",
             "ACCOUNT",
             "PLAN",
             ew = section.email_width,
@@ -243,11 +299,12 @@ impl Table {
             _ => head,
         };
         let suffix = if entry.active { self.style.bold("  <- active") } else { String::new() };
-        if let Err(error) = &entry.limits {
+        if let Err(error) = &entry.usage {
             return format!("{head}  {}{suffix}", self.style.health(error, Health::Critical));
         }
-        if entry.known().is_empty() {
-            return format!("{head}  no usage windows reported{suffix}");
+        let no_readings = section.columns.is_empty() && section.models.is_empty();
+        if no_readings {
+            return format!("{head}  no usage readings reported{suffix}");
         }
         match entry.provider {
             Provider::Claude => {
@@ -264,7 +321,7 @@ impl Table {
             }
             Provider::Codex => {
                 let named: BTreeSet<_> =
-                    entry.known().iter().filter_map(Limit::model_name).collect();
+                    entry.visible_limits().filter_map(Limit::model_name).collect();
                 let pools = std::iter::once(None).chain(named.into_iter().map(Some));
                 pools
                     .enumerate()
@@ -286,16 +343,47 @@ impl Table {
                             _ => " ".repeat(3 + section.email_width + 2 + section.plan_width),
                         };
                         let active = if row == 0 { suffix.as_str() } else { "" };
-                        format!(
-                            "{prefix}  {:<width$}  {cells}{active}",
-                            pool.unwrap_or("Shared"),
-                            width = section.pool_width
-                        )
+                        let pool = match section.pool_width {
+                            0 => String::new(),
+                            width => format!("{:<width$}  ", pool.unwrap_or("Shared")),
+                        };
+                        let models = match row {
+                            0 => section
+                                .models
+                                .iter()
+                                .map(|name| {
+                                    let status = entry.models().and_then(|models| models.get(name));
+                                    let text = format!(
+                                        "  {:<width$}",
+                                        availability(status),
+                                        width = self.model_width(section, name)
+                                    );
+                                    match status.and_then(|s| s.available) {
+                                        Some(true) => self.style.health(&text, Health::Ok),
+                                        Some(false) => self.style.health(&text, Health::Critical),
+                                        None => self.style.dim(&text),
+                                    }
+                                })
+                                .collect::<String>(),
+                            _ => String::new(),
+                        };
+                        format!("{prefix}  {pool}{cells}{models}{active}")
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
             }
         }
+    }
+
+    fn model_width(&self, section: &Section, name: &str) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.provider == section.provider)
+            .map(|e| availability(e.models().and_then(|models| models.get(name))).len())
+            .max()
+            .unwrap_or(0)
+            .max(model_label(name).len())
+            .max(CELL)
     }
 
     fn cell(&self, limit: Option<&Limit>, width: usize) -> String {
@@ -312,6 +400,42 @@ impl Table {
     }
 }
 
+fn hidden_model(provider: Provider, name: &str) -> bool {
+    provider == Provider::Codex && name.eq_ignore_ascii_case("gpt-5.3-codex-spark")
+}
+
+fn model_label(name: &str) -> &str {
+    match name {
+        "gpt-6-astra" => "Astra",
+        _ => name,
+    }
+}
+
+fn availability(status: Option<&ModelAvailability>) -> String {
+    availability_at(status, Timestamp::now())
+}
+
+fn availability_at(status: Option<&ModelAvailability>, now: Timestamp) -> String {
+    let Some(status) = status else { return "unknown".into() };
+    match status.available {
+        Some(true) => "available".into(),
+        None => "unknown".into(),
+        Some(false) => {
+            let text = status
+                .available_at
+                .as_ref()
+                .and_then(|at| at.instant())
+                .filter(|at| *at > now)
+                .map(|at| format!("back {}", compact(at.as_second() - now.as_second())))
+                .unwrap_or_else(|| "unavailable".into());
+            match status.credits_would_enable {
+                Some(true) => format!("{text}; credits unlock"),
+                _ => text,
+            }
+        }
+    }
+}
+
 fn codex_window(limit: &Limit) -> String {
     match limit.kind.as_str() {
         "session" => "5h".into(),
@@ -324,7 +448,7 @@ fn codex_window(limit: &Limit) -> String {
 /// The union of limit columns across every account, ordered so the two limits
 /// that always exist lead and per-model weeklies follow by name.
 fn columns_of<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<String> {
-    ordered_columns(entries.into_iter().flat_map(|e| e.known().iter().map(Limit::column)))
+    ordered_columns(entries.into_iter().flat_map(|e| e.visible_limits().map(Limit::column)))
 }
 
 fn ordered_columns(names: impl Iterator<Item = String>) -> Vec<String> {
@@ -408,10 +532,10 @@ pub fn question(entry: &Entry, verb: Verb) -> String {
             "Launch anyway?",
         ),
     };
-    let spent = entry.exhausted();
-    match spent.is_empty() {
+    let restrictions = entry.restrictions();
+    match restrictions.is_empty() {
         true => asked,
-        false => format!("{account} has no {} left. {anyway}", spent.join(", ")),
+        false => format!("{account}: {}. {anyway}", restrictions.join("; ")),
     }
 }
 
@@ -435,15 +559,14 @@ fn phrase(seconds: i64, gap: &str) -> String {
 }
 
 /// Per-limit detail for one account: where each limit stands and when it comes
-/// back. Shared by `ccs status` and the picker's footer.
+/// back, for `ccs status`.
 pub fn detail(entry: &Entry, style: Style) -> Vec<String> {
-    if let Err(error) = &entry.limits {
+    if let Err(error) = &entry.usage {
         return vec![style.health(&format!("  {error}"), Health::Critical)];
     }
-    let width = entry.known().iter().map(|l| entry.limit_label(l).len()).max().unwrap_or(0);
-    entry
-        .known()
-        .iter()
+    let width = entry.visible_limits().map(|l| entry.limit_label(l).len()).max().unwrap_or(0);
+    let mut lines: Vec<_> = entry
+        .visible_limits()
         .map(|limit| {
             let resets = limit
                 .resets_at
@@ -460,7 +583,16 @@ pub fn detail(entry: &Entry, style: Style) -> Vec<String> {
             );
             style.health(&body, limit.health())
         })
-        .collect()
+        .collect();
+    lines.extend(entry.visible_models().map(|(name, status)| {
+        let text = format!("  {}: {}", model_label(name), availability(Some(status)));
+        match status.available {
+            Some(true) => style.health(&text, Health::Ok),
+            Some(false) => style.health(&text, Health::Critical),
+            None => style.dim(&text),
+        }
+    }));
+    lines
 }
 
 #[cfg(test)]
@@ -479,7 +611,7 @@ mod tests {
             email: email.into(),
             plan: "max20x".into(),
             active: false,
-            limits: Ok(limits),
+            usage: Ok(limits.into()),
         }
     }
 
@@ -530,8 +662,7 @@ mod tests {
             vec![
                 limit!("session", 10.0),
                 limit!("weekly_all", 20.0),
-                limit!("session", 30.0, model = "GPT-5.3-Codex-Spark"),
-                limit!("weekly_all", 40.0, model = "GPT-5.3-Codex-Spark"),
+                limit!("session", 30.0, model = "Another pool"),
                 limit!("weekly_all", 50.0, model = "Another pool"),
             ],
         );
@@ -550,12 +681,93 @@ mod tests {
         assert!(codex.contains(">  2 a@codex.test"));
         let shared = codex.lines().find(|l| l.contains("Shared")).unwrap();
         assert!(shared.contains("10%") && shared.contains("20%"));
-        let spark = codex.lines().find(|l| l.contains("GPT-5.3-Codex-Spark")).unwrap();
-        assert!(spark.contains("30%") && spark.contains("40%"));
         let other = codex.lines().find(|l| l.contains("Another pool")).unwrap();
-        assert!(other.contains("—") && other.contains("50%"));
+        assert!(other.contains("30%") && other.contains("50%"));
         assert_eq!(table.len(), 2, "pool rows do not become selectable accounts");
         assert!(question(&table.entries()[1], Verb::Switch).contains("on Codex"));
+    }
+
+    fn with_models(mut entry: Entry, raw: serde_json::Value) -> Entry {
+        entry.provider = Provider::Codex;
+        entry.usage.as_mut().unwrap().model_usage = Some(serde_json::from_value(raw).unwrap());
+        entry
+    }
+
+    #[test]
+    fn model_gates_get_columns_without_inventing_percentages_or_availability() {
+        let available = with_models(
+            entry("a@x", vec![]),
+            serde_json::json!({
+                "gpt-6-astra": {"available": true}, "future-model": {"available": false}
+            }),
+        );
+        let blocked = with_models(
+            entry("b@x", vec![]),
+            serde_json::json!({
+                "gpt-6-astra": {"available": false, "credits_would_enable": true}
+            }),
+        );
+        assert_eq!(blocked.health(), Health::Critical);
+        assert_eq!(blocked.restrictions(), ["Astra unavailable"]);
+        assert!(question(&blocked, Verb::Switch).contains("Astra unavailable. Switch anyway?"));
+        let mut missing = entry("c@x", vec![]);
+        missing.provider = Provider::Codex;
+        let table = Table::build(vec![available, blocked, missing], plain());
+        let screen = table.lines(None).join("\n");
+        assert!(screen.contains("ASTRA") && screen.contains("FUTURE-MODEL"));
+        assert!(!screen.contains('%') && !screen.contains("POOL"));
+        assert!(table.row(0).contains("available"));
+        assert!(table.row(1).contains("unavailable; credits unlock"));
+        assert!(table.row(2).contains("unknown"));
+        assert!(table.entries()[2].restrictions().is_empty());
+        assert_eq!(detail(&table.entries()[1], plain()), ["  Astra: unavailable; credits unlock"]);
+    }
+
+    #[test]
+    fn a_model_countdown_never_overrides_the_reported_availability() {
+        let now: Timestamp = "2026-09-07T00:00:00Z".parse().unwrap();
+        for at in [serde_json::json!("2026-09-07T01:30:00Z"), serde_json::json!(1788744600_i64)] {
+            let status: ModelAvailability = serde_json::from_value(serde_json::json!({
+                "available": false, "available_at": at, "credits_would_enable": true
+            }))
+            .unwrap();
+            assert_eq!(availability_at(Some(&status), now), "back 1h30m; credits unlock");
+        }
+        for at in [serde_json::json!("2026-09-06T23:00:00Z"), serde_json::json!("unreadable")] {
+            let mut status: ModelAvailability = serde_json::from_value(serde_json::json!({
+                "available": false, "available_at": at
+            }))
+            .unwrap();
+            assert_eq!(availability_at(Some(&status), now), "unavailable");
+            status.available = Some(true);
+            assert_eq!(availability_at(Some(&status), now), "available");
+            status.available = None;
+            assert_eq!(availability_at(Some(&status), now), "unknown");
+        }
+    }
+
+    #[test]
+    fn spark_is_preserved_as_data_but_does_not_warn_or_clutter_the_display() {
+        let codex = with_models(
+            entry(
+                "a@x",
+                vec![
+                    limit!("weekly_all", 10.0),
+                    limit!("session", 100.0, model = "GPT-5.3-Codex-Spark"),
+                ],
+            ),
+            serde_json::json!({"gpt-5.3-codex-spark": {"available": false}}),
+        );
+        assert_eq!(codex.known().len(), 2);
+        assert_eq!(codex.models().unwrap().len(), 1);
+        assert_eq!(codex.health(), Health::Ok);
+        assert!(codex.restrictions().is_empty());
+        assert!(!question(&codex, Verb::Switch).contains("anyway"));
+        assert!(!detail(&codex, plain()).join("\n").contains("Spark"));
+        let screen = Table::build(vec![codex], plain()).lines(None).join("\n");
+        assert!(screen.contains("10%"));
+        assert!(!screen.to_lowercase().contains("spark"));
+        assert!(!screen.contains("POOL") && !screen.contains("5H"));
     }
 
     #[test]
@@ -586,7 +798,7 @@ mod tests {
             vec![limit!("session", 3.0), limit!("weekly_scoped", 100.0, model = "Fable")],
         );
         assert_eq!(spent.health(), Health::Critical);
-        assert_eq!(spent.exhausted(), ["Fable"]);
+        assert_eq!(spent.restrictions(), ["no Fable left"]);
     }
 
     #[test]
@@ -597,10 +809,10 @@ mod tests {
             email: "a@x.com".into(),
             plan: "?".into(),
             active: false,
-            limits: Err("token rejected".into()),
+            usage: Err("token rejected".into()),
         };
         assert!(broken.known().is_empty());
-        assert!(broken.exhausted().is_empty());
+        assert!(broken.restrictions().is_empty());
     }
 
     #[test]
@@ -611,7 +823,7 @@ mod tests {
             email: "a@x.com".into(),
             plan: "?".into(),
             active: false,
-            limits: Err("token rejected".into()),
+            usage: Err("token rejected".into()),
         };
         let table = Table::build(vec![broken], plain());
         assert!(table.row(0).contains("token rejected"));
@@ -625,7 +837,7 @@ mod tests {
             email: "a@x.com".into(),
             plan: "?".into(),
             active: true,
-            limits: Err("token rejected".into()),
+            usage: Err("token rejected".into()),
         };
         let row = Table::build(vec![broken], plain()).row(0);
         assert!(row.contains("token rejected"), "{row}");

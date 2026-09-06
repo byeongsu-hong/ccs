@@ -342,12 +342,6 @@ fn frame(
     verb: Verb,
 ) -> String {
     let mut lines = table.lines(at);
-    // With no row selected there is nothing to detail, and the gap it leaves
-    // is the plainest signal that `enter` has nothing to act on.
-    if let Some(entry) = at.and_then(|at| table.entries().get(at)) {
-        lines.push(String::new());
-        lines.extend(render::detail(entry, style));
-    }
     lines.push(String::new());
     lines.push(footer(table, at, mode, style, polled, verb));
     lines.join("\n")
@@ -392,7 +386,7 @@ fn footer(
         Mode::Confirming(target) => {
             let Some(entry) = table.entries().get(*target) else { return String::new() };
             let question = format!("  {} [y/n]", render::question(entry, verb));
-            match entry.exhausted().is_empty() {
+            match entry.restrictions().is_empty() {
                 true => style.bold(&question),
                 false => style.health(&question, Health::Critical),
             }

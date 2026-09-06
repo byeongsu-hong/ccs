@@ -19,7 +19,10 @@ use crate::codex::Creds as _;
 use crate::creds::{self, Backend, CredStore};
 use crate::lock;
 use crate::login;
-use crate::model::{Account, CredsFile, Limit, Oauth, Provider, Stashed, plan_label};
+use crate::model::{
+    Account, CredsFile, Limit, ModelAvailability, Oauth, Provider, Stashed, UsageResponse,
+    plan_label,
+};
 use crate::notify;
 use crate::pen;
 use crate::picker::{self, Act, Outcome};
@@ -124,7 +127,7 @@ struct Probe {
     /// persist it: the refresh may have rotated the refresh token, and a
     /// rotated token that is not written down costs an interactive re-login.
     refreshed: Option<Oauth>,
-    limits: Result<Vec<Limit>, String>,
+    usage: Result<UsageResponse, String>,
 }
 
 /// Ask one account for its limits, refreshing its access token first if the
@@ -134,20 +137,20 @@ fn probe(apis: Apis, entry: &Stashed) -> Probe {
     let provider = entry.account.provider;
     let refreshed = match freshen(apis, provider, &entry.account.oauth) {
         Ok(refreshed) => refreshed,
-        Err(e) => return Probe { slug, refreshed: None, limits: Err(describe(&e)) },
+        Err(e) => return Probe { slug, refreshed: None, usage: Err(describe(&e)) },
     };
     let oauth = refreshed.as_ref().unwrap_or(&entry.account.oauth);
-    let limits = read_limits(apis, provider, oauth).map_err(|e| describe(&e));
-    Probe { slug, refreshed, limits }
+    let usage = read_usage(apis, provider, oauth).map_err(|e| describe(&e));
+    Probe { slug, refreshed, usage }
 }
 
 /// What an account has left, asked of its provider.
-fn read_limits(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<Vec<Limit>> {
+fn read_usage(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<UsageResponse> {
     match provider {
-        Provider::Claude => Ok(apis.claude.usage(&oauth.access_token)?.limits),
+        Provider::Claude => apis.claude.usage(&oauth.access_token),
         Provider::Codex => {
             let account = oauth.account_id().context("a Codex login that names no account")?;
-            Ok(codex::limits(&apis.codex.usage(&oauth.access_token, account)?))
+            Ok(apis.codex.usage(&oauth.access_token, account)?.into())
         }
     }
 }
@@ -339,8 +342,8 @@ fn persist(ctx: &Ctx, accounts: &mut [Stashed], probes: &[Probe], live: &Live) -
 /// is worth more than absent, and the stamp on it says how stale.
 fn remember(ctx: &Ctx, probes: &[Probe]) -> Result<()> {
     for probe in probes {
-        let Ok(limits) = &probe.limits else { continue };
-        ctx.usage.record(&probe.slug, limits)?;
+        let Ok(usage) = &probe.usage else { continue };
+        ctx.usage.record(&probe.slug, usage)?;
     }
     Ok(())
 }
@@ -471,8 +474,8 @@ fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
         .map(|account| {
             let live = ctx.stash.active(account.account.provider);
             let reading = ctx.usage.read(&account.slug)?;
-            let (limits, polled_at) = match reading {
-                Some(reading) => (Ok(reading.limits), Some(reading.polled_at)),
+            let (usage, polled_at) = match reading {
+                Some(reading) => (Ok(reading.usage), Some(reading.polled_at)),
                 None => (Err("not polled yet; `ccs watch` polls".to_string()), None),
             };
             let entry = Entry {
@@ -481,7 +484,7 @@ fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
                 email: account.account.email.clone(),
                 plan: account.account.plan_label(),
                 active: live.as_deref() == Some(account.slug.as_str()),
-                limits,
+                usage,
             };
             Ok(Cached { entry, polled_at })
         })
@@ -545,8 +548,8 @@ fn status_entries(ctx: &Ctx, cached: bool, selected: Option<Provider>) -> Result
         if cached {
             let account = account.context("the current login is not stashed; run `ccs add --current` (with --codex for Codex)")?;
             let reading = ctx.usage.read(&account.slug)?;
-            let (limits, polled_at) = match reading {
-                Some(reading) => (Ok(reading.limits), Some(reading.polled_at)),
+            let (usage, polled_at) = match reading {
+                Some(reading) => (Ok(reading.usage), Some(reading.polled_at)),
                 None => (Err("not polled yet; `ccs watch` polls".to_string()), None),
             };
             readings.push(Cached {
@@ -556,7 +559,7 @@ fn status_entries(ctx: &Ctx, cached: bool, selected: Option<Provider>) -> Result
                     email: account.account.email.clone(),
                     plan: account.account.plan_label(),
                     active: true,
-                    limits,
+                    usage,
                 },
                 polled_at,
             });
@@ -601,9 +604,9 @@ fn status_entries(ctx: &Ctx, cached: bool, selected: Option<Provider>) -> Result
                 (who.email, format!("codex {}", who.plan))
             }
         };
-        let limits = read_limits(ctx.apis(), provider, &oauth)?;
+        let usage = read_usage(ctx.apis(), provider, &oauth)?;
         if let Some(slug) = &identified {
-            ctx.usage.record(slug, &limits)?;
+            ctx.usage.record(slug, &usage)?;
         }
         readings.push(Cached {
             entry: Entry {
@@ -612,7 +615,7 @@ fn status_entries(ctx: &Ctx, cached: bool, selected: Option<Provider>) -> Result
                 email,
                 plan,
                 active: true,
-                limits: Ok(limits),
+                usage: Ok(usage),
             },
             polled_at: None,
         });
@@ -1370,7 +1373,7 @@ fn guard_exhausted(entry: &Entry, force: bool) -> Result<()> {
     if force {
         return Ok(());
     }
-    if entry.exhausted().is_empty() {
+    if entry.restrictions().is_empty() {
         return Ok(());
     }
     if !confirm(&render::question(entry, Verb::Switch))? {
@@ -1405,6 +1408,8 @@ struct View<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     polled_at: Option<&'a str>,
     limits: &'a [Limit],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_usage: Option<&'a std::collections::BTreeMap<String, ModelAvailability>>,
 }
 
 fn view<'a>(entry: &'a Entry, polled_at: Option<&'a str>) -> View<'a> {
@@ -1414,9 +1419,10 @@ fn view<'a>(entry: &'a Entry, polled_at: Option<&'a str>) -> View<'a> {
         email: &entry.email,
         plan: &entry.plan,
         active: entry.active,
-        error: entry.limits.as_ref().err().map(String::as_str),
+        error: entry.usage.as_ref().err().map(String::as_str),
         polled_at,
         limits: entry.known(),
+        model_usage: entry.models(),
     }
 }
 
@@ -1435,7 +1441,7 @@ fn entry_of(account: &Stashed, probe: &Probe, active: bool) -> Entry {
         email: account.account.email.clone(),
         plan: account.account.plan_label(),
         active,
-        limits: probe.limits.clone(),
+        usage: probe.usage.clone(),
     }
 }
 
@@ -1666,7 +1672,7 @@ mod tests {
         let probes = vec![Probe {
             slug: "work".into(),
             refreshed: Some(oauth("rotated", 2)),
-            limits: Ok(vec![]),
+            usage: Ok(vec![].into()),
         }];
         persist(&fixture.ctx(), &mut accounts, &probes, &claude_live("work")).expect("persist");
 
@@ -1820,27 +1826,36 @@ mod tests {
         let probe = Probe {
             slug: "a".into(),
             refreshed: None,
-            limits: Ok(vec![limit!("weekly_scoped", 61.0, model = "Fable")]),
+            usage: Ok(vec![limit!("weekly_scoped", 61.0, model = "Fable")].into()),
         };
         remember(&fixture.ctx(), std::slice::from_ref(&probe)).expect("records");
 
         let reading = fixture.reading("a").expect("recorded");
-        assert_eq!(reading.limits[0].model_name(), Some("Fable"));
-        assert_eq!(reading.limits[0].percent, 61.0);
+        assert_eq!(reading.usage.limits[0].model_name(), Some("Fable"));
+        assert_eq!(reading.usage.limits[0].percent, 61.0);
     }
 
     #[test]
     fn a_probe_that_failed_leaves_the_last_good_reading_standing() {
         let fixture = Fixture::new("kept");
-        let good =
-            Probe { slug: "a".into(), refreshed: None, limits: Ok(vec![limit!("session", 12.0)]) };
+        let good = Probe {
+            slug: "a".into(),
+            refreshed: None,
+            usage: Ok(serde_json::from_value(serde_json::json!({
+                "limits": [{"kind": "session", "percent": 12}],
+                "model_usage": {"gpt-6-astra": {"available": false}}
+            }))
+            .unwrap()),
+        };
         remember(&fixture.ctx(), std::slice::from_ref(&good)).expect("records");
 
         let failed =
-            Probe { slug: "a".into(), refreshed: None, limits: Err("token rejected".into()) };
+            Probe { slug: "a".into(), refreshed: None, usage: Err("token rejected".into()) };
         remember(&fixture.ctx(), std::slice::from_ref(&failed)).expect("records nothing");
 
-        assert_eq!(fixture.reading("a").expect("still there").limits[0].percent, 12.0);
+        let reading = fixture.reading("a").expect("still there");
+        assert_eq!(reading.usage.limits[0].percent, 12.0);
+        assert_eq!(reading.usage.model_usage.unwrap()["gpt-6-astra"].available, Some(false));
     }
 
     /// A reader that cannot afford a poll — a menu bar repainting every few
@@ -1854,7 +1869,7 @@ mod tests {
             fixture.stash.save(&entry.slug, &entry.account).expect("stash");
         }
         fixture.stash.set_active(Provider::Claude, "b").expect("active");
-        fixture.usage.record("a", &[limit!("session", 42.0)]).expect("records");
+        fixture.usage.record("a", &vec![limit!("session", 42.0)].into()).expect("records");
 
         let entries = cached_entries(&fixture.ctx()).expect("lists");
 
@@ -1864,7 +1879,7 @@ mod tests {
         assert!(entries[0].polled_at.is_some());
         assert!(!entries[0].entry.active);
         assert!(entries[1].entry.active);
-        assert!(entries[1].entry.limits.as_ref().unwrap_err().contains("not polled"));
+        assert!(entries[1].entry.usage.as_ref().unwrap_err().contains("not polled"));
         assert!(entries[1].polled_at.is_none());
     }
 
@@ -1873,7 +1888,7 @@ mod tests {
         let fixture = Fixture::new("forgotten");
         let entry = stashed("gone", oauth("r", 0));
         fixture.stash.save(&entry.slug, &entry.account).expect("stash");
-        fixture.usage.record("gone", &[limit!("session", 5.0)]).expect("records");
+        fixture.usage.record("gone", &vec![limit!("session", 5.0)].into()).expect("records");
 
         remove(&fixture.ctx(), "gone").expect("removes");
         assert!(fixture.reading("gone").is_none());
@@ -2074,7 +2089,7 @@ mod tests {
         let probe = Probe {
             slug: "g".into(),
             refreshed: Some(codex_oauth("r-new", LATER + 1, "g@x")),
-            limits: Err("poll failed".into()),
+            usage: Err("poll failed".into()),
         };
         persist(&fixture.ctx(), &mut accounts, &[probe], &Live::default()).unwrap();
         let store = codex::Store::at(&path, Some(&path));
@@ -2098,7 +2113,7 @@ mod tests {
         let probe = Probe {
             slug: "g".into(),
             refreshed: Some(codex_oauth("r-new", LATER + 1000, "g@x")),
-            limits: Ok(Vec::new()),
+            usage: Ok(Vec::new().into()),
         };
         persist(&pinned, &mut accounts, &[probe], &live).unwrap();
         assert_eq!(global.read().unwrap().unwrap().oauth().unwrap().refresh_token, "r-new");
@@ -2130,7 +2145,7 @@ mod tests {
         fixture.stash.save("g", &g.account).unwrap();
         fixture.stash.set_active(Provider::Codex, "other").unwrap();
         fixture.codex.write(&codex::AuthFile::default().with(&g.account.oauth)).unwrap();
-        fixture.usage.record("g", &[limit!("session", 42.0)]).unwrap();
+        fixture.usage.record("g", &vec![limit!("session", 42.0)].into()).unwrap();
         let entries = status_entries(&fixture.ctx(), true, Some(Provider::Codex)).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entry.slug, "g");
@@ -2188,7 +2203,7 @@ mod tests {
         fixture.stash.save("g", &g.account).unwrap();
         fixture.codex.write(&codex::AuthFile::default().with(&g.account.oauth)).unwrap();
         let entries = status_entries(&fixture.ctx(), true, Some(Provider::Codex)).unwrap();
-        assert!(entries[0].entry.limits.as_ref().unwrap_err().contains("not polled"));
+        assert!(entries[0].entry.usage.as_ref().unwrap_err().contains("not polled"));
         assert!(entries[0].polled_at.is_none());
         assert_eq!(fixture.codex_live().as_deref(), Some("expired"));
     }

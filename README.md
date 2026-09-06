@@ -148,7 +148,9 @@ text status and switch warnings. JSON and the usage cache retain its readings,
 along with `model_usage` metadata for every reported model. Other named quota
 pools appear on continuation rows with a `POOL` column when needed. Every
 reported window is retained, including both five-hour and weekly windows when
-present; missing windows appear as absent. The backend describes quota windows
+present. The `5H` column is always visible, showing `—` when the response does
+not include that window; a dash does not imply zero usage or unlimited access.
+The backend describes quota windows
 in its [usage response schema](https://github.com/openai/codex/blob/main/codex-rs/codex-backend-openapi-models/src/models/rate_limit_status_payload.rs).
 
 Old cached Codex readings that lost a named pool's window duration appear under
@@ -233,9 +235,9 @@ The Codex section shows its quota windows and model availability:
 
 ```text
   Codex
-     ACCOUNT              PLAN       WEEKLY            ASTRA
-   4 you@example.com      codex pro  ██░░  29% 2d11h   available         <- active
-   5 you+alt@example.com  codex pro  ███░  65% 2d11h   back 1h30m
+     ACCOUNT              PLAN       5H                WEEKLY            ASTRA
+   4 you@example.com      codex pro  —                 ██░░  29% 2d11h   available         <- active
+   5 you+alt@example.com  codex pro  —                 ███░  65% 2d11h   back 1h30m
 ```
 
 Additional pool names and model IDs come from the API. Pool rows belong to the

@@ -1,7 +1,7 @@
 //! Rendering the usage table: bars, colour, and the dynamic column set.
 //!
-//! Columns are derived from whatever limits the API reports rather than fixed
-//! in code, so a newly scoped model shows up on its own.
+//! Columns follow the limits the API reports, with a permanent Codex five-hour
+//! column so an unreported window is visible as a dash.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -192,9 +192,11 @@ impl Table {
                     .collect();
                 let columns = match provider {
                     Provider::Claude => columns_of(accounts.iter().copied()),
-                    Provider::Codex => ordered_columns(
-                        accounts.iter().flat_map(|e| e.visible_limits()).map(codex_window),
-                    ),
+                    Provider::Codex => {
+                        let windows =
+                            accounts.iter().flat_map(|e| e.visible_limits()).map(codex_window);
+                        ordered_columns(std::iter::once("5h".into()).chain(windows))
+                    }
                 };
                 Some(Section {
                     provider,
@@ -767,7 +769,9 @@ mod tests {
         let screen = Table::build(vec![codex], plain()).lines(None).join("\n");
         assert!(screen.contains("10%"));
         assert!(!screen.to_lowercase().contains("spark"));
-        assert!(!screen.contains("POOL") && !screen.contains("5H"));
+        assert!(!screen.contains("POOL") && screen.contains("5H"));
+        assert!(screen.contains('—'), "the shared five-hour reading is unreported");
+        assert!(!screen.contains("100%"), "Spark cannot fill the shared five-hour cell");
     }
 
     #[test]

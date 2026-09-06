@@ -15,10 +15,14 @@ use serde::Serialize;
 
 use crate::api::{Api, refreshed_oauth};
 use crate::codex;
+use crate::codex::Creds as _;
 use crate::creds::{self, Backend, CredStore};
 use crate::lock;
 use crate::login;
-use crate::model::{Account, CredsFile, Limit, Oauth, Provider, Stashed, plan_label};
+use crate::model::{
+    Account, CredsFile, Limit, ModelAvailability, Oauth, Provider, Stashed, UsageResponse,
+    plan_label,
+};
 use crate::notify;
 use crate::pen;
 use crate::picker::{self, Act, Outcome};
@@ -123,7 +127,7 @@ struct Probe {
     /// persist it: the refresh may have rotated the refresh token, and a
     /// rotated token that is not written down costs an interactive re-login.
     refreshed: Option<Oauth>,
-    limits: Result<Vec<Limit>, String>,
+    usage: Result<UsageResponse, String>,
 }
 
 /// Ask one account for its limits, refreshing its access token first if the
@@ -133,20 +137,20 @@ fn probe(apis: Apis, entry: &Stashed) -> Probe {
     let provider = entry.account.provider;
     let refreshed = match freshen(apis, provider, &entry.account.oauth) {
         Ok(refreshed) => refreshed,
-        Err(e) => return Probe { slug, refreshed: None, limits: Err(describe(&e)) },
+        Err(e) => return Probe { slug, refreshed: None, usage: Err(describe(&e)) },
     };
     let oauth = refreshed.as_ref().unwrap_or(&entry.account.oauth);
-    let limits = read_limits(apis, provider, oauth).map_err(|e| describe(&e));
-    Probe { slug, refreshed, limits }
+    let usage = read_usage(apis, provider, oauth).map_err(|e| describe(&e));
+    Probe { slug, refreshed, usage }
 }
 
 /// What an account has left, asked of its provider.
-fn read_limits(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<Vec<Limit>> {
+fn read_usage(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<UsageResponse> {
     match provider {
-        Provider::Claude => Ok(apis.claude.usage(&oauth.access_token)?.limits),
+        Provider::Claude => apis.claude.usage(&oauth.access_token),
         Provider::Codex => {
             let account = oauth.account_id().context("a Codex login that names no account")?;
-            Ok(codex::limits(&apis.codex.usage(&oauth.access_token, account)?))
+            Ok(apis.codex.usage(&oauth.access_token, account)?.into())
         }
     }
 }
@@ -185,23 +189,63 @@ fn freshen(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<Option<Oauth
 /// Every copy of one account's credentials there is to read.
 ///
 /// `installed` is what its provider's live slot holds, and belongs here only
-/// when that is this account. Pens are Claude Code's, so only a Claude
-/// account has one to read.
+/// when that is this account. Pins contribute their provider's credentials.
 fn copies(ctx: &Ctx, entry: &Stashed, installed: Option<&Oauth>) -> Result<Vec<Oauth>> {
-    // Only where there is a pen to read: a pen that was never built holds no
-    // copy, and asking after one costs a keychain lookup on the machines that
-    // keep credentials there.
-    let pen = match entry.account.provider {
+    let mut held = vec![entry.account.oauth.clone()];
+    held.extend(installed.cloned());
+    match entry.account.provider {
         Provider::Claude => {
             let pen_dir = pen::at(ctx.stash.root(), &entry.slug);
-            match pen_dir.is_dir() {
-                true => ctx.backend.confined(&pen_dir).read()?.map(|file| file.oauth),
-                false => None,
+            if pen_dir.is_dir() {
+                held.extend(ctx.backend.confined(&pen_dir).read()?.map(|file| file.oauth));
             }
         }
-        Provider::Codex => None,
-    };
-    Ok([Some(entry.account.oauth.clone()), installed.cloned(), pen].into_iter().flatten().collect())
+        Provider::Codex => {
+            for store in codex_copies(ctx, entry)? {
+                held.extend(store.read()?.and_then(|file| file.oauth()));
+            }
+        }
+    }
+    Ok(held)
+}
+
+/// Pins may have been switched in place, so their credentials' account id,
+/// rather than the directory name, decides which account owns the copy.
+fn codex_copies(ctx: &Ctx, entry: &Stashed) -> Result<Vec<codex::Store>> {
+    let root = ctx.stash.root().join("pens");
+    let mut directories = Vec::new();
+    if let Some(home) = pen::codex_home_of(ctx.codex.dir())? {
+        directories.push(home);
+    }
+    if root.is_dir() {
+        for directory in std::fs::read_dir(root)? {
+            let directory = directory?.path();
+            if pen::codex_home_of(&directory)?.is_some() {
+                directories.push(directory);
+            }
+        }
+    }
+    let mut stores = Vec::new();
+    for directory in directories {
+        let store = codex::Store::at(&directory, Some(&directory));
+        let held = store.read()?.and_then(|file| file.oauth());
+        let belongs_to_account =
+            held.as_ref().is_some_and(|oauth| codex_account_matches(entry, oauth));
+        if belongs_to_account {
+            stores.push(store);
+        }
+    }
+    Ok(stores)
+}
+
+/// A workspace can contain several users. Its account id alone cannot
+/// identify which user's credentials a stashed login owns.
+fn codex_account_matches(entry: &Stashed, oauth: &Oauth) -> bool {
+    let same_workspace = oauth.account_id() == Some(entry.account.uuid.as_str());
+    let identity = oauth.id_token().and_then(|token| codex::identity(token).ok());
+    let same_user =
+        identity.is_some_and(|who| who.email.eq_ignore_ascii_case(&entry.account.email));
+    same_workspace && same_user
 }
 
 /// The most recently minted of some copies of one account's credentials.
@@ -227,10 +271,17 @@ fn propagate(ctx: &Ctx, entry: &mut Stashed, oauth: &Oauth, live: &Live) -> Resu
     if live.holds(entry) {
         install_live(ctx, entry.account.provider, oauth)?;
     }
-    if entry.account.provider == Provider::Claude {
-        let pen = pen::at(ctx.stash.root(), &entry.slug);
-        if pen.is_dir() {
-            install(ctx.backend.confined(&pen).as_ref(), oauth)?;
+    match entry.account.provider {
+        Provider::Claude => {
+            let pen = pen::at(ctx.stash.root(), &entry.slug);
+            if pen.is_dir() {
+                install(ctx.backend.confined(&pen).as_ref(), oauth)?;
+            }
+        }
+        Provider::Codex => {
+            for store in codex_copies(ctx, entry)? {
+                install_codex(&store, oauth)?;
+            }
         }
     }
     Ok(())
@@ -291,8 +342,8 @@ fn persist(ctx: &Ctx, accounts: &mut [Stashed], probes: &[Probe], live: &Live) -
 /// is worth more than absent, and the stamp on it says how stale.
 fn remember(ctx: &Ctx, probes: &[Probe]) -> Result<()> {
     for probe in probes {
-        let Ok(limits) = &probe.limits else { continue };
-        ctx.usage.record(&probe.slug, limits)?;
+        let Ok(usage) = &probe.usage else { continue };
+        ctx.usage.record(&probe.slug, usage)?;
     }
     Ok(())
 }
@@ -308,6 +359,12 @@ fn identify(
     live: Option<&Oauth>,
 ) -> Option<String> {
     let live = live?;
+    if provider == Provider::Codex {
+        return accounts
+            .iter()
+            .find(|a| a.account.provider == provider && codex_account_matches(a, live))
+            .map(|a| a.slug.clone());
+    }
     let matched = accounts.iter().filter(|a| a.account.provider == provider).find(|a| {
         a.account.oauth.refresh_token == live.refresh_token
             || a.account.oauth.access_token == live.access_token
@@ -387,10 +444,7 @@ pub fn list(ctx: &Ctx, json: bool, cached: bool) -> Result<()> {
             return Ok(());
         }
         let table = Table::build(readings.into_iter().map(|r| r.entry).collect(), Style::detect());
-        println!("{}", table.header());
-        for index in 0..table.len() {
-            println!("{}", table.row(index));
-        }
+        println!("{}", table.lines(None).join("\n"));
         return Ok(());
     }
     let mut accounts = stashed(ctx)?;
@@ -398,10 +452,7 @@ pub fn list(ctx: &Ctx, json: bool, cached: bool) -> Result<()> {
     if json {
         return emit_json(&table);
     }
-    println!("{}", table.header());
-    for index in 0..table.len() {
-        println!("{}", table.row(index));
-    }
+    println!("{}", table.lines(None).join("\n"));
     Ok(())
 }
 
@@ -423,8 +474,8 @@ fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
         .map(|account| {
             let live = ctx.stash.active(account.account.provider);
             let reading = ctx.usage.read(&account.slug)?;
-            let (limits, polled_at) = match reading {
-                Some(reading) => (Ok(reading.limits), Some(reading.polled_at)),
+            let (usage, polled_at) = match reading {
+                Some(reading) => (Ok(reading.usage), Some(reading.polled_at)),
                 None => (Err("not polled yet; `ccs watch` polls".to_string()), None),
             };
             let entry = Entry {
@@ -433,7 +484,7 @@ fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
                 email: account.account.email.clone(),
                 plan: account.account.plan_label(),
                 active: live.as_deref() == Some(account.slug.as_str()),
-                limits,
+                usage,
             };
             Ok(Cached { entry, polled_at })
         })
@@ -442,98 +493,134 @@ fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
 
 /// The limits of every account in use: the one in Claude Code's slot, the
 /// one in Codex's, whichever are logged in.
-pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
-    let style = Style::detect();
-    warn_overridden();
-    let accounts = ctx.stash.list()?;
-    let mut entries = Vec::new();
-
-    // Each slot is read once: on a Mac the Claude read is a keychain call.
-    let slots = slots(ctx)?;
-    if let Some(held) = slots.claude {
-        let oauth = match freshen(ctx.apis(), Provider::Claude, &held)? {
-            None => held.clone(),
-            Some(fresh) => {
-                install(ctx.creds, &fresh)?;
-                fresh
-            }
-        };
-        let identified = identify(ctx, &accounts, Provider::Claude, Some(&held));
-        let profile = ctx.api.profile(&oauth.access_token)?;
-        let limits = ctx.api.usage(&oauth.access_token)?.limits;
-        // An account nothing in the stash answers for has nowhere to be
-        // recorded; the reading is keyed by slug, and there is no slug.
-        if let Some(slug) = &identified {
-            ctx.usage.record(slug, &limits)?;
-        }
-        let organization = profile.organization.as_ref();
-        let plan = plan_label(
-            organization.and_then(|o| o.rate_limit_tier.as_deref()),
-            organization.and_then(|o| o.organization_type.as_deref()),
-        );
-        entries.push(Entry {
-            provider: Provider::Claude,
-            slug: identified.unwrap_or_default(),
-            email: profile.account.email,
-            plan,
-            active: true,
-            limits: Ok(limits),
-        });
-    }
-    if let Some(held) = slots.codex {
-        let oauth = match freshen(ctx.apis(), Provider::Codex, &held)? {
-            None => held.clone(),
-            Some(fresh) => {
-                install_codex(ctx.codex, &fresh)?;
-                fresh
-            }
-        };
-        let identified = identify(ctx, &accounts, Provider::Codex, Some(&held));
-        let who = codex::identity(oauth.id_token().unwrap_or_default())
-            .with_context(|| format!("reading the login in {}", ctx.codex.describe()))?;
-        let limits = read_limits(ctx.apis(), Provider::Codex, &oauth)?;
-        if let Some(slug) = &identified {
-            ctx.usage.record(slug, &limits)?;
-        }
-        entries.push(Entry {
-            provider: Provider::Codex,
-            slug: identified.unwrap_or_default(),
-            email: who.email,
-            plan: format!("codex {}", who.plan),
-            active: true,
-            limits: Ok(limits),
-        });
-    }
-    if entries.is_empty() {
+pub fn status(ctx: &Ctx, json: bool, cached: bool, provider: Option<Provider>) -> Result<()> {
+    let readings = status_entries(ctx, cached, provider)?;
+    if readings.is_empty() {
         bail!(
-            "nothing is logged in: no credentials in {} and no login in {}",
-            ctx.creds.describe(),
-            ctx.codex.describe()
+            "no matching account is logged in; use `ccs add --current` or `ccs add --current --codex`"
         );
     }
-
     if json {
-        // The shape it always had — the Claude account's fields at the top —
-        // with the Codex account, when there is one, under `codex`. With
-        // only a Codex login, that one is at the top and says so in
-        // `provider`, so nothing reading this ever meets a list.
-        let mut top = serde_json::to_value(view(&entries[0], None))?;
-        if let (Some(codex), serde_json::Value::Object(map)) = (entries.get(1), &mut top) {
-            map.insert("codex".into(), serde_json::to_value(view(codex, None))?);
+        let views: Vec<_> =
+            readings.iter().map(|r| view(&r.entry, r.polled_at.as_deref())).collect();
+        let mut top = serde_json::to_value(&views[0])?;
+        if let Some(codex) = views.get(1) {
+            top["codex"] = serde_json::to_value(codex)?;
         }
         println!("{}", serde_json::to_string_pretty(&top)?);
         return Ok(());
     }
-    for (index, entry) in entries.iter().enumerate() {
+    let style = Style::detect();
+    for (index, reading) in readings.iter().enumerate() {
         if index > 0 {
             println!();
         }
-        println!("{}  {}", style.bold(&entry.email), style.dim(&entry.plan));
+        let entry = &reading.entry;
+        println!(
+            "{} · {}  {}",
+            entry.provider.label(),
+            style.bold(&entry.email),
+            style.dim(&entry.plan)
+        );
         for line in render::detail(entry, style) {
             println!("{line}");
         }
+        if let Some(polled_at) = &reading.polled_at {
+            println!("last polled {polled_at}");
+        }
     }
     Ok(())
+}
+
+/// Cached status reads the calling client's credentials to select the account,
+/// but never refreshes or polls. A pin can differ from the global active pointer.
+fn status_entries(ctx: &Ctx, cached: bool, selected: Option<Provider>) -> Result<Vec<Cached>> {
+    let accounts = ctx.stash.list()?;
+    let mut readings = Vec::new();
+    for provider in Provider::ALL {
+        if selected.is_some_and(|selected| provider != selected) {
+            continue;
+        }
+        let Some(held) = slot(ctx, provider)? else { continue };
+        let identified = identify(ctx, &accounts, provider, Some(&held));
+        let account =
+            identified.as_ref().and_then(|slug| accounts.iter().find(|a| &a.slug == slug));
+        if cached {
+            let account = account.context("the current login is not stashed; run `ccs add --current` (with --codex for Codex)")?;
+            let reading = ctx.usage.read(&account.slug)?;
+            let (usage, polled_at) = match reading {
+                Some(reading) => (Ok(reading.usage), Some(reading.polled_at)),
+                None => (Err("not polled yet; `ccs watch` polls".to_string()), None),
+            };
+            readings.push(Cached {
+                entry: Entry {
+                    provider,
+                    slug: account.slug.clone(),
+                    email: account.account.email.clone(),
+                    plan: account.account.plan_label(),
+                    active: true,
+                    usage,
+                },
+                polled_at,
+            });
+            continue;
+        }
+        let copies = match account {
+            Some(account) => copies(ctx, account, Some(&held))?,
+            None => vec![held.clone()],
+        };
+        let latest = newest(copies.iter().cloned()).expect("includes the live credentials");
+        let oauth = freshen(ctx.apis(), provider, &latest)?.unwrap_or(latest);
+        let credentials_changed = copies.iter().any(|copy| {
+            copy.access_token != oauth.access_token || copy.refresh_token != oauth.refresh_token
+        });
+        if credentials_changed {
+            match account {
+                Some(account) => {
+                    let mut live = Live::default();
+                    live.set(provider, Some(account.slug.clone()));
+                    propagate(ctx, &mut account.clone(), &oauth, &live)?;
+                }
+                None => install_live(ctx, provider, &oauth)?,
+            }
+        }
+        let (email, plan) = match provider {
+            Provider::Claude => {
+                warn_overridden();
+                let profile = ctx.api.profile(&oauth.access_token)?;
+                let organization = profile.organization.as_ref();
+                (
+                    profile.account.email,
+                    plan_label(
+                        organization.and_then(|o| o.rate_limit_tier.as_deref()),
+                        organization.and_then(|o| o.organization_type.as_deref()),
+                    ),
+                )
+            }
+            Provider::Codex => {
+                let who = codex::identity(
+                    oauth.id_token().context("Codex login has no identity token")?,
+                )?;
+                (who.email, format!("codex {}", who.plan))
+            }
+        };
+        let usage = read_usage(ctx.apis(), provider, &oauth)?;
+        if let Some(slug) = &identified {
+            ctx.usage.record(slug, &usage)?;
+        }
+        readings.push(Cached {
+            entry: Entry {
+                provider,
+                slug: identified.unwrap_or_default(),
+                email,
+                plan,
+                active: true,
+                usage: Ok(usage),
+            },
+            polled_at: None,
+        });
+    }
+    Ok(readings)
 }
 
 /// Stash an account. Two ways in: log in to another one without disturbing the
@@ -545,12 +632,13 @@ pub fn add(
     current: bool,
     options: &login::Options,
 ) -> Result<()> {
+    options.validate(provider)?;
     let oauth = match (provider, current) {
         (Provider::Claude, true) => {
             in_use(ctx, "sign in with `claude` before `ccs add --current`")?.1
         }
         (Provider::Claude, false) => {
-            println!("logging in to another account; the one in use is not affected");
+            println!("logging in to another Claude Code account; the one in use is not affected");
             login::run(ctx.backend, ctx.stash.root(), &claude_binary(), options)?
         }
         (Provider::Codex, true) => {
@@ -566,8 +654,10 @@ pub fn add(
     let (email, slug) = (&recorded.stashed.account.email, &recorded.stashed.slug);
 
     match current {
-        true => println!("{verb} the account in use, {email}, as {slug}"),
-        false => println!("{verb} {email} as {slug}; `ccs use {slug}` to switch to it"),
+        true => println!("{verb} the {provider} account in use, {email}, as {slug}"),
+        false => println!(
+            "{verb} {provider} account {email} as {slug}; `ccs use {slug}` to switch to it"
+        ),
     }
     Ok(())
 }
@@ -676,7 +766,10 @@ fn record(
         oauth,
     };
     ctx.stash.save(&slug, &account)?;
-    if installed == Installed::Yes {
+    let is_codex_pin =
+        provider == Provider::Codex && pen::codex_home_of(ctx.codex.dir())?.is_some();
+    let installed_globally = installed == Installed::Yes && !is_codex_pin;
+    if installed_globally {
         ctx.stash.set_active(provider, &slug)?;
     }
     Ok(Recorded { stashed: Stashed { slug, account }, replaced })
@@ -686,19 +779,36 @@ pub fn remove(ctx: &Ctx, needle: &str) -> Result<()> {
     let accounts = ctx.stash.list()?;
     let target = stash::resolve(&accounts, needle)?.clone();
     ctx.stash.remove(&target.slug)?;
-    if let Err(e) = pen::discard(ctx.stash.root(), &target.slug) {
-        eprintln!("ccs: {}'s pen is still there: {}", target.slug, describe(&e));
-    }
-    // The pen's credentials may not have been inside it, and what is left of
-    // them outlives the directory without a word.
-    if let Err(e) = ctx.backend.forget(&pen::at(ctx.stash.root(), &target.slug)) {
-        eprintln!("ccs: {}'s pinned credentials are still there: {}", target.slug, describe(&e));
+    if let Err(error) = forget_pins(ctx, &target) {
+        eprintln!(
+            "ccs: {}'s pinned credentials are still there: {}",
+            target.slug,
+            describe(&error)
+        );
     }
     if let Err(e) = ctx.usage.forget(&target.slug) {
         eprintln!("ccs: {}'s last usage reading is still there: {}", target.slug, describe(&e));
     }
     println!("forgot {} ({})", target.account.email, target.slug);
     Ok(())
+}
+
+fn forget_pins(ctx: &Ctx, target: &Stashed) -> Result<()> {
+    match target.account.provider {
+        Provider::Claude => {
+            pen::discard(ctx.stash.root(), &target.slug)?;
+            ctx.backend.forget(&pen::at(ctx.stash.root(), &target.slug))
+        }
+        Provider::Codex => {
+            for store in codex_copies(ctx, target)? {
+                if pen::codex_home_of(store.dir())?.is_none() {
+                    continue;
+                }
+                std::fs::remove_file(store.dir().join("auth.json"))?;
+            }
+            Ok(())
+        }
+    }
 }
 
 pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
@@ -721,9 +831,22 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Subscribe (or unsubscribe) the calling Claude Code session to notices.
-pub fn notify(ctx: &Ctx, off: bool, kinds: &[String], bypass: bool) -> Result<()> {
-    notify::subscribe(ctx.stash.root(), !off, kinds, bypass)
+/// Subscribe (or unsubscribe) the calling client session to notices.
+pub fn notify(
+    ctx: &Ctx,
+    off: bool,
+    kinds: &[String],
+    bypass: bool,
+    provider: Option<Provider>,
+) -> Result<()> {
+    let session = notify::Session::detect(
+        ctx.creds.dir(),
+        ctx.codex.dir(),
+        &codex_binary(),
+        provider,
+        bypass,
+    )?;
+    notify::subscribe(ctx.stash.root(), session, !off, kinds)
 }
 
 /// Poll every account on an interval and raise a notice for whatever changed.
@@ -746,8 +869,12 @@ pub fn watch(ctx: &Ctx, every: Duration, high: f64, rotate: &[String]) -> Result
             Ok((table, _)) => {
                 for event in watch::diff(&before, table.entries(), high) {
                     let told = notify::broadcast(
-                        ctx.creds.dir(),
+                        match event.provider {
+                            Provider::Claude => ctx.creds.dir(),
+                            Provider::Codex => ctx.codex.dir(),
+                        },
                         ctx.stash.root(),
+                        event.provider,
                         event.kind,
                         &event.text,
                     );
@@ -952,7 +1079,7 @@ pub fn pick(ctx: &Ctx) -> Result<()> {
 }
 
 /// Confine a session to one account: install that account's credentials in its
-/// own pen and hand the process over to Claude Code there.
+/// own pen and hand the process over to its client there.
 ///
 /// Nothing outside the pen is touched, so every other session stays on the
 /// account in use and a later `ccs use` leaves this one where it is.
@@ -970,18 +1097,16 @@ pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
             chosen
         }
     };
-    if target.account.provider != Provider::Claude {
-        bail!(
-            "{} is a {} account; a pin is a Claude Code session",
-            target.account.email,
-            target.account.provider
-        );
-    }
-
     let pen = pen_for(ctx, &target, &live)?;
-    warn_overridden();
+    let binary = match target.account.provider {
+        Provider::Claude => {
+            warn_overridden();
+            claude_binary()
+        }
+        Provider::Codex => codex_binary(),
+    };
     println!("{} is pinned to this session only", target.account.email);
-    pen::launch(&pen, &claude_binary(), args)
+    pen::launch(&pen, target.account.provider, &binary, args)
 }
 
 /// The account's pen, with its freshest credentials in place.
@@ -990,11 +1115,18 @@ pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
 /// finds it, which is what leaves the pen and every other copy of the account on
 /// the one token a refresh here has not spent.
 fn pen_for(ctx: &Ctx, target: &Stashed, live: &Live) -> Result<PathBuf> {
-    let pen = pen::prepare(ctx.home, ctx.stash.root(), &target.slug)?;
+    let provider = target.account.provider;
+    let pen = match provider {
+        Provider::Claude => pen::prepare(ctx.home, ctx.stash.root(), &target.slug)?,
+        Provider::Codex => pen::prepare_codex(ctx.codex.dir(), ctx.stash.root(), &target.slug)?,
+    };
 
     let mut entry = target.clone();
-    let oauth = freshen(ctx.apis(), Provider::Claude, &entry.account.oauth)?
+    let oauth = freshen(ctx.apis(), provider, &entry.account.oauth)?
         .unwrap_or_else(|| entry.account.oauth.clone());
+    if provider == Provider::Codex {
+        install_codex(&codex::Store::at(&pen, Some(&pen)), &oauth)?;
+    }
     propagate(ctx, &mut entry, &oauth, live)?;
     Ok(pen)
 }
@@ -1087,7 +1219,7 @@ fn choose(ctx: &Ctx, accounts: &mut [Stashed], verb: Verb) -> Result<Option<Stas
 fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
     let accounts = ctx.stash.list()?;
     if accounts.is_empty() {
-        bail!("no accounts stashed yet; log in with `claude` then run `ccs add`");
+        bail!("no accounts stashed yet; run `ccs add` and choose Claude Code or Codex");
     }
     Ok(accounts)
 }
@@ -1142,6 +1274,7 @@ fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<us
     let told = notify::broadcast(
         ctx.creds.dir(),
         ctx.stash.root(),
+        Provider::Claude,
         "switch",
         &format!(
             "this session's account is now {} ({}). \
@@ -1157,8 +1290,16 @@ fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<us
 /// the screen.
 fn report_switch(target: &Stashed, told: usize) {
     println!("switched to {} ({})", target.account.email, target.slug);
-    println!("running sessions pick this up on their next request{}", heard(told));
-    warn_overridden();
+    match target.account.provider {
+        Provider::Claude => {
+            println!("running sessions pick this up on their next request{}", heard(told));
+            warn_overridden();
+        }
+        Provider::Codex => println!(
+            "Codex login installed{}; verify with /status and resume if the session still shows the previous account",
+            heard(told)
+        ),
+    }
 }
 
 /// How many subscribed sessions heard about it, for the tail of a report.
@@ -1170,8 +1311,7 @@ fn heard(told: usize) -> String {
     }
 }
 
-/// Install `target` as Codex's login. Codex CLI reloads the file when it
-/// changes, so running sessions follow; there is no inbox to tell.
+/// Install `target` as Codex's login and notify subscribers to that home.
 fn switch_codex(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<usize> {
     std::fs::create_dir_all(ctx.codex.dir())
         .with_context(|| format!("creating {}", ctx.codex.dir().display()))?;
@@ -1185,8 +1325,20 @@ fn switch_codex(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result
         eprintln!("ccs: {} held an API-key login; it is replaced", ctx.codex.describe());
     }
     ctx.codex.write(&current.unwrap_or_default().with(&target.account.oauth))?;
-    ctx.stash.set_active(Provider::Codex, &target.slug)?;
-    Ok(0)
+    if pen::codex_home_of(ctx.codex.dir())?.is_none() {
+        ctx.stash.set_active(Provider::Codex, &target.slug)?;
+    }
+    drop(_guard);
+    Ok(notify::broadcast(
+        ctx.codex.dir(),
+        ctx.stash.root(),
+        Provider::Codex,
+        "switch",
+        &format!(
+            "Codex account changed to {} ({}). Use /status to verify the running session's account; resume the session if it still shows the previous login.",
+            target.account.email, target.slug
+        ),
+    ))
 }
 
 /// Fold the outgoing account's live credentials into its stash entry.
@@ -1221,7 +1373,7 @@ fn guard_exhausted(entry: &Entry, force: bool) -> Result<()> {
     if force {
         return Ok(());
     }
-    if entry.exhausted().is_empty() {
+    if entry.restrictions().is_empty() {
         return Ok(());
     }
     if !confirm(&render::question(entry, Verb::Switch))? {
@@ -1256,6 +1408,8 @@ struct View<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     polled_at: Option<&'a str>,
     limits: &'a [Limit],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_usage: Option<&'a std::collections::BTreeMap<String, ModelAvailability>>,
 }
 
 fn view<'a>(entry: &'a Entry, polled_at: Option<&'a str>) -> View<'a> {
@@ -1265,9 +1419,10 @@ fn view<'a>(entry: &'a Entry, polled_at: Option<&'a str>) -> View<'a> {
         email: &entry.email,
         plan: &entry.plan,
         active: entry.active,
-        error: entry.limits.as_ref().err().map(String::as_str),
+        error: entry.usage.as_ref().err().map(String::as_str),
         polled_at,
         limits: entry.known(),
+        model_usage: entry.models(),
     }
 }
 
@@ -1286,7 +1441,7 @@ fn entry_of(account: &Stashed, probe: &Probe, active: bool) -> Entry {
         email: account.account.email.clone(),
         plan: account.account.plan_label(),
         active,
-        limits: probe.limits.clone(),
+        usage: probe.usage.clone(),
     }
 }
 
@@ -1393,6 +1548,9 @@ mod tests {
     fn codex_stashed(slug: &str, oauth: Oauth) -> Stashed {
         let mut entry = stashed(slug, oauth);
         entry.account.provider = Provider::Codex;
+        entry.account.uuid = entry.account.oauth.account_id().expect("account id").to_string();
+        entry.account.email =
+            codex::identity(entry.account.oauth.id_token().unwrap()).unwrap().email;
         entry
     }
 
@@ -1514,7 +1672,7 @@ mod tests {
         let probes = vec![Probe {
             slug: "work".into(),
             refreshed: Some(oauth("rotated", 2)),
-            limits: Ok(vec![]),
+            usage: Ok(vec![].into()),
         }];
         persist(&fixture.ctx(), &mut accounts, &probes, &claude_live("work")).expect("persist");
 
@@ -1668,27 +1826,36 @@ mod tests {
         let probe = Probe {
             slug: "a".into(),
             refreshed: None,
-            limits: Ok(vec![limit!("weekly_scoped", 61.0, model = "Fable")]),
+            usage: Ok(vec![limit!("weekly_scoped", 61.0, model = "Fable")].into()),
         };
         remember(&fixture.ctx(), std::slice::from_ref(&probe)).expect("records");
 
         let reading = fixture.reading("a").expect("recorded");
-        assert_eq!(reading.limits[0].model_name(), Some("Fable"));
-        assert_eq!(reading.limits[0].percent, 61.0);
+        assert_eq!(reading.usage.limits[0].model_name(), Some("Fable"));
+        assert_eq!(reading.usage.limits[0].percent, 61.0);
     }
 
     #[test]
     fn a_probe_that_failed_leaves_the_last_good_reading_standing() {
         let fixture = Fixture::new("kept");
-        let good =
-            Probe { slug: "a".into(), refreshed: None, limits: Ok(vec![limit!("session", 12.0)]) };
+        let good = Probe {
+            slug: "a".into(),
+            refreshed: None,
+            usage: Ok(serde_json::from_value(serde_json::json!({
+                "limits": [{"kind": "session", "percent": 12}],
+                "model_usage": {"gpt-6-astra": {"available": false}}
+            }))
+            .unwrap()),
+        };
         remember(&fixture.ctx(), std::slice::from_ref(&good)).expect("records");
 
         let failed =
-            Probe { slug: "a".into(), refreshed: None, limits: Err("token rejected".into()) };
+            Probe { slug: "a".into(), refreshed: None, usage: Err("token rejected".into()) };
         remember(&fixture.ctx(), std::slice::from_ref(&failed)).expect("records nothing");
 
-        assert_eq!(fixture.reading("a").expect("still there").limits[0].percent, 12.0);
+        let reading = fixture.reading("a").expect("still there");
+        assert_eq!(reading.usage.limits[0].percent, 12.0);
+        assert_eq!(reading.usage.model_usage.unwrap()["gpt-6-astra"].available, Some(false));
     }
 
     /// A reader that cannot afford a poll — a menu bar repainting every few
@@ -1702,7 +1869,7 @@ mod tests {
             fixture.stash.save(&entry.slug, &entry.account).expect("stash");
         }
         fixture.stash.set_active(Provider::Claude, "b").expect("active");
-        fixture.usage.record("a", &[limit!("session", 42.0)]).expect("records");
+        fixture.usage.record("a", &vec![limit!("session", 42.0)].into()).expect("records");
 
         let entries = cached_entries(&fixture.ctx()).expect("lists");
 
@@ -1712,7 +1879,7 @@ mod tests {
         assert!(entries[0].polled_at.is_some());
         assert!(!entries[0].entry.active);
         assert!(entries[1].entry.active);
-        assert!(entries[1].entry.limits.as_ref().unwrap_err().contains("not polled"));
+        assert!(entries[1].entry.usage.as_ref().unwrap_err().contains("not polled"));
         assert!(entries[1].polled_at.is_none());
     }
 
@@ -1721,7 +1888,7 @@ mod tests {
         let fixture = Fixture::new("forgotten");
         let entry = stashed("gone", oauth("r", 0));
         fixture.stash.save(&entry.slug, &entry.account).expect("stash");
-        fixture.usage.record("gone", &[limit!("session", 5.0)]).expect("records");
+        fixture.usage.record("gone", &vec![limit!("session", 5.0)].into()).expect("records");
 
         remove(&fixture.ctx(), "gone").expect("removes");
         assert!(fixture.reading("gone").is_none());
@@ -1874,12 +2041,171 @@ mod tests {
     }
 
     #[test]
-    fn a_pin_is_a_claude_code_session_and_says_so_for_a_codex_account() {
+    fn a_codex_pin_has_its_own_credentials_and_leaves_live_slots_alone() {
         let fixture = Fixture::new("codex-pin");
         let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
         fixture.stash.save("g", &g.account).expect("save");
-        let error = pin(&fixture.ctx(), Some("g"), &[]).unwrap_err().to_string();
-        assert!(error.contains("Claude Code"), "{error}");
+        let path = pen_for(&fixture.ctx(), &g, &Live::default()).expect("prepares");
+        let store = codex::Store::at(&path, Some(&path));
+        assert_eq!(store.read().unwrap().unwrap().oauth().unwrap().refresh_token, "r-g");
+        assert!(fixture.codex_live().is_none());
+        assert!(fixture.creds.read().unwrap().is_none());
+        assert!(fixture.stash.active(Provider::Codex).is_none());
+    }
+
+    #[test]
+    fn codex_pin_refreshes_are_kept_with_the_account_after_repinning() {
+        let fixture = Fixture::new("codex-repin");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        let h = codex_stashed("h", codex_oauth("r-h", LATER, "h@x"));
+        fixture.stash.save("g", &g.account).unwrap();
+        fixture.stash.save("h", &h.account).unwrap();
+        fixture.codex.write(&codex::AuthFile::default().with(&g.account.oauth)).unwrap();
+        fixture.stash.set_active(Provider::Codex, "g").unwrap();
+        let path = pen_for(&fixture.ctx(), &g, &Live::default()).unwrap();
+        let store = codex::Store::at(&path, Some(&path));
+        let pinned = Ctx { codex: &store, ..fixture.ctx() };
+        let mut accounts = fixture.stash.list().unwrap();
+        switch_to(&pinned, &mut accounts, &h).unwrap();
+        assert_eq!(fixture.stash.active(Provider::Codex).as_deref(), Some("g"));
+        assert_eq!(fixture.codex_live().as_deref(), Some("r-g"));
+        assert_eq!(identify_live(&pinned, &accounts).unwrap().codex.as_deref(), Some("h"));
+        let refreshed = codex_oauth("r-h-new", LATER + 1000, "h@x");
+        store.write(&codex::AuthFile::default().with(&refreshed)).unwrap();
+        let live = identify_live(&fixture.ctx(), &accounts).unwrap();
+        reconcile(&fixture.ctx(), &mut accounts, &live).unwrap();
+        assert_eq!(fixture.tokens("h").0, "r-h-new");
+        assert_eq!(fixture.tokens("g").0, "r-g");
+        assert_eq!(fixture.codex_live().as_deref(), Some("r-g"));
+    }
+
+    #[test]
+    fn polling_a_codex_account_propagates_its_refresh_to_the_pin() {
+        let fixture = Fixture::new("codex-pin-propagate");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        fixture.stash.save("g", &g.account).unwrap();
+        let path = pen_for(&fixture.ctx(), &g, &Live::default()).unwrap();
+        let mut accounts = fixture.stash.list().unwrap();
+        let probe = Probe {
+            slug: "g".into(),
+            refreshed: Some(codex_oauth("r-new", LATER + 1, "g@x")),
+            usage: Err("poll failed".into()),
+        };
+        persist(&fixture.ctx(), &mut accounts, &[probe], &Live::default()).unwrap();
+        let store = codex::Store::at(&path, Some(&path));
+        assert_eq!(store.read().unwrap().unwrap().oauth().unwrap().refresh_token, "r-new");
+        assert_eq!(fixture.tokens("g").0, "r-new");
+        assert!(fixture.codex_live().is_none());
+    }
+
+    #[test]
+    fn refreshing_inside_a_codex_pin_updates_the_matching_global_login() {
+        let fixture = Fixture::new("codex-pin-to-global");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        fixture.stash.save("g", &g.account).unwrap();
+        let global = codex::Store::at(&fixture.dir, Some(fixture.codex.dir()));
+        global.write(&codex::AuthFile::default().with(&g.account.oauth)).unwrap();
+        let path = pen_for(&fixture.ctx(), &g, &Live::default()).unwrap();
+        let store = codex::Store::at(&path, Some(&path));
+        let pinned = Ctx { codex: &store, ..fixture.ctx() };
+        let mut accounts = fixture.stash.list().unwrap();
+        let live = identify_live(&pinned, &accounts).unwrap();
+        let probe = Probe {
+            slug: "g".into(),
+            refreshed: Some(codex_oauth("r-new", LATER + 1000, "g@x")),
+            usage: Ok(Vec::new().into()),
+        };
+        persist(&pinned, &mut accounts, &[probe], &live).unwrap();
+        assert_eq!(global.read().unwrap().unwrap().oauth().unwrap().refresh_token, "r-new");
+        assert_eq!(store.read().unwrap().unwrap().oauth().unwrap().refresh_token, "r-new");
+    }
+
+    #[test]
+    fn removing_a_codex_account_clears_only_pins_currently_holding_that_account() {
+        let fixture = Fixture::new("codex-remove-repin");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        let h = codex_stashed("h", codex_oauth("r-h", LATER, "h@x"));
+        fixture.stash.save("g", &g.account).unwrap();
+        fixture.stash.save("h", &h.account).unwrap();
+        let path = pen_for(&fixture.ctx(), &g, &Live::default()).unwrap();
+        let store = codex::Store::at(&path, Some(&path));
+        store.write(&codex::AuthFile::default().with(&h.account.oauth)).unwrap();
+        fs::write(path.join("history.jsonl"), "conversation").unwrap();
+        remove(&fixture.ctx(), "g").unwrap();
+        assert_eq!(store.read().unwrap().unwrap().oauth().unwrap().refresh_token, "r-h");
+        remove(&fixture.ctx(), "h").unwrap();
+        assert!(store.read().unwrap().is_none());
+        assert_eq!(fs::read_to_string(path.join("history.jsonl")).unwrap(), "conversation");
+    }
+
+    #[test]
+    fn cached_codex_status_reads_the_login_even_when_the_global_pointer_differs() {
+        let fixture = Fixture::new("cached-codex-status");
+        let g = codex_stashed("g", codex_oauth("expired", 1, "g@x"));
+        fixture.stash.save("g", &g.account).unwrap();
+        fixture.stash.set_active(Provider::Codex, "other").unwrap();
+        fixture.codex.write(&codex::AuthFile::default().with(&g.account.oauth)).unwrap();
+        fixture.usage.record("g", &vec![limit!("session", 42.0)].into()).unwrap();
+        let entries = status_entries(&fixture.ctx(), true, Some(Provider::Codex)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry.slug, "g");
+        assert_eq!(entries[0].entry.known()[0].percent, 42.0);
+        assert!(entries[0].polled_at.is_some());
+        assert_eq!(fixture.codex_live().as_deref(), Some("expired"));
+        assert_eq!(fixture.stash.active(Provider::Codex).as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn a_codex_login_with_a_different_account_id_is_not_the_saved_active_account() {
+        let fixture = Fixture::new("codex-identity");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        fixture.stash.set_active(Provider::Codex, "g").unwrap();
+        let unknown = codex_oauth("r-other", LATER + 1, "other@x");
+        assert!(identify(&fixture.ctx(), &[g], Provider::Codex, Some(&unknown)).is_none());
+    }
+
+    #[test]
+    fn users_sharing_a_codex_workspace_never_share_credentials() {
+        let fixture = Fixture::new("codex-shared-workspace");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        let mut other_oauth = codex_oauth("r-other", LATER, "other@x");
+        other_oauth
+            .extra
+            .insert("accountId".into(), serde_json::Value::String(g.account.uuid.clone()));
+        let other = codex_stashed("other", other_oauth);
+        fixture.stash.save("g", &g.account).unwrap();
+        fixture.stash.save("other", &other.account).unwrap();
+        let g_path = pen_for(&fixture.ctx(), &g, &Live::default()).unwrap();
+        let other_path = pen_for(&fixture.ctx(), &other, &Live::default()).unwrap();
+        let accounts = vec![g.clone(), other.clone()];
+        assert_eq!(
+            identify(&fixture.ctx(), &accounts, Provider::Codex, Some(&other.account.oauth))
+                .as_deref(),
+            Some("other")
+        );
+        let mut other = other;
+        let mut fresh = other.account.oauth.clone();
+        fresh.refresh_token = "r-other-fresh".into();
+        propagate(&fixture.ctx(), &mut other, &fresh, &Live::default()).unwrap();
+        let g_store = codex::Store::at(&g_path, Some(&g_path));
+        let other_store = codex::Store::at(&other_path, Some(&other_path));
+        assert_eq!(g_store.read().unwrap().unwrap().oauth().unwrap().refresh_token, "r-g");
+        assert_eq!(
+            other_store.read().unwrap().unwrap().oauth().unwrap().refresh_token,
+            "r-other-fresh"
+        );
+    }
+
+    #[test]
+    fn cached_status_reports_a_missing_reading_without_refreshing() {
+        let fixture = Fixture::new("cached-unread");
+        let g = codex_stashed("g", codex_oauth("expired", 1, "g@x"));
+        fixture.stash.save("g", &g.account).unwrap();
+        fixture.codex.write(&codex::AuthFile::default().with(&g.account.oauth)).unwrap();
+        let entries = status_entries(&fixture.ctx(), true, Some(Provider::Codex)).unwrap();
+        assert!(entries[0].entry.usage.as_ref().unwrap_err().contains("not polled"));
+        assert!(entries[0].polled_at.is_none());
+        assert_eq!(fixture.codex_live().as_deref(), Some("expired"));
     }
 
     #[test]
@@ -1906,7 +2232,6 @@ mod tests {
 
     // ── the gateway's desk ──────────────────────────────────────────────────
 
-    use crate::codex::Creds as _;
     use crate::serve::Accounts as _;
 
     /// Far enough off that nothing here reaches for a refresh.

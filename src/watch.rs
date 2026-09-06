@@ -28,6 +28,7 @@ pub type Snapshot = HashMap<String, Seen>;
 /// A notice: which kind, and the line to deliver.
 #[derive(Debug, PartialEq)]
 pub struct Event {
+    pub provider: Provider,
     pub kind: &'static str,
     pub text: String,
 }
@@ -35,7 +36,7 @@ pub struct Event {
 pub fn snapshot(entries: &[Entry]) -> Snapshot {
     entries
         .iter()
-        .filter(|e| e.limits.is_ok())
+        .filter(|e| e.usage.is_ok())
         .map(|e| {
             let session = limit(e, "session");
             (
@@ -57,15 +58,13 @@ pub fn diff(before: &Snapshot, entries: &[Entry], high: f64) -> Vec<Event> {
 }
 
 fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Event> {
-    // Notices go into Claude Code sessions and are about Claude accounts:
-    // the account in use they compare against is the Claude one, and a
-    // Codex row is not theirs to hear about.
-    let claude = |e: &&Entry| e.provider == Provider::Claude;
-    let active_weekly =
-        entries.iter().filter(claude).find(|e| e.active).and_then(|e| at(limit(e, "weekly_all")?));
     let mut events = Vec::new();
-    for e in entries.iter().filter(claude) {
-        if e.limits.is_err() {
+    for e in entries {
+        let active_weekly = entries
+            .iter()
+            .find(|active| active.active && active.provider == e.provider)
+            .and_then(|active| at(limit(active, "weekly_all")?));
+        if e.usage.is_err() {
             continue;
         }
         let was = before.get(&e.slug);
@@ -78,6 +77,7 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
             && was.and_then(|w| w.session_pct).is_none_or(|p| p < high)
         {
             events.push(Event {
+                provider: e.provider,
                 kind: "session-high",
                 text: format!(
                     "{} session at {:.0}%{}; weekly {}",
@@ -97,6 +97,7 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
                 _ => "",
             };
             events.push(Event {
+                provider: e.provider,
                 kind: "session-reset",
                 text: format!(
                     "{} session window reset; weekly {}{sooner}",
@@ -110,6 +111,7 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
             && came_back(w.weekly_resets_at, weekly.and_then(at), now)
         {
             events.push(Event {
+                provider: e.provider,
                 kind: "weekly-reset",
                 text: format!("{} weekly window reset", e.email),
             });
@@ -149,7 +151,7 @@ fn rotate_within<'a>(
     high: f64,
 ) -> Option<&'a Entry> {
     let active = entries.iter().find(|e| e.active && e.provider == provider)?;
-    if active.limits.is_err() || !pool.contains(&active.slug) || has_room(active, high) {
+    if active.usage.is_err() || !pool.contains(&active.slug) || has_room(active, high) {
         return None;
     }
     entries
@@ -175,7 +177,7 @@ fn rotate_within<'a>(
 const HYSTERESIS: f64 = 15.0;
 
 fn has_room(e: &Entry, high: f64) -> bool {
-    e.limits.is_ok()
+    e.usage.is_ok()
         && limit(e, "session").is_none_or(|s| s.percent < high)
         && limit(e, "weekly_all").is_none_or(|w| !w.exhausted())
 }
@@ -230,29 +232,29 @@ mod tests {
             email: format!("{slug}@x"),
             plan: "max".into(),
             active,
-            limits: Ok(vec![lim("session", session.0, session.1), lim("weekly_all", 10.0, weekly)]),
+            usage: Ok(
+                vec![lim("session", session.0, session.1), lim("weekly_all", 10.0, weekly)].into()
+            ),
         }
     }
 
     fn codex_entry(slug: &str, active: bool, weekly: f64) -> Entry {
         let mut entry = entry(slug, active, (0.0, None), None);
         entry.provider = Provider::Codex;
-        entry.limits = Ok(vec![Limit {
+        entry.usage = Ok(vec![Limit {
             kind: "weekly_all".into(),
             percent: weekly,
             severity: None,
             resets_at: None,
             scope: None,
-        }]);
+        }]
+        .into());
         entry
     }
 
-    /// Notices go into Claude Code sessions, about Claude accounts; a Codex
-    /// row running high is not theirs to hear, and the weekly a reset is
-    /// compared against is the active Claude account's, whichever row sorts
-    /// first.
+    /// Both providers produce events; delivery uses the provider on each event.
     #[test]
-    fn notices_are_about_claude_rows_only() {
+    fn notices_name_the_provider_they_belong_to() {
         let before: Snapshot = [
             (
                 "a".to_string(),
@@ -266,17 +268,20 @@ mod tests {
         .into_iter()
         .collect();
         let mut gpt = codex_entry("gpt", true, 95.0);
-        gpt.limits = Ok(vec![Limit {
+        gpt.usage = Ok(vec![Limit {
             kind: "session".into(),
             percent: 95.0,
             severity: None,
             resets_at: None,
             scope: None,
-        }]);
+        }]
+        .into());
         let now = entry("a", true, (95.0, None), None);
         let events = diff_at(&before, &[gpt, now], 90.0, 0);
-        assert_eq!(events.len(), 1);
-        assert!(events[0].text.contains("a@x"), "{}", events[0].text);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].provider, Provider::Codex);
+        assert_eq!(events[1].provider, Provider::Claude);
+        assert!(events[1].text.contains("a@x"), "{}", events[1].text);
     }
 
     /// Each provider rotates among its own rows: a spent Claude account
@@ -396,7 +401,7 @@ mod tests {
     #[test]
     fn an_active_account_whose_probe_failed_is_not_mistaken_for_an_empty_one() {
         let mut a = entry("a", true, (0.0, None), Some(W1));
-        a.limits = Err("429".into());
+        a.usage = Err("429".into());
         let e = [a, entry("b", false, (0.0, None), Some(W0))];
         assert!(rotate(&e, &pool(&["a", "b"]), 90.0).is_none());
     }

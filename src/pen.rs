@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::fsx::write_atomic;
+use crate::model::Provider;
 
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -25,6 +26,7 @@ const FILE_MODE: u32 = 0o600;
 /// Records the configuration a pen was cut from. Named for this tool because it
 /// sits in a directory Claude Code reads.
 const MARKER: &str = ".ccs-pen.json";
+const CODEX_MARKER: &str = ".ccs-codex-pen.json";
 
 /// Claude Code's global configuration file, which it resolves beside the home
 /// directory normally and inside `CLAUDE_CONFIG_DIR` when that is set.
@@ -83,9 +85,59 @@ pub fn prepare(home: &Home, root: &Path, slug: &str) -> Result<PathBuf> {
     Ok(pen)
 }
 
-/// Take a pen away, along with the credentials it holds.
+/// Codex pins share configuration; runtime files are never mirrored.
+/// SQLite files and their journals must
+/// stay together; mirroring a changing home entry by entry cannot ensure that.
+#[derive(Serialize, Deserialize)]
+struct CodexOrigin {
+    home: PathBuf,
+}
+
+pub fn codex_home_of(config: &Path) -> Result<Option<PathBuf>> {
+    let path = config.join(CODEX_MARKER);
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let origin: CodexOrigin =
+        serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(origin.home))
+}
+
+pub fn prepare_codex(home: &Path, root: &Path, slug: &str) -> Result<PathBuf> {
+    let source = codex_home_of(home)?.unwrap_or_else(|| home.to_path_buf());
+    fs::create_dir_all(&source)?;
+    let source = fs::canonicalize(source)?;
+    let pen = at(root, slug);
+    fs::create_dir_all(&pen)?;
+    fs::set_permissions(&pen, Permissions::from_mode(DIR_MODE))?;
+    let origin = CodexOrigin { home: source.clone() };
+    write_atomic(&pen.join(CODEX_MARKER), &serde_json::to_vec_pretty(&origin)?, FILE_MODE)?;
+    prune(&pen);
+    for entry in fs::read_dir(&source)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let shared_configuration = matches!(
+            name,
+            "config.toml" | "AGENTS.md" | "skills" | "plugins" | "rules" | "prompts"
+        ) || name.ends_with(".config.toml");
+        if shared_configuration {
+            link(&path, &pen.join(name))?;
+        }
+    }
+    Ok(pen)
+}
+
+/// Remove credentials. Codex pins retain their private conversation history.
 pub fn discard(root: &Path, slug: &str) -> Result<()> {
     let pen = at(root, slug);
+    if codex_home_of(&pen)?.is_some() {
+        return match fs::remove_file(pen.join("auth.json")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result.with_context(|| format!("removing {}'s credentials", pen.display())),
+        };
+    }
     match pen.exists() {
         true => fs::remove_dir_all(&pen).with_context(|| format!("removing {}", pen.display())),
         false => Ok(()),
@@ -99,10 +151,29 @@ pub fn discard(root: &Path, slug: &str) -> Result<()> {
 /// status all belong to the session.
 ///
 /// Only ever returns on failure to launch.
-pub fn launch(pen: &Path, binary: &str, args: &[String]) -> Result<()> {
-    let error = Command::new(binary).args(args).env("CLAUDE_CONFIG_DIR", pen).exec();
+pub fn launch(pen: &Path, provider: Provider, binary: &str, args: &[String]) -> Result<()> {
+    let error = launch_command(pen, provider, binary, args).exec();
+    let override_env = match provider {
+        Provider::Claude => "CCS_CLAUDE_BINARY",
+        Provider::Codex => "CCS_CODEX_BINARY",
+    };
     Err(error)
-        .with_context(|| format!("running `{binary}`; set CCS_CLAUDE_BINARY if it is not on PATH"))
+        .with_context(|| format!("running `{binary}`; set {override_env} if it is not on PATH"))
+}
+
+fn launch_command(pen: &Path, provider: Provider, binary: &str, args: &[String]) -> Command {
+    let mut command = Command::new(binary);
+    match provider {
+        Provider::Claude => {
+            command.env("CLAUDE_CONFIG_DIR", pen);
+        }
+        Provider::Codex => {
+            command.env("CODEX_HOME", pen);
+            command.args(["-c", "cli_auth_credentials_store=\"file\""]);
+        }
+    }
+    command.args(args);
+    command
 }
 
 /// Point every name in the real configuration at itself from inside the pen.
@@ -196,6 +267,73 @@ mod tests {
 
     fn links_to(pen: &Path, name: &str) -> Option<PathBuf> {
         fs::read_link(pen.join(name)).ok()
+    }
+
+    #[test]
+    fn a_codex_pin_shares_configuration_and_keeps_runtime_state_private() {
+        let fixture = Fixture::new("codex-mirror");
+        let home = fixture.root.join("codex");
+        fs::create_dir_all(home.join("skills")).unwrap();
+        for name in [
+            "config.toml",
+            "AGENTS.md",
+            "work.config.toml",
+            "auth.json",
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "history.jsonl",
+        ] {
+            fs::write(home.join(name), "source").unwrap();
+        }
+        let pen = prepare_codex(&home, &fixture.root, "codex-work").unwrap();
+        for name in ["config.toml", "AGENTS.md", "skills", "work.config.toml"] {
+            assert_eq!(links_to(&pen, name), Some(home.join(name)));
+        }
+        for name in ["auth.json", "state_5.sqlite", "state_5.sqlite-wal", "history.jsonl"] {
+            assert!(!pen.join(name).exists(), "{name}");
+        }
+        fs::write(home.join("config.toml"), "updated").unwrap();
+        assert_eq!(fs::read_to_string(pen.join("config.toml")).unwrap(), "updated");
+        let second = prepare_codex(&pen, &fixture.root, "codex-other").unwrap();
+        assert_eq!(codex_home_of(&second).unwrap(), Some(home));
+        assert_eq!(fs::metadata(pen).unwrap().permissions().mode() & 0o777, DIR_MODE);
+    }
+
+    #[test]
+    fn forgetting_a_codex_pin_removes_credentials_and_preserves_conversations() {
+        let fixture = Fixture::new("codex-discard");
+        let home = fixture.root.join("codex");
+        let pen = prepare_codex(&home, &fixture.root, "codex-work").unwrap();
+        fs::write(pen.join("auth.json"), "credentials").unwrap();
+        fs::write(pen.join("history.jsonl"), "conversation").unwrap();
+        discard(&fixture.root, "codex-work").unwrap();
+        assert!(!pen.join("auth.json").exists());
+        assert_eq!(fs::read_to_string(pen.join("history.jsonl")).unwrap(), "conversation");
+        discard(&fixture.root, "codex-work").unwrap();
+    }
+
+    #[test]
+    fn a_broken_codex_marker_never_turns_history_into_a_disposable_claude_pen() {
+        let fixture = Fixture::new("codex-broken-marker");
+        let pen = prepare_codex(&fixture.root.join("codex"), &fixture.root, "codex-work").unwrap();
+        fs::write(pen.join(CODEX_MARKER), "broken").unwrap();
+        fs::write(pen.join("history.jsonl"), "conversation").unwrap();
+        assert!(discard(&fixture.root, "codex-work").is_err());
+        assert_eq!(fs::read_to_string(pen.join("history.jsonl")).unwrap(), "conversation");
+    }
+
+    #[test]
+    fn a_codex_launch_selects_its_home_and_file_credentials_and_forwards_args() {
+        let args = vec!["resume".into(), "--last".into()];
+        let command = launch_command(Path::new("/pin"), Provider::Codex, "codex", &args);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-c", "cli_auth_credentials_store=\"file\"", "resume", "--last"]
+        );
+        assert!(command.get_envs().any(
+            |(name, value)| name == "CODEX_HOME" && value == Some(std::ffi::OsStr::new("/pin"))
+        ));
+        assert!(!command.get_envs().any(|(name, _)| name == "CLAUDE_CONFIG_DIR"));
     }
 
     #[test]

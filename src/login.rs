@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 
 use crate::creds::{self, Backend};
-use crate::model::Oauth;
+use crate::model::{Oauth, Provider};
 
 /// Prefix marking a throwaway login directory, so one left behind by an
 /// interrupted run can be recognised later and swept.
@@ -27,6 +27,19 @@ pub struct Options {
     pub email: Option<String>,
     pub console: bool,
     pub sso: bool,
+}
+
+impl Options {
+    pub fn validate(&self, provider: Provider) -> Result<()> {
+        let claude_options = self.email.is_some() || self.console || self.sso;
+        let incompatible = provider == Provider::Codex && claude_options;
+        if incompatible {
+            bail!(
+                "--email, --console and --sso steer Claude's login page; choose Claude Code or omit them for Codex"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// A throwaway config directory, destroyed on drop.

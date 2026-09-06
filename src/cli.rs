@@ -5,28 +5,28 @@ use anyhow::{Result, bail};
 use crate::model::Provider;
 
 pub const HELP: &str = "\
-ccs - Claude Code account switcher
+ccs - Claude Code and Codex account switcher
 
 USAGE
     ccs                      pick an account interactively
     ccs ls                   every stashed account and what it has left
-    ccs use <account>        switch to an account; running sessions follow
+    ccs use <account>        switch that provider's login to an account
     ccs pin [<account>]      start a session confined to one account, leaving
                              every other session on the account in use
-    ccs add                  log in to another account and stash it, without
-                             disturbing the account in use
-    ccs add --current        stash the account that is logged in right now
-    ccs add --codex          the same two, for a Codex (ChatGPT) account: log
-                             in to another, or stash the one `codex` is using
+    ccs add                  choose Claude Code or Codex, then log in and stash
+                             another account without disturbing the one in use
+    ccs add --current        choose a provider and stash its current login
     ccs rm <account>         forget a stashed account
-    ccs status               limits for the account currently in use
-    ccs notify [<kind>...]   from inside a Claude Code session: have notices
+    ccs status               choose a provider (or both) and show current usage
+    ccs notify [<kind>...]   from inside Claude Code or Codex: have notices
                              delivered into that session's chat. Kinds:
                              switch, session-high, session-reset, weekly-reset;
                              all of them when none is named. `ccs notify off`
-                             stops them. A session running with permission
+                             stops them. A Claude session with permission
                              prompts bypassed adds --bypass, or it will hold
-                             every notice for review.
+                             every notice for review. Codex uses `codex queue`;
+                             choose the provider in a terminal; otherwise the
+                             calling session determines it.
     ccs watch                poll every account and raise session-high,
                              session-reset and weekly-reset notices; runs
                              until killed. With --rotate, also switch away
@@ -39,24 +39,28 @@ USAGE
                              to paste into pi. With --rotate, a request the
                              account in use is too limited to answer is sent
                              again as the next pooled account
-    ccs serve --key [codex]  print the key a client presents to the gateway,
-                             for Claude or for Codex
+    ccs serve --key          choose whose gateway key to print
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
 
-    Anything after `--` is passed on to Claude Code: `ccs pin -- --continue`.
+    Provider menus require a terminal. Scripts adding accounts must select
+    --claude or --codex. JSON/piped status shows both by default; piped
+    serve --key keeps its Claude default (or name codex/claude after --key).
+
+    Anything after `--` is passed on to the selected client: `ccs pin -- --continue`.
 
 OPTIONS
     -f, --force              switch even to an account with no headroom left
         --json               machine-readable output (ls, status)
-        --cached             what the last poll wrote down, without polling (ls);
+        --cached             what the last poll wrote down, without polling (ls, status);
                              `ccs watch` is what keeps that current
         --name <slug>        stash under this name instead of the email (add)
         --email <address>    pre-fill the login page (add)
         --console            log in with Console billing, not a subscription (add)
         --sso                force the SSO login flow (add)
-        --codex              a Codex account rather than a Claude one (add)
+        --codex              choose Codex without a menu (add, status, notify, serve --key)
+        --claude             choose Claude without a menu (same commands)
         --every <seconds>    poll interval (watch; default 300)
         --high <percent>     session percentage that counts as high (watch; default 90)
         --rotate <a>,<b>,... accounts to rotate between (watch) or fall over
@@ -83,7 +87,7 @@ pub enum Cmd {
         email: Option<String>,
         console: bool,
         sso: bool,
-        codex: bool,
+        provider: Option<Provider>,
     },
     Pin {
         target: Option<String>,
@@ -94,11 +98,14 @@ pub enum Cmd {
     },
     Status {
         json: bool,
+        cached: bool,
+        provider: Option<Provider>,
     },
     Notify {
         off: bool,
         kinds: Vec<String>,
         bypass: bool,
+        provider: Option<Provider>,
     },
     Watch {
         every: u64,
@@ -110,10 +117,19 @@ pub enum Cmd {
         rotate: Vec<String>,
     },
     ServeKey {
-        provider: Provider,
+        provider: Option<Provider>,
     },
     Help,
     Version,
+}
+
+fn selected_provider(args: &[String]) -> Result<Option<Provider>> {
+    match (has(args, "--claude"), has(args, "--codex")) {
+        (true, true) => bail!("choose one provider: --claude or --codex"),
+        (true, false) => Ok(Some(Provider::Claude)),
+        (false, true) => Ok(Some(Provider::Codex)),
+        (false, false) => Ok(None),
+    }
 }
 
 pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
@@ -126,7 +142,11 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "ls" | "list" => {
             Ok(Cmd::List { json: has(&args[1..], "--json"), cached: has(&args[1..], "--cached") })
         }
-        "status" | "st" => Ok(Cmd::Status { json: has(&args[1..], "--json") }),
+        "status" | "st" => Ok(Cmd::Status {
+            json: has(&args[1..], "--json"),
+            cached: has(&args[1..], "--cached"),
+            provider: selected_provider(&args[1..])?,
+        }),
         "notify" => {
             let rest = &args[1..];
             Ok(Cmd::Notify {
@@ -137,6 +157,7 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
                     .cloned()
                     .collect(),
                 bypass: has(rest, "--bypass"),
+                provider: selected_provider(rest)?,
             })
         }
         "watch" => {
@@ -158,12 +179,18 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "serve" | "gateway" => {
             let rest = &args[1..];
             if has(rest, "--key") {
-                let provider = match value(rest, "--key") {
+                let named = match value(rest, "--key") {
                     Some(named) if !named.starts_with('-') => {
-                        named.parse().map_err(anyhow::Error::msg)?
+                        Some(named.parse().map_err(anyhow::Error::msg)?)
                     }
-                    _ => Provider::Claude,
+                    _ => None,
                 };
+                let flagged = selected_provider(rest)?;
+                let conflicting = matches!((named, flagged), (Some(a), Some(b)) if a != b);
+                if conflicting {
+                    bail!("choose one provider for --key");
+                }
+                let provider = named.or(flagged);
                 return Ok(Cmd::ServeKey { provider });
             }
             let port = match value(rest, "--port") {
@@ -184,7 +211,8 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         }
         "add" | "capture" => {
             let rest = &args[1..];
-            if has(rest, "--codex") {
+            let provider = selected_provider(rest)?;
+            if provider == Some(Provider::Codex) {
                 for flag in ["--email", "--console", "--sso"] {
                     if has(rest, flag) {
                         bail!("{flag} steers Claude's login page; a Codex login has none");
@@ -197,7 +225,7 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
                 email: value(rest, "--email"),
                 console: has(rest, "--console"),
                 sso: has(rest, "--sso"),
-                codex: has(rest, "--codex"),
+                provider,
             })
         }
         "pin" | "confine" => {
@@ -276,6 +304,32 @@ mod tests {
     }
 
     #[test]
+    fn status_selects_a_provider_and_can_read_without_polling() {
+        assert!(matches!(
+            parsed(&["status", "--codex", "--cached", "--json"]),
+            Cmd::Status { json: true, cached: true, provider: Some(Provider::Codex) }
+        ));
+        assert!(matches!(parsed(&["status"]), Cmd::Status { cached: false, provider: None, .. }));
+        assert!(parse(["status", "--claude", "--codex"].map(String::from).into_iter()).is_err());
+    }
+
+    #[test]
+    fn notify_can_select_codex_without_treating_the_flag_as_a_kind() {
+        let Cmd::Notify { off, kinds, provider, .. } =
+            parsed(&["notify", "--codex", "session-high"])
+        else {
+            panic!("notify")
+        };
+        assert!(!off);
+        assert_eq!(kinds, ["session-high"]);
+        assert_eq!(provider, Some(Provider::Codex));
+        assert!(matches!(
+            parsed(&["notify", "off", "--codex"]),
+            Cmd::Notify { off: true, provider: Some(Provider::Codex), .. }
+        ));
+    }
+
+    #[test]
     fn no_arguments_opens_the_picker() {
         assert!(matches!(parsed(&[]), Cmd::Pick));
     }
@@ -334,8 +388,26 @@ mod tests {
         assert!(parse(words.into_iter()).is_err());
         assert!(matches!(
             parsed(&["add", "--codex", "--current"]),
-            Cmd::Add { codex: true, current: true, .. }
+            Cmd::Add { provider: Some(Provider::Codex), current: true, .. }
         ));
+    }
+
+    #[test]
+    fn provider_critical_commands_leave_an_omitted_provider_for_the_menu() {
+        assert!(matches!(parsed(&["add"]), Cmd::Add { provider: None, .. }));
+        assert!(matches!(
+            parsed(&["add", "--claude"]),
+            Cmd::Add { provider: Some(Provider::Claude), .. }
+        ));
+        assert!(matches!(
+            parsed(&["serve", "--key", "--codex"]),
+            Cmd::ServeKey { provider: Some(Provider::Codex) }
+        ));
+        for args in
+            [vec!["add", "--claude", "--codex"], vec!["serve", "--key", "codex", "--claude"]]
+        {
+            assert!(parse(args.into_iter().map(String::from)).is_err());
+        }
     }
 
     #[test]
@@ -428,13 +500,10 @@ mod tests {
 
     #[test]
     fn serve_key_only_prints_the_key_of_the_provider_named() {
-        assert!(matches!(
-            parsed(&["serve", "--key"]),
-            Cmd::ServeKey { provider: Provider::Claude }
-        ));
+        assert!(matches!(parsed(&["serve", "--key"]), Cmd::ServeKey { provider: None }));
         assert!(matches!(
             parsed(&["serve", "--key", "codex"]),
-            Cmd::ServeKey { provider: Provider::Codex }
+            Cmd::ServeKey { provider: Some(Provider::Codex) }
         ));
         assert!(
             parse(["serve".to_string(), "--key".to_string(), "gemini".to_string()].into_iter())

@@ -1,6 +1,6 @@
 # ccs
 
-Switch Claude Code accounts without logging out, and see what each one has left
+Switch Claude Code and Codex accounts, and see what each one has left
 before you commit to it.
 
 ![the ccs picker](docs/picker.svg)
@@ -13,22 +13,22 @@ moving to has any room left either. An hour later you do the whole thing again i
 reverse.
 
 `ccs` keeps every account logged in at once, shows you where each one stands, and
-moves between them in place. Sessions that are already running follow along on
-their next request. Nothing restarts, and nothing gets signed out.
+moves between them in place. Claude Code sessions that are already running follow
+along on their next request. Nothing restarts, and nothing gets signed out.
 
 ## What it is actually good at
 
-**Seeing before switching.** The table above is the whole point. The five-hour
-session window, the all-models weekly window, and any weekly window scoped to a
-single model — Fable, today — for every account at once: how much is gone, and
-how long until it comes back. You pick the account with room instead of
-discovering there wasn't any two prompts later.
+**Seeing before switching.** Claude Code and Codex have separate sections with
+columns suited to their usage limits. Claude shows its session, weekly and
+model-specific windows. Codex shows its shared quota and every additional pool
+the API reports, with all available windows and reset countdowns. You can see
+which account has room before switching.
 
 **Never logging in again.** Each account is stashed with its own credentials.
 Switching installs one of them over the live file; it never signs the other one
 out. Going back is another switch, not another login.
 
-**Live sessions.** A switch reaches sessions that are already running, mid-task,
+**Live sessions.** A Claude Code switch reaches sessions already running, mid-task,
 without a restart. That is the difference between "I'll switch accounts" being a
 two-second decision and being a five-minute interruption.
 
@@ -59,7 +59,7 @@ account you have stashed and never logs in itself; `ccs use`, the picker and
 its own, a request the account in use is too limited to answer is quietly sent
 again as the next pooled account. See below.
 
-**Codex accounts too.** `ccs add --codex` stashes a ChatGPT login for Codex
+**Codex accounts too.** Choose Codex in `ccs add` to stash a ChatGPT login for Codex
 CLI the same way, and the table, picker, watcher, menu bar app and gateway
 take it from there: what each Codex account has left, a click to switch
 `~/.codex/auth.json`, rotation among Codex accounts, and pi or Aside's
@@ -94,17 +94,19 @@ sudo make install PREFIX=/usr/local
 Start with the one you are already signed in as, then log in to the others:
 
 ```sh
-ccs add --current    # stash whoever is logged in right now
-ccs add              # log in to another account
+ccs add --current    # choose Claude Code or Codex, then stash its current login
+ccs add              # choose a provider, then log in to another account
 ccs add              # ...and another
 ```
 
-`ccs add` runs `claude auth login` against a throwaway config directory, keeps the
-credentials it mints, and destroys the directory. The account you are currently
+`ccs add` first opens a provider menu. Arrows or `j`/`k` select Claude Code or
+Codex; Enter continues and Esc or `q` cancels. It then runs `claude auth login`
+or `codex login` against a throwaway config directory, keeps the credentials it
+mints, and destroys the directory. The account you are currently
 using is never touched — no logout, no re-login, and sessions running against it
 carry on straight through the login you are doing in the next window.
 
-Steer the login page with `--email <address>`, `--console` (Console billing rather
+Steer Claude's login page with `--email <address>`, `--console` (Console billing rather
 than a subscription), or `--sso`. Stash under a name of your choosing with
 `--name <slug>`; otherwise the slug comes from the email.
 
@@ -114,52 +116,146 @@ directly.
 ## Codex accounts
 
 ```sh
-ccs add --current --codex   # stash the account `codex` is logged in as
-ccs add --codex             # log in to another, in a throwaway CODEX_HOME
+ccs add --current   # choose Codex to stash its current login
+ccs add             # choose Codex to log in to another account
 ```
 
-A Codex account sits in the same table with `codex` in front of its plan.
-`ccs use` installs it into `~/.codex/auth.json` (or `$CODEX_HOME`'s), which
-Codex CLI reloads on its own, so running sessions follow. Claude Code's slot
-is untouched, and the other way round: `ccs ls` marks one account in use per
-provider, and `ccs status` reports both when both are logged in.
+Codex accounts have their own section in the picker and `ccs ls`.
+`ccs use` installs the selected account into `~/.codex/auth.json` (or `$CODEX_HOME`'s).
+Use Codex's `/status` to check an existing session after switching; if it still
+shows the previous login, resume the session. Claude Code's slot is untouched,
+and the other way round: `ccs ls` marks one account in use per provider, and
+`ccs status` offers Claude Code, Codex, or both. Commands naming an account,
+such as `use`, `pin` and `rm`, take their provider from that account.
 
-The limits come from the same endpoint Codex's own `/status` reads: the
-five-hour and weekly windows under `session` and `weekly`, and a model with a
-limit of its own — Spark, today — under its name. A Pro account reports a
-single weekly window; that is the endpoint's doing.
+This integration reads Codex's file credentials. If your Codex uses an OS
+credential store, select `cli_auth_credentials_store = "file"` in its config
+and log in there before choosing Codex in `ccs add --current`. See
+[Codex authentication](https://developers.openai.com/codex/auth/).
+`ccs pin` selects file credentials for its Codex launch.
 
-Pins are Claude Code sessions and stay Claude-only. So do the notices.
+Codex shows the reported shared quota windows and a model availability column
+when the backend supplies one. `Astra` appears alongside those windows, in the
+same place that model-specific limits occupy in the Claude section. Its cell
+says `available`, `unavailable`, or `back 1h30m` when a future availability time
+is reported. It adds `credits unlock` when the response says credits would
+provide access. Missing availability is `unknown`; an elapsed countdown never
+overrides the backend's availability flag.
+
+Astra's availability is distinct from a percentage-based quota. No separate
+GPT-5.6 or Astra percentage is invented. Spark is hidden from terminal tables,
+text status and switch warnings. JSON and the usage cache retain its readings,
+along with `model_usage` metadata for every reported model. Other named quota
+pools appear on continuation rows with a `POOL` column when needed. Every
+reported window is retained, including both five-hour and weekly windows when
+present; missing windows appear as absent. The backend describes quota windows
+in its [usage response schema](https://github.com/openai/codex/blob/main/codex-rs/codex-backend-openapi-models/src/models/rate_limit_status_payload.rs).
+
+Old cached Codex readings that lost a named pool's window duration appear under
+`CACHED WINDOW` until the next poll replaces them. Refresh with `r` in the picker
+or run `ccs watch` to obtain the complete readings.
+
+Codex accounts can also be pinned and can receive usage notices:
+
+```sh
+ccs pin codex-work                    # launch Codex on this stashed account
+ccs pin codex-work -- resume --last   # resume within that pin's history
+```
+
+The account determines which client `ccs pin` launches. A Codex pin sets
+`CODEX_HOME` to `ccs/pens/<account>/`, keeps `auth.json` private, and links
+`config.toml`, `AGENTS.md`, skills, plugins, rules, prompts and named
+`*.config.toml` profiles to the original Codex home. These are Codex's own
+settings and skills; Claude configuration is not translated. Conversation
+history, databases, locks and other runtime files use the pin by default; explicit
+paths in your Codex configuration still apply. A later
+launch with the same account reuses that home. `ccs rm` removes matching
+pinned credentials while preserving Codex conversations.
+
+Inside a Codex session, have the agent run:
+
+```sh
+ccs notify                           # detect this Codex thread and subscribe
+ccs notify session-high              # or only the high-usage notice
+ccs notify off                       # unsubscribe this thread
+ccs status --codex --cached           # last account usage reading, no API call
+ccs status --codex --cached --json    # includes polled_at for scripts
+ccs status --codex                    # refresh only Codex's reading
+```
+
+Run `ccs watch` in another terminal to poll and generate usage notices. The
+watcher sends `session-high` for the account active in its credential home,
+and `session-reset`/`weekly-reset` for that provider's accounts. Notices and
+rotation use shared windows; additional named pools are shown in usage views. Run the
+watcher with a pin's `CODEX_HOME` to track that pin's active account. Switch
+notices go only to sessions registered against the home that changed.
+
+Codex notices use `codex queue --thread … --message …`, with the thread ID
+Codex exports as `CODEX_THREAD_ID`. They are queued conversation messages,
+not a native status-line widget. Registration verifies that the installed
+CLI supports this command (verified with 0.153.4); older builds get a clear
+error and can still use cached status. Queue failures are reported and keep
+the subscription for future events. `--bypass` is only for Claude's inbox;
+Codex keeps its session permissions.
+
+In a terminal, `ccs notify` and `ccs serve --key` offer a provider menu too.
+Without a terminal, notices detect the calling client from its session
+environment; if both clients' variables are inherited, select `--codex` or
+`--claude` explicitly. Cached status uses the credentials in that home, so it
+reports the pinned account even when the global active pointer differs.
+These readings track subscription windows, not individual-turn token counts.
+
+For scripts, `--claude` and `--codex` bypass provider menus. Adding an account
+without a terminal requires one of these selectors. JSON or piped status shows
+both providers by default; piped `ccs serve --key` retains its Claude default,
+with `ccs serve --key codex` selecting Codex. `ls`, `watch` and `serve` operate
+across providers without a provider menu.
 
 ## Everyday use
 
-Run `ccs` with no arguments and you get the picker:
+Run `ccs` with no arguments and you get the picker. Accounts are grouped by
+provider, then email. The numbers shown by `ccs ls` use the same order for
+`use`, `pin` and `rm`; prefer stable slugs in scripts.
+
+For example, the Claude section:
 
 ```
+  Claude Code
      ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
 >  1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m   <- active
    2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h
    3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   ███░  70% 5d19h
 
-  session          █░░░  10%   resets in 3h 54m
-  weekly           ███░  55%   resets in 6h 24m
-  Fable            ████ 100%   resets in 6h 24m   spent
-
   up/down select   enter switch   esc unselect   r refresh   q quit      updated just now
 ```
 
-Arrows or `j`/`k` move, `home`/`end` jump to the ends, and the block under the
-table details whichever account you are sitting on. `enter` asks before it does
-anything, and says what is spent if anything is:
+The Codex section shows its quota windows and model availability:
+
+```text
+  Codex
+     ACCOUNT              PLAN       WEEKLY            ASTRA
+   4 you@example.com      codex pro  ██░░  29% 2d11h   available         <- active
+   5 you+alt@example.com  codex pro  ███░  65% 2d11h   back 1h30m
+```
+
+Additional pool names and model IDs come from the API. Pool rows belong to the
+account above them; only accounts are selectable. Switching to an account with
+an unavailable model prompts for confirmation, just as a spent quota does.
+Watcher notices and rotation continue to follow shared quota windows.
+
+Arrows or `j`/`k` move and `home`/`end` jump to the ends. The table carries the
+readings; the footer carries keys and confirmations. `ccs status` shows detailed
+readings separately. `enter` asks before it does anything and names restrictions:
 
 ```
-  you@example.com has no Fable left. Switch anyway? [y/n]
+  you@example.com on Claude Code: no Fable left. Switch anyway? [y/n]
 ```
 
 Answering yes switches, and the picker stays where it is — the active marker moves
 to the row you picked and the footer says what happened:
 
 ```
+  Claude Code
      ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
    1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m
 >  2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h   <- active
@@ -178,6 +274,7 @@ from the list it puts the selection away entirely, which leaves `enter` with
 nothing to act on:
 
 ```
+  Claude Code
      ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
    1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m   <- active
    2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h
@@ -203,7 +300,7 @@ the picker is where you switch and then keep looking. It only stops to ask when
 the account you are switching to has a limit already at 100%, and `--force` skips
 even that.
 
-## Pinning a session to one account
+## Pinning a Claude Code session to one account
 
 A switch is global — every session follows it. Sometimes that is exactly wrong:
 you want this terminal on the work account and everything else left alone. That
@@ -415,17 +512,17 @@ painted, so only the percentages are as old as the footer says.
 | --- | --- |
 | `ccs` | the picker |
 | `ccs ls` | every stashed account and what it has left |
-| `ccs use <account>` | switch; running sessions follow |
+| `ccs use <account>` | switch that provider's login |
 | `ccs pin [<account>]` | start a session confined to one account |
-| `ccs add` | log in to another account and stash it |
-| `ccs add --current` | stash whichever account is logged in right now |
-| `ccs add [--current] --codex` | the same, for a Codex (ChatGPT) account |
+| `ccs add` | choose a provider, then log in and stash another account |
+| `ccs add --current` | choose a provider and stash its current login |
 | `ccs rm <account>` | forget a stashed account |
-| `ccs status` | limits for the account in use, with reset times |
+| `ccs status` | choose a provider or both; show usage and reset times |
+| `ccs status --codex --cached` | this Codex home's last reading, without polling |
 | `ccs notify [<kind>...]` | have notices delivered into the calling session |
 | `ccs watch` | poll every account and raise notices; `--rotate` switches too |
 | `ccs serve` | serve the API on loopback as the account in use |
-| `ccs serve --key [codex]` | print the key a client presents to the gateway |
+| `ccs serve --key` | choose whose gateway key to print |
 
 `<account>` is a slug, an email, an unambiguous prefix of either, or the index from
 `ccs ls`. `ccs pin` without one opens the picker; `ccs use` without one is an
@@ -434,7 +531,10 @@ error rather than a guess.
 `-f`/`--force` switches even into an account with nothing left. `--json` on `ls`
 and `status` gives you the same data for scripts; `status` keeps the shape it
 always had, one object, with the Codex account under `codex` when both are
-logged in. A status line wants
+logged in. `status --codex` and `status --claude` read only that provider.
+`status --cached` reads the account's last reading without polling or refreshing
+tokens, includes `polled_at`, and reports a missing reading rather than zero usage.
+For all stashed accounts, a status line wants
 `ccs ls --cached --json` instead — the last readings `ccs watch` wrote down,
 with a `polled_at` on each, and no poll — because it repaints far more often
 than a poll can be afforded.
@@ -466,6 +566,8 @@ account did.
 ~/.claude/ccs/pens/<account>/   one pinned session's configuration each
 ~/.claude/ccs/usage/*.json      what each account last had left, and when
 ~/.claude/ccs/state.json        which slug is currently installed
+~/.claude/ccs/notify.json       Claude session subscriptions
+~/.claude/ccs/notify-codex.json  Codex threads, homes and notice subscriptions
 ~/.claude/ccs/gateway.key       what a client presents to `ccs serve`, mode 0600
 ~/.claude/ccs/codex.key         the same for the Codex route
 ~/.codex/auth.json              the Codex account in use, as Codex CLI reads it

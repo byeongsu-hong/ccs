@@ -280,12 +280,11 @@ open /Applications/ccs.app
 
 The menu bar shows the active account's session percentage on a gauge that
 fills as it runs high. The popover has every account with its bars and reset
-times; click one to switch, and a spent account asks first. Two switches below
-keep the daemons running for as long as the app is: **Gateway** runs
-`ccs serve` on the port you set, and **Rotate automatically** runs `ccs watch
---rotate` over the accounts you tick, with **Notifications** turning the
-watcher's `session-high`, `session-reset`, `weekly-reset` and `rotate` lines
-into macOS notifications. **Launch at login** does what it says. Quitting the
+times; click one to switch, and a spent account asks first. The app keeps `ccs watch`
+running for as long as it is, as the one thing that polls; **Rotate
+automatically** hands it a pool of the accounts you tick, and **Notifications**
+turns its `session-high`, `session-reset`, `weekly-reset` and `rotate` lines
+into macOS notifications. **Gateway** runs `ccs serve` on the port you set. **Launch at login** does what it says. Quitting the
 app stops both daemons.
 
 The app is a shell over the `ccs` on `~/.cargo/bin` (or `/usr/local/bin`,

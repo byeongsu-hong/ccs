@@ -11,10 +11,32 @@ final class NoticesTests: XCTestCase {
         XCTAssertEqual(parseNotice("12:00:01 rotate: switched to alt@x.com (alt)"), .rotated("switched to alt@x.com (alt)"))
     }
 
-    func testTheHeardSuffixIsDroppedFromANotice() {
+    /// The CLI records delivery on the same line: `; told 1 subscribed
+    /// session`, `; told 3 subscribed sessions`. That is not the news.
+    func testTheDeliveryRecordIsDroppedFromANotice() {
         XCTAssertEqual(
-            parseNotice("12:00:01 session-high: you@x.com has crossed 90%; 2 sessions told"),
+            parseNotice("12:00:01 session-high: you@x.com has crossed 90%; told 1 subscribed session"),
             .sessionHigh("you@x.com has crossed 90%"))
+        XCTAssertEqual(
+            parseNotice("12:00:01 rotate: switched to a@x.com (a); told 3 subscribed sessions"),
+            .rotated("switched to a@x.com (a)"))
+    }
+
+    /// A semicolon inside the news itself is left alone.
+    func testOnlyTheDeliveryRecordIsDropped() {
+        XCTAssertEqual(
+            parseNotice("12:00:01 session-high: you@x.com session 92%; weekly 40%, resets in 3h"),
+            .sessionHigh("you@x.com session 92%; weekly 40%, resets in 3h"))
+    }
+
+    func testOrphansAreTheRecordedChildrenStillRunningCcs() {
+        let commands: [Int32: String] = [
+            101: "/Users/you/.cargo/bin/ccs watch --rotate a,b",
+            102: "/Users/you/.cargo/bin/ccs serve --port 4141",
+            103: "/usr/bin/vim notes.txt",
+        ]
+        let found = orphans(recorded: [101, 102, 103, 104], commandOf: { commands[$0] })
+        XCTAssertEqual(found, [101, 102])
     }
 
     func testOtherLinesAreNotNotices() {

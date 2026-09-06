@@ -33,6 +33,7 @@ final class Store: ObservableObject {
             error = "ccs is not installed; `make install` in the ccs checkout puts it in ~/.cargo/bin"
         }
         askForNotifications()
+        sweepOrphans()
         schedule()
         apply()
         Task { await refresh() }
@@ -81,9 +82,17 @@ final class Store: ObservableObject {
     private func schedule() {
         timer?.invalidate()
         // Reading the cache is cheap, so this can be far more often than a poll.
-        let every = TimeInterval(max(min(preferences.refreshSeconds, 60), 15))
+        let every = TimeInterval(max(preferences.refreshSeconds, 15))
         timer = Timer.scheduledTimer(withTimeInterval: every, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in await self?.refresh() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // The watcher is where every reading comes from: one that
+                // has died is started again, at this pace rather than at once.
+                if !self.watcher.running || (self.preferences.gatewayOn && !self.gateway.running) {
+                    self.apply()
+                }
+                await self.refresh()
+            }
         }
     }
 
@@ -93,7 +102,9 @@ final class Store: ObservableObject {
     /// to them; a child whose arguments changed is restarted.
     func apply() {
         guard let ccs else { return }
-        let pool = preferences.pool
+        // The pool means something only while rotation is on; the checkboxes
+        // sit under that switch, and the gateway follows the same reading.
+        let pool = preferences.rotationOn ? preferences.pool : []
 
         let serve = serveArguments(port: preferences.gatewayPort, pool: pool)
         if preferences.gatewayOn {
@@ -108,13 +119,40 @@ final class Store: ObservableObject {
 
         // The watcher always runs: it is the poller the readings come from.
         // Rotation and notifications only change what is done with a poll.
-        let watch = watchArguments(pool: preferences.rotationOn ? pool : [])
+        let watch = watchArguments(pool: pool)
         if !watcher.running || watcherArguments != watch {
             watcher.start(binary: ccs.binary, arguments: watch) { [weak self] line in
                 self?.heard(line)
             }
             watcherArguments = watch
         }
+        preferences.children = [gateway.pid, watcher.pid].compactMap { $0 }.map(Int.init)
+    }
+
+    /// Take down children a previous run left behind: an app that crashed
+    /// never reached `shutdown`, and its watcher would go on rotating
+    /// accounts with nothing on screen to say so.
+    private func sweepOrphans() {
+        let left = orphans(recorded: preferences.children.map(Int32.init), commandOf: commandLine)
+        for pid in left {
+            kill(pid, SIGTERM)
+        }
+        preferences.children = []
+    }
+
+    /// What a process is running, or nothing when there is no such process.
+    private func commandLine(_ pid: Int32) -> String? {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-o", "command=", "-p", String(pid)]
+        let out = Pipe()
+        ps.standardOutput = out
+        ps.standardError = FileHandle.nullDevice
+        guard (try? ps.run()) != nil else { return nil }
+        let said = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        ps.waitUntilExit()
+        let line = said.trimmingCharacters(in: .whitespacesAndNewlines)
+        return line.isEmpty ? nil : line
     }
 
     private var gatewayArguments: [String]?

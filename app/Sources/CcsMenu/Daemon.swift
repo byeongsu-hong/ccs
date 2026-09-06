@@ -15,8 +15,13 @@ final class Daemon: ObservableObject {
     @Published private(set) var exitedWith: String?
 
     private var process: Process?
+    private var pipe: Pipe?
     private var buffer = Data()
     private let keep = 6
+
+    /// The child's pid while it runs, so a later launch can find it if this
+    /// one never got to stop it.
+    var pid: Int32? { process?.processIdentifier }
 
     init(name: String) {
         self.name = name
@@ -36,6 +41,12 @@ final class Daemon: ObservableObject {
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
+            // At end of file the handler is called again and again until it
+            // is taken down; leaving it up spins a core for nothing.
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
             Task { @MainActor [weak self] in
                 self?.consume(chunk, onLine: onLine)
             }
@@ -45,15 +56,23 @@ final class Daemon: ObservableObject {
                 guard let self, self.process === finished else { return }
                 self.running = false
                 self.process = nil
-                self.exitedWith = self.lines.last ?? "exited with status \(finished.terminationStatus)"
+                self.pipe = nil
+                // Merged stderr: a last line explains a failure; success has
+                // nothing to explain and the last line would be a log line.
+                let status = finished.terminationStatus
+                self.exitedWith = status == 0
+                    ? "exited"
+                    : self.lines.last ?? "exited with status \(status)"
             }
         }
         do {
             try process.run()
             self.process = process
+            self.pipe = pipe
             running = true
             exitedWith = nil
             lines = []
+            buffer = Data()
         } catch {
             exitedWith = error.localizedDescription
             running = false
@@ -63,6 +82,9 @@ final class Daemon: ObservableObject {
     func stop() {
         guard let process else { return }
         self.process = nil
+        pipe?.fileHandleForReading.readabilityHandler = nil
+        pipe = nil
+        buffer = Data()
         process.terminationHandler = nil
         process.terminate()
         running = false

@@ -52,7 +52,7 @@ percentage dimmed when the last refresh failed and the number shown is stale.
   limit the endpoint reports, with percent and "resets in". The active
   account is marked. Clicking a row runs `ccs use <slug>`; an account with
   any limit at 100% asks first, as the picker does. A refresh button and a
-  "updated N min ago" stamp; a red line with `ccs`'s own message when the
+  "polled N min ago" stamp, the newest reading's own time; a red line with `ccs`'s own message when the
   last run failed, and the install hint when the binary is missing.
 - **Gateway.** A toggle and a port field. On, the app spawns
   `ccs serve --port <port>`, adding `--rotate <pool>` when a pool is set,
@@ -82,7 +82,8 @@ a switch, and whenever the watcher prints a line (each follows a poll).
 
 Settings live in `UserDefaults`: `gateway.on`, `gateway.port` (4141),
 `rotation.on`, `rotation.pool` (slugs), `notifications.on`,
-`refresh.seconds` (300).
+`refresh.seconds` (30, the cache re-read; never under 15), and
+`children.pids`, the daemons the last run started.
 
 ## Finding `ccs`
 
@@ -93,9 +94,15 @@ inherit a shell's `PATH`, so nothing here searches it.
 ## Errors
 
 A failed `ccs ls` leaves the last reading up and says so; a failed switch
-shows the message inline and re-reads. A child that exits on its own flips its
-toggle off and keeps its last log line visible, so a port already in use or a
-missing pool account is seen rather than silently retried.
+shows the message inline and re-reads. A child that exits on its own keeps
+its toggle as it was and shows why it died under it — its last line when the
+exit status was not zero — so a port already in use or a missing pool account
+is seen. The next timer tick starts it again, since the watcher is where
+every reading comes from; a child that keeps dying is therefore retried every
+half minute with its reason on screen, never in a tight loop. An app that
+crashed never reaches its shutdown, so the pids of its children are recorded,
+and the next launch takes down any of them still running `ccs watch` or
+`ccs serve` before starting its own.
 
 ## Testing
 

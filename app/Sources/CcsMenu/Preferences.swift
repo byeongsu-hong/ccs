@@ -12,6 +12,9 @@ final class Preferences: ObservableObject {
     @Published var pool: [String] { didSet { defaults.set(pool, forKey: "rotation.pool") } }
     @Published var notificationsOn: Bool { didSet { defaults.set(notificationsOn, forKey: "notifications.on") } }
     @Published var refreshSeconds: Int { didSet { defaults.set(refreshSeconds, forKey: "refresh.seconds") } }
+    /// The children the last run started, for the next run to find if this
+    /// one never got to stop them.
+    @Published var children: [Int] { didSet { defaults.set(children, forKey: "children.pids") } }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -20,7 +23,8 @@ final class Preferences: ObservableObject {
         rotationOn = defaults.bool(forKey: "rotation.on")
         pool = defaults.stringArray(forKey: "rotation.pool") ?? []
         notificationsOn = defaults.object(forKey: "notifications.on") as? Bool ?? true
-        refreshSeconds = defaults.object(forKey: "refresh.seconds") as? Int ?? 300
+        refreshSeconds = defaults.object(forKey: "refresh.seconds") as? Int ?? 30
+        children = defaults.array(forKey: "children.pids") as? [Int] ?? []
     }
 
     func toggle(_ slug: String, inPool on: Bool) {

@@ -16,7 +16,7 @@ enum Health: Equatable {
     case ok, warn, spent
 }
 
-struct Limit: Decodable, Equatable {
+struct Limit: Decodable, Equatable, Identifiable {
     var kind: String
     var percent: Double
     var severity: String?
@@ -68,6 +68,9 @@ struct Limit: Decodable, Equatable {
     }
 
     var spent: Bool { percent >= spentPercent }
+
+    /// Two limits scoped to one model share a column; the kind tells them apart.
+    var id: String { "\(kind)/\(column)" }
 
     /// The API's own severity is authoritative below the cap; the percentage
     /// stands in where it is absent.
@@ -125,15 +128,18 @@ private func parseInstant(_ text: String) -> Date? {
     return ISO8601DateFormatter().date(from: trimmed)
 }
 
-/// How long until `date`, the way the CLI prints it: the two largest units
-/// that are not zero, and `now` once it has passed.
+/// How long until `date`, the way the CLI prints it: seconds under a minute,
+/// minutes under an hour, `3h04m` under a day, `2d11h` beyond, and `now`
+/// once it has passed.
 func until(_ date: Date, now: Date = Date()) -> String {
     let seconds = Int(date.timeIntervalSince(now))
     if seconds <= 0 { return "now" }
-    let days = seconds / 86400
-    let hours = seconds % 86400 / 3600
+    let hours = seconds / 3600
     let minutes = seconds % 3600 / 60
-    if days > 0 { return "\(days)d\(hours)h" }
-    if hours > 0 { return "\(hours)h\(minutes)m" }
-    return "\(minutes)m"
+    switch (hours, minutes) {
+    case (0, 0): return "\(seconds)s"
+    case (0, let m): return "\(m)m"
+    case (let h, let m) where h < 24: return String(format: "%dh%02dm", h, m)
+    case (let h, _): return "\(h / 24)d\(h % 24)h"
+    }
 }

@@ -39,8 +39,8 @@ func parseNotice(_ line: String) -> Notice? {
     guard let colon = rest.firstIndex(of: ":") else { return nil }
     let kind = rest[..<colon]
     var text = rest[rest.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-    // "; N sessions told" is the CLI's own record of delivery, not the news.
-    if let heard = text.range(of: "; ", options: .backwards), text[heard.upperBound...].hasSuffix("told") {
+    // "; told N subscribed sessions" is the CLI's record of delivery, not the news.
+    if let heard = text.range(of: "; told ", options: .backwards) {
         text = String(text[..<heard.lowerBound])
     }
     switch kind {
@@ -65,4 +65,18 @@ func watchArguments(pool: [String]) -> [String] {
 
 private func rotate(_ pool: [String]) -> [String] {
     pool.isEmpty ? [] : ["--rotate", pool.joined(separator: ",")]
+}
+
+/// Which of the children a previous run recorded are still running `ccs`.
+/// An app that crashed leaves its watcher rotating accounts with no window
+/// to say so; the next launch takes it down before starting its own.
+/// `commandOf` is the command line a pid is running now, or nothing when
+/// the pid is gone.
+func orphans(recorded: [Int32], commandOf: (Int32) -> String?) -> [Int32] {
+    recorded.filter { pid in
+        guard let command = commandOf(pid) else { return false }
+        let words = command.split(separator: " ").map(String.init)
+        guard let first = words.first, first == "ccs" || first.hasSuffix("/ccs") else { return false }
+        return words.dropFirst().first.map { $0 == "watch" || $0 == "serve" } ?? false
+    }
 }

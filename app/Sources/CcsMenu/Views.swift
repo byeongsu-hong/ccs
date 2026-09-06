@@ -8,6 +8,7 @@ struct PopoverView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var preferences: Preferences
     @State private var confirming: Account?
+    @State private var loginError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -74,6 +75,10 @@ struct PopoverView: View {
     private var footer: some View {
         HStack {
             Toggle("Launch at login", isOn: launchAtLogin).toggleStyle(.checkbox).font(.caption)
+                .help(loginError ?? "Registers the app in /Applications with Launch Services")
+            if let loginError {
+                Text(loginError).font(.caption2).foregroundStyle(.red).lineLimit(1)
+            }
             Spacer()
             if let polledAt = store.polledAt {
                 Text("polled \(polledAt, style: .relative) ago").font(.caption).foregroundStyle(.secondary)
@@ -89,8 +94,10 @@ struct PopoverView: View {
             set: { on in
                 do {
                     if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                    loginError = nil
                 } catch {
-                    // Registering needs a bundle in a fixed place; outside one it cannot work.
+                    // Registering needs a bundle in a fixed place; said, not swallowed.
+                    loginError = error.localizedDescription
                 }
             })
     }
@@ -109,7 +116,7 @@ struct AccountRow: View {
                 Spacer()
             }
             HStack(spacing: 8) {
-                ForEach(account.limits, id: \.column) { limit in
+                ForEach(account.limits) { limit in
                     BarView(limit: limit)
                 }
             }
@@ -170,7 +177,10 @@ struct GatewaySection: View {
                 Text("port").font(.caption).foregroundStyle(.secondary)
                 TextField("4141", value: $preferences.gatewayPort, format: .number.grouping(.never))
                     .textFieldStyle(.roundedBorder).frame(width: 64).font(.caption)
-                    .onSubmit { store.apply() }
+                    .onSubmit {
+                        if !(1...65535).contains(preferences.gatewayPort) { preferences.gatewayPort = 4141 }
+                        store.apply()
+                    }
             }
             Text("Serves the Anthropic API on 127.0.0.1 as the account in use, for pi and Aside.")
                 .font(.caption2).foregroundStyle(.secondary)

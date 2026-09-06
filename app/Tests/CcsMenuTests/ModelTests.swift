@@ -78,9 +78,21 @@ final class ModelTests: XCTestCase {
     func testUntilReadsLikeTheCli() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         XCTAssertEqual(until(now.addingTimeInterval(3 * 3600 + 54 * 60 + 20), now: now), "3h54m")
+        XCTAssertEqual(until(now.addingTimeInterval(3 * 3600 + 4 * 60), now: now), "3h04m")
         XCTAssertEqual(until(now.addingTimeInterval(2 * 86400 + 11 * 3600), now: now), "2d11h")
         XCTAssertEqual(until(now.addingTimeInterval(7 * 60), now: now), "7m")
+        XCTAssertEqual(until(now.addingTimeInterval(45), now: now), "45s")
         XCTAssertEqual(until(now.addingTimeInterval(-5), now: now), "now")
+    }
+
+    /// Two limits scoped to one model would share a column name; a row needs
+    /// an identity of its own for each.
+    func testEachLimitHasAnIdentityOfItsOwnEvenUnderOneColumn() {
+        let scope = Limit.Scope(model: .init(displayName: "Fable"))
+        let weekly = Limit(kind: "weekly_scoped", percent: 1, severity: nil, resetsAt: nil, scope: scope)
+        let monthly = Limit(kind: "monthly_scoped", percent: 1, severity: nil, resetsAt: nil, scope: scope)
+        XCTAssertEqual(weekly.column, monthly.column)
+        XCTAssertNotEqual(weekly.id, monthly.id)
     }
 
     private func limit(kind: String = "session", percent: Double = 0, severity: String? = nil) -> Limit {

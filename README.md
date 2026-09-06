@@ -246,7 +246,11 @@ It prints the fragment to paste into pi's `~/.pi/agent/models.json`:
 
 That is the whole of it. Overriding only `baseUrl` on the built-in provider keeps
 every Claude model pi already knows about, and the key is fetched by running the
-command, so nothing secret sits in the file. Each request goes out as the account
+command, so nothing secret sits in the file. A client launched from the desktop
+rather than a shell may not have `~/.cargo/bin` on its `PATH`; spell the command
+out as `!/Users/you/.cargo/bin/ccs serve --key` if the model shows as
+unavailable. [Aside](https://aside.com) reads the same file at
+`~/.aside/u/0/models.json`, and needs exactly that. Each request goes out as the account
 in use, with its access token refreshed on the way when it has expired, and the
 answer is streamed back as it arrives.
 

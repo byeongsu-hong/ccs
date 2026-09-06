@@ -38,8 +38,12 @@ struct Ccs {
         ccsCandidates().first { FileManager.default.isExecutableFile(atPath: $0.path) }.map(Ccs.init)
     }
 
+    /// What the last poll wrote down, without polling. Asking the network
+    /// here would spend the limits being shown, on every repaint; keeping
+    /// the readings current is the watcher's job, and it runs for as long
+    /// as the app does.
     func list() async throws -> [Account] {
-        let out = try await run(["ls", "--json"])
+        let out = try await run(["ls", "--cached", "--json"])
         return try decodeAccounts(Data(out.utf8))
     }
 

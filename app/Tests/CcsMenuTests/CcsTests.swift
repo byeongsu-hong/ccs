@@ -28,7 +28,7 @@ final class CcsTests: XCTestCase {
         let script = dir.appendingPathComponent("ccs")
         let body = """
         #!/bin/sh
-        if [ "$1" = "ls" ]; then
+        if [ "$1" = "ls" ] && [ "$2" = "--cached" ]; then
           printf '%s' '[{"slug":"a","email":"a@x","plan":"pro","active":true,"limits":[]}]'
           exit 0
         fi
@@ -44,10 +44,21 @@ final class CcsTests: XCTestCase {
         return script
     }
 
-    func testListingDecodesWhatTheBinaryPrints() async throws {
+    /// The app reads what the last poll wrote down rather than polling: a
+    /// listing that went to the network would spend the very limits it shows.
+    func testListingReadsTheCacheRatherThanPolling() async throws {
         let ccs = Ccs(binary: try fakeCcs())
         let accounts = try await ccs.list()
         XCTAssertEqual(accounts.map(\.slug), ["a"])
+    }
+
+    func testAnUncachedListingIsWhatTheBinaryRefuses() async throws {
+        let ccs = Ccs(binary: try fakeCcs())
+        _ = try await ccs.list()  // cached: fine
+        do {
+            _ = try await ccs.run(["ls", "--json"])
+            XCTFail("the fake only answers a cached listing")
+        } catch is CcsError {}
     }
 
     func testSwitchingHandsBackWhatTheBinarySaid() async throws {

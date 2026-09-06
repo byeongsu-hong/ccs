@@ -1,6 +1,10 @@
 // The app's one source of state: the last reading, the daemons, and the
-// settings that decide which daemons run. Everything the popover shows and
-// everything it can do goes through here.
+// preferences that decide how the daemons run. Everything the popover shows
+// and everything it can do goes through here.
+//
+// The readings are what `ccs watch` last wrote down, read back cheaply and
+// often; the watcher is the one thing that polls, at its own interval, so
+// the app never spends the limits it displays.
 
 import Foundation
 import UserNotifications
@@ -71,9 +75,13 @@ final class Store: ObservableObject {
         await refresh()
     }
 
+    /// When the newest reading on show was taken.
+    var polledAt: Date? { accounts.compactMap(\.polledAt).max() }
+
     private func schedule() {
         timer?.invalidate()
-        let every = TimeInterval(max(preferences.refreshSeconds, 30))
+        // Reading the cache is cheap, so this can be far more often than a poll.
+        let every = TimeInterval(max(min(preferences.refreshSeconds, 60), 15))
         timer = Timer.scheduledTimer(withTimeInterval: every, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in await self?.refresh() }
         }
@@ -98,19 +106,14 @@ final class Store: ObservableObject {
             gatewayArguments = nil
         }
 
-        // The watcher runs for rotation, or for the notices alone.
-        let wantWatcher = preferences.rotationOn || preferences.notificationsOn
+        // The watcher always runs: it is the poller the readings come from.
+        // Rotation and notifications only change what is done with a poll.
         let watch = watchArguments(pool: preferences.rotationOn ? pool : [])
-        if wantWatcher {
-            if !watcher.running || watcherArguments != watch {
-                watcher.start(binary: ccs.binary, arguments: watch) { [weak self] line in
-                    self?.heard(line)
-                }
-                watcherArguments = watch
+        if !watcher.running || watcherArguments != watch {
+            watcher.start(binary: ccs.binary, arguments: watch) { [weak self] line in
+                self?.heard(line)
             }
-        } else {
-            watcher.stop()
-            watcherArguments = nil
+            watcherArguments = watch
         }
     }
 
@@ -123,8 +126,9 @@ final class Store: ObservableObject {
     }
 
     private func heard(_ line: String) {
+        // Every line the watcher prints follows a poll, so the cache is fresh.
+        Task { await refresh() }
         guard let notice = parseNotice(line) else { return }
-        if case .rotated = notice { Task { await refresh() } }
         if preferences.notificationsOn { notify(notice) }
     }
 

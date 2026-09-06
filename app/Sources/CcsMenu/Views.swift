@@ -75,8 +75,9 @@ struct PopoverView: View {
         HStack {
             Toggle("Launch at login", isOn: launchAtLogin).toggleStyle(.checkbox).font(.caption)
             Spacer()
-            if let updatedAt = store.updatedAt {
-                Text("updated \(updatedAt, style: .relative) ago").font(.caption).foregroundStyle(.secondary)
+            if let polledAt = store.polledAt {
+                Text("polled \(polledAt, style: .relative) ago").font(.caption).foregroundStyle(.secondary)
+                    .help("When the watcher last read the limits; the app itself never polls")
             }
             Button("Quit") { NSApplication.shared.terminate(nil) }.font(.caption)
         }
@@ -198,7 +199,6 @@ struct RotationSection: View {
                 .toggleStyle(.checkbox).font(.caption)
             }
             Toggle("Notifications", isOn: $preferences.notificationsOn).toggleStyle(.switch).controlSize(.small)
-                .onChange(of: preferences.notificationsOn) { store.apply() }
                 .padding(.top, 4)
             DaemonLines(daemon: store.watcher)
         }

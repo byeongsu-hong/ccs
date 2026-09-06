@@ -6,6 +6,7 @@ final class ModelTests: XCTestCase {
     static let listing = """
     [
       {"slug": "you_at_example.com", "email": "you@example.com", "plan": "max20x", "active": true,
+       "polled_at": "2026-09-06T12:00:00.123456Z",
        "limits": [
          {"kind": "session", "percent": 16.0, "severity": "normal",
           "resets_at": "2026-09-06T17:00:00.387644+00:00", "scope": null},
@@ -40,6 +41,12 @@ final class ModelTests: XCTestCase {
         let session = try decodeAccounts(Self.listing)[0].limits[0]
         let expected = ISO8601DateFormatter().date(from: "2026-09-06T17:00:00Z")!
         XCTAssertEqual(session.resetsAt, expected)
+    }
+
+    func testWhenAReadingWasTakenIsDecodedWhenTheListingSaysSo() throws {
+        let accounts = try decodeAccounts(Self.listing)
+        XCTAssertEqual(accounts[0].polledAt, ISO8601DateFormatter().date(from: "2026-09-06T12:00:00Z"))
+        XCTAssertNil(accounts[1].polledAt)
     }
 
     func testAMissingResetTimeIsNilNotAFailure() throws {

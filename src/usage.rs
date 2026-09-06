@@ -61,6 +61,20 @@ impl Cache {
         write_atomic(&self.at(slug), &body, FILE_MODE)
     }
 
+    /// What an account was last seen to have left, for a reader that cannot
+    /// afford to ask. `None` when nothing has polled it yet.
+    pub fn read(&self, slug: &str) -> Result<Option<Reading>> {
+        let path = self.at(slug);
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        serde_json::from_slice(&raw)
+            .with_context(|| format!("parsing {}", path.display()))
+            .map(Some)
+    }
+
     /// Drop an account's reading. Having none is a resting state — an account
     /// can be forgotten before it was ever polled — so only a real failure to
     /// remove one is worth reporting.
@@ -178,6 +192,22 @@ mod tests {
         fixture.cache.record("a", &[limit!("session", 3.0)]).expect("records");
         fixture.cache.forget("a").expect("forgets");
         assert!(!fixture.exists("a"));
+    }
+
+    #[test]
+    fn a_reading_can_be_read_back_by_something_that_cannot_poll() {
+        let fixture = Fixture::new("readback");
+        fixture.cache.record("a", &[limit!("session", 42.0)]).expect("records");
+
+        let back = fixture.cache.read("a").expect("reads").expect("a reading");
+        assert_eq!(back.limits[0].percent, 42.0);
+        assert!(!back.polled_at.is_empty());
+    }
+
+    #[test]
+    fn an_account_never_polled_has_no_reading_rather_than_a_broken_one() {
+        let fixture = Fixture::new("unread");
+        assert!(fixture.cache.read("never").expect("reads").is_none());
     }
 
     #[test]

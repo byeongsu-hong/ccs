@@ -45,6 +45,8 @@ USAGE
 OPTIONS
     -f, --force              switch even to an account with no headroom left
         --json               machine-readable output (ls, status)
+        --cached             what the last poll wrote down, without polling (ls);
+                             `ccs watch` is what keeps that current
         --name <slug>        stash under this name instead of the email (add)
         --email <address>    pre-fill the login page (add)
         --console            log in with Console billing, not a subscription (add)
@@ -61,7 +63,7 @@ OPTIONS
 #[derive(Debug, Clone)]
 pub enum Cmd {
     Pick,
-    List { json: bool },
+    List { json: bool, cached: bool },
     Use { target: String, force: bool },
     Add { name: Option<String>, current: bool, email: Option<String>, console: bool, sso: bool },
     Pin { target: Option<String>, args: Vec<String> },
@@ -82,7 +84,9 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
     match head.as_str() {
         "-h" | "--help" | "help" => Ok(Cmd::Help),
         "-V" | "--version" | "version" => Ok(Cmd::Version),
-        "ls" | "list" => Ok(Cmd::List { json: has(&args[1..], "--json") }),
+        "ls" | "list" => {
+            Ok(Cmd::List { json: has(&args[1..], "--json"), cached: has(&args[1..], "--cached") })
+        }
         "status" | "st" => Ok(Cmd::Status { json: has(&args[1..], "--json") }),
         "notify" => {
             let rest = &args[1..];
@@ -225,8 +229,16 @@ mod tests {
 
     #[test]
     fn list_takes_an_optional_json_flag() {
-        assert!(matches!(parsed(&["ls"]), Cmd::List { json: false }));
-        assert!(matches!(parsed(&["list", "--json"]), Cmd::List { json: true }));
+        assert!(matches!(parsed(&["ls"]), Cmd::List { json: false, cached: false }));
+        assert!(matches!(parsed(&["list", "--json"]), Cmd::List { json: true, .. }));
+    }
+
+    #[test]
+    fn list_can_be_asked_for_the_last_readings_rather_than_a_poll() {
+        assert!(matches!(
+            parsed(&["ls", "--cached", "--json"]),
+            Cmd::List { json: true, cached: true }
+        ));
     }
 
     #[test]

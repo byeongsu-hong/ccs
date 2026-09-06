@@ -249,7 +249,22 @@ fn in_use(ctx: &Ctx, hint: &str) -> Result<(CredsFile, Oauth)> {
 
 // ── commands ────────────────────────────────────────────────────────────────
 
-pub fn list(ctx: &Ctx, json: bool) -> Result<()> {
+pub fn list(ctx: &Ctx, json: bool, cached: bool) -> Result<()> {
+    if cached {
+        let readings = cached_entries(ctx)?;
+        if json {
+            let views: Vec<View> =
+                readings.iter().map(|r| view(&r.entry, r.polled_at.as_deref())).collect();
+            println!("{}", serde_json::to_string_pretty(&views)?);
+            return Ok(());
+        }
+        let table = Table::build(readings.into_iter().map(|r| r.entry).collect(), Style::detect());
+        println!("{}", table.header());
+        for index in 0..table.len() {
+            println!("{}", table.row(index));
+        }
+        return Ok(());
+    }
     let mut accounts = stashed(ctx)?;
     let (table, _) = survey(ctx, &mut accounts, Style::detect())?;
     if json {
@@ -260,6 +275,40 @@ pub fn list(ctx: &Ctx, json: bool) -> Result<()> {
         println!("{}", table.row(index));
     }
     Ok(())
+}
+
+/// An entry as the last poll left it, and when that was.
+struct Cached {
+    entry: Entry,
+    polled_at: Option<String>,
+}
+
+/// Every account with what the last poll wrote down for it: no network, no
+/// refresh, nothing spent. The source of truth for anything that asks more
+/// often than a poll can be afforded, with `ccs watch` keeping it current.
+/// The account in use is whichever the stash's pointer names; identifying it
+/// against the live credentials would cost a keychain read per call.
+fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
+    let accounts = stashed(ctx)?;
+    let live = ctx.stash.active();
+    accounts
+        .iter()
+        .map(|account| {
+            let reading = ctx.usage.read(&account.slug)?;
+            let (limits, polled_at) = match reading {
+                Some(reading) => (Ok(reading.limits), Some(reading.polled_at)),
+                None => (Err("not polled yet; `ccs watch` polls".to_string()), None),
+            };
+            let entry = Entry {
+                slug: account.slug.clone(),
+                email: account.account.email.clone(),
+                plan: account.account.plan_label(),
+                active: live.as_deref() == Some(account.slug.as_str()),
+                limits,
+            };
+            Ok(Cached { entry, polled_at })
+        })
+        .collect()
 }
 
 pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
@@ -291,7 +340,7 @@ pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
         limits: Ok(limits),
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&view(&entry))?);
+        println!("{}", serde_json::to_string_pretty(&view(&entry, None))?);
         return Ok(());
     }
     println!("{}  {}", style.bold(&entry.email), style.dim(&entry.plan));
@@ -889,22 +938,26 @@ struct View<'a> {
     active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
+    /// When the limits were read, for a listing that did not read them now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    polled_at: Option<&'a str>,
     limits: &'a [Limit],
 }
 
-fn view(entry: &Entry) -> View<'_> {
+fn view<'a>(entry: &'a Entry, polled_at: Option<&'a str>) -> View<'a> {
     View {
         slug: &entry.slug,
         email: &entry.email,
         plan: &entry.plan,
         active: entry.active,
         error: entry.limits.as_ref().err().map(String::as_str),
+        polled_at,
         limits: entry.known(),
     }
 }
 
 fn emit_json(table: &Table) -> Result<()> {
-    let views: Vec<View> = table.entries().iter().map(view).collect();
+    let views: Vec<View> = table.entries().iter().map(|e| view(e, None)).collect();
     println!("{}", serde_json::to_string_pretty(&views)?);
     Ok(())
 }
@@ -1255,6 +1308,31 @@ mod tests {
         remember(&fixture.ctx(), std::slice::from_ref(&failed)).expect("records nothing");
 
         assert_eq!(fixture.reading("a").expect("still there").limits[0].percent, 12.0);
+    }
+
+    /// A reader that cannot afford a poll — a menu bar repainting every few
+    /// seconds — takes what the last poll wrote down, and is told how old it
+    /// is; an account nothing has polled yet is said to be unread, not broken.
+    #[test]
+    fn a_cached_listing_is_the_last_readings_without_a_poll() {
+        let fixture = Fixture::new("cached");
+        for slug in ["a", "b"] {
+            let entry = stashed(slug, oauth(&format!("r-{slug}"), 0));
+            fixture.stash.save(&entry.slug, &entry.account).expect("stash");
+        }
+        fixture.stash.set_active("b").expect("active");
+        fixture.usage.record("a", &[limit!("session", 42.0)]).expect("records");
+
+        let entries = cached_entries(&fixture.ctx()).expect("lists");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].entry.slug, "a");
+        assert_eq!(entries[0].entry.known()[0].percent, 42.0);
+        assert!(entries[0].polled_at.is_some());
+        assert!(!entries[0].entry.active);
+        assert!(entries[1].entry.active);
+        assert!(entries[1].entry.limits.as_ref().unwrap_err().contains("not polled"));
+        assert!(entries[1].polled_at.is_none());
     }
 
     #[test]

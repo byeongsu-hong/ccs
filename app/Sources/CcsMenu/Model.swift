@@ -87,6 +87,23 @@ struct Account: Decodable, Identifiable, Equatable {
     var plan: String
     var active: Bool
     var limits: [Limit]
+    /// When the limits were read, for a listing that did not read them now.
+    var polledAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case slug, email, plan, active, limits
+        case polledAt = "polled_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        slug = try container.decode(String.self, forKey: .slug)
+        email = try container.decode(String.self, forKey: .email)
+        plan = try container.decode(String.self, forKey: .plan)
+        active = try container.decode(Bool.self, forKey: .active)
+        limits = try container.decodeIfPresent([Limit].self, forKey: .limits) ?? []
+        polledAt = try container.decodeIfPresent(String.self, forKey: .polledAt).flatMap(parseInstant)
+    }
 
     var id: String { slug }
     var session: Limit? { limits.first { $0.kind == "session" } }

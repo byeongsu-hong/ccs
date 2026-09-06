@@ -290,7 +290,11 @@ app stops both daemons.
 
 The app is a shell over the `ccs` on `~/.cargo/bin` (or `/usr/local/bin`,
 `/opt/homebrew/bin`, or `CCS_BINARY`): it never reads credentials or the stash
-itself, so a fix to the CLI is a fix to the app. It needs macOS 14 and builds
+itself, so a fix to the CLI is a fix to the app. Nor does it poll. The watcher
+it keeps running is the one thing that asks the API, and what it writes down
+under `ccs/usage/` is what the app reads back — `ccs ls --cached --json`, the
+same listing without the poll — so opening the popover twenty times costs the
+limits nothing. The footer says when the watcher last looked. It needs macOS 14 and builds
 with `swift build` alone; `make app` wraps the binary in an ad-hoc-signed
 bundle, and `make test-app` runs its tests.
 
@@ -391,9 +395,10 @@ painted, so only the percentages are as old as the footer says.
 error rather than a guess.
 
 `-f`/`--force` switches even into an account with nothing left. `--json` on `ls`
-and `status` gives you the same data for scripts. A status line wants the cache
-under `ccs/usage/` instead — it repaints far more often than a poll can be
-afforded.
+and `status` gives you the same data for scripts. A status line wants
+`ccs ls --cached --json` instead — the last readings `ccs watch` wrote down,
+with a `polled_at` on each, and no poll — because it repaints far more often
+than a poll can be afforded.
 
 ## Limits
 

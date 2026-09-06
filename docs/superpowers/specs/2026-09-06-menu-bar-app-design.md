@@ -10,8 +10,11 @@ as the app is, and hear about a session running high as a macOS notification.
 ## Shape
 
 A thin shell over the installed `ccs` binary. The app never reads credentials
-or the stash itself; it runs `ccs ls --json` for readings, `ccs use <slug>` to
-switch, and owns `ccs serve` and `ccs watch` as child processes. One
+or the stash itself, and never polls: it runs `ccs ls --cached --json` for the
+readings the watcher last wrote down, `ccs use <slug>` to switch, and owns
+`ccs serve` and `ccs watch` as child processes. The watcher always runs — it
+is the one poller, and the cache it writes is the source of truth — so the
+readings cost nothing however often the popover is opened. One
 implementation of token refresh, keychain and reconciliation, and the app
 inherits every fix to it.
 
@@ -61,20 +64,21 @@ percentage dimmed when the last refresh failed and the number shown is stale.
   and, when it is running, the gateway.
 - **Notifications.** A toggle. The app reads the watcher's stdout and turns
   lines of the kinds `session-high`, `session-reset`, `weekly-reset` and
-  `rotate:` into notifications through `UNUserNotificationCenter`. With
-  rotation off but notifications on, a plain `ccs watch` runs for the
-  notices alone.
+  `rotate:` into notifications through `UNUserNotificationCenter`. The
+  watcher runs whether or not this is on; the toggle only decides what is
+  done with what it says.
 - **Launch at login.** A toggle over `SMAppService.mainApp`.
 - **Quit.**
 
 ## Data
 
-`ccs ls --json` is an array of `{slug, email, plan, active, limits: [{kind,
-percent, severity, resets_at, scope: {model: {display_name}}}]}`. Columns
-follow the CLI: `session` and `weekly_all` under those names, a scoped limit
-under its model's display name, anything else under its kind. Readings are
-refreshed every five minutes and when the popover opens, and a switch refreshes
-at once.
+`ccs ls --cached --json` is an array of `{slug, email, plan, active,
+polled_at, limits: [{kind, percent, severity, resets_at, scope: {model:
+{display_name}}}]}`, with `error` in place of readings for an account nothing
+has polled yet. Columns follow the CLI: `session` and `weekly_all` under those
+names, a scoped limit under its model's display name, anything else under its
+kind. The cache is re-read every thirty seconds, when the popover opens, after
+a switch, and whenever the watcher prints a line (each follows a poll).
 
 Settings live in `UserDefaults`: `gateway.on`, `gateway.port` (4141),
 `rotation.on`, `rotation.pool` (slugs), `notifications.on`,

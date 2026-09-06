@@ -22,6 +22,7 @@ use crate::notify;
 use crate::pen;
 use crate::picker::{self, Act, Outcome};
 use crate::render::{self, Entry, Style, Table, Verb};
+use crate::serve::{self, Grant};
 use crate::stash::{self, Stash};
 use crate::usage;
 use crate::watch;
@@ -475,6 +476,132 @@ fn stamp() -> String {
     Timestamp::now().strftime("%H:%M:%S").to_string()
 }
 
+// ── the gateway ─────────────────────────────────────────────────────────────
+
+/// Serve the API on loopback as the account in use, until killed.
+///
+/// The connections are answered on threads of their own; this thread keeps
+/// the stash, and answers their questions about which account to send as.
+pub fn serve(ctx: &Ctx, port: u16, rotate: &[String]) -> Result<()> {
+    let pool: Vec<String> = {
+        let accounts = stashed(ctx)?;
+        rotate
+            .iter()
+            .map(|n| stash::resolve(&accounts, n).map(|s| s.slug.clone()))
+            .collect::<Result<_>>()?
+    };
+    let key = serve::key(ctx.stash.root())?;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .with_context(|| format!("listening on 127.0.0.1:{port}"))?;
+
+    println!("{} serving the API on http://127.0.0.1:{port} as the account in use", stamp());
+    if !pool.is_empty() {
+        println!("{} falling over to {} when it is limited", stamp(), pool.join(", "));
+    }
+    println!("paste into pi's models.json:\n{}", serve::pi_config(port));
+
+    let (asks, inbox) = std::sync::mpsc::channel();
+    serve::listen(listener, key, asks);
+    let desk = Desk { ctx, pool: &pool };
+    for ask in inbox {
+        ask.answer(&desk);
+    }
+    Ok(())
+}
+
+/// Print the gateway key, for pi's `"apiKey": "!ccs serve --key"`.
+pub fn serve_key(ctx: &Ctx) -> Result<()> {
+    println!("{}", serve::key(ctx.stash.root())?);
+    Ok(())
+}
+
+/// The stash as the gateway sees it: which account a request goes out as.
+struct Desk<'a> {
+    ctx: &'a Ctx<'a>,
+    /// Accounts to fall over to, in order, when the one in use is limited.
+    pool: &'a [String],
+}
+
+impl Desk<'_> {
+    /// Which stashed account is in use. The recorded pointer is what every
+    /// switch writes, and is cheap; the live credentials are read only when
+    /// it points nowhere.
+    fn live(&self, accounts: &[Stashed]) -> Result<Option<String>> {
+        let recorded = self.ctx.stash.active().filter(|s| accounts.iter().any(|a| a.slug == *s));
+        match recorded {
+            Some(slug) => Ok(Some(slug)),
+            None => identify_live(self.ctx, accounts),
+        }
+    }
+
+    /// The account a request goes out as: the one in use, unless it is among
+    /// `avoid`, and then the first pooled account that is not.
+    fn choose(&self, accounts: &[Stashed], live: Option<&str>, avoid: &[String]) -> Result<String> {
+        let usable = |slug: &str| {
+            accounts.iter().any(|a| a.slug == slug) && !avoid.iter().any(|a| a == slug)
+        };
+        if let Some(slug) = live.filter(|s| usable(s)) {
+            return Ok(slug.to_string());
+        }
+        if let Some(slug) = self.pool.iter().find(|s| usable(s)) {
+            return Ok(slug.clone());
+        }
+        match (live, avoid.is_empty()) {
+            (None, true) => bail!("no account is in use; `ccs use` one"),
+            _ => bail!("every account is limited: {}", avoid.join(", ")),
+        }
+    }
+
+    /// `slug`'s credentials, refreshed if they are spent.
+    ///
+    /// A session may have refreshed them already, leaving the stash behind on
+    /// a spent refresh token; the copies are brought level before one is
+    /// presented to the server.
+    fn hand_out(&self, slug: &str, accounts: &mut [Stashed], live: Option<&str>) -> Result<Grant> {
+        let position = accounts.iter().position(|a| a.slug == slug).context("no such account")?;
+        if accounts[position].account.oauth.needs_refresh() {
+            reconcile(self.ctx, accounts, live)?;
+        }
+        let entry = &mut accounts[position];
+        if let Some(oauth) = freshen(self.ctx.api, &entry.account.oauth)? {
+            propagate(self.ctx, entry, &oauth, live)?;
+        }
+        Ok(grant_of(entry))
+    }
+}
+
+fn grant_of(entry: &Stashed) -> Grant {
+    Grant {
+        slug: entry.slug.clone(),
+        email: entry.account.email.clone(),
+        token: entry.account.oauth.access_token.clone(),
+    }
+}
+
+impl serve::Accounts for Desk<'_> {
+    fn grant(&self, avoid: &[String]) -> Result<Grant, String> {
+        let granted = || -> Result<Grant> {
+            let mut accounts = self.ctx.stash.list()?;
+            let live = self.live(&accounts)?;
+            let slug = self.choose(&accounts, live.as_deref(), avoid)?;
+            self.hand_out(&slug, &mut accounts, live.as_deref())
+        };
+        granted().map_err(|e| describe(&e))
+    }
+
+    fn stale(&self, grant: &Grant) -> Result<Option<Grant>, String> {
+        let renewed = || -> Result<Option<Grant>> {
+            let mut accounts = self.ctx.stash.list()?;
+            let live = self.live(&accounts)?;
+            reconcile(self.ctx, &mut accounts, live.as_deref())?;
+            let entry =
+                accounts.iter().find(|a| a.slug == grant.slug).context("no such account")?;
+            Ok((entry.account.oauth.access_token != grant.token).then(|| grant_of(entry)))
+        };
+        renewed().map_err(|e| describe(&e))
+    }
+}
+
 pub fn pick(ctx: &Ctx) -> Result<()> {
     let mut accounts = stashed(ctx)?;
     // Switching is done from inside the picker, which stays up for it, so
@@ -843,6 +970,8 @@ mod tests {
         usage: usage::Cache,
         api: Api,
         home: pen::Home,
+        /// Accounts a gateway desk may fall over to.
+        pool: Vec<String>,
     }
 
     impl Fixture {
@@ -858,6 +987,7 @@ mod tests {
                 api: Api::new(),
                 home: pen::Home { config: dir.clone(), global: dir.join(".claude.json") },
                 dir,
+                pool: Vec::new(),
             }
         }
 
@@ -1123,5 +1253,94 @@ mod tests {
 
         remove(&fixture.ctx(), "gone").expect("removes");
         assert!(fixture.reading("gone").is_none());
+    }
+
+    // ── the gateway's desk ──────────────────────────────────────────────────
+
+    use crate::serve::Accounts as _;
+
+    /// Far enough off that nothing here reaches for a refresh.
+    const LATER: i64 = i64::MAX / 2;
+
+    fn desk_fixture(name: &str, active: Option<&str>, pool: &[&str]) -> Fixture {
+        let mut fixture = Fixture::new(name);
+        for slug in ["a", "b", "c"] {
+            let entry = stashed(slug, oauth(&format!("r-{slug}"), LATER));
+            fixture.stash.save(&entry.slug, &entry.account).expect("stash");
+        }
+        if let Some(slug) = active {
+            fixture.stash.set_active(slug).expect("active");
+        }
+        fixture.pool = pool.iter().map(|s| s.to_string()).collect();
+        fixture
+    }
+
+    #[test]
+    fn a_grant_is_the_account_in_use() {
+        let fixture = desk_fixture("desk-active", Some("b"), &[]);
+        let ctx = fixture.ctx();
+        let grant = Desk { ctx: &ctx, pool: &fixture.pool }.grant(&[]).expect("grants");
+        assert_eq!((grant.slug.as_str(), grant.token.as_str()), ("b", "access-r-b"));
+        assert_eq!(grant.email, "b@example.com");
+    }
+
+    #[test]
+    fn a_limited_account_in_use_gives_way_to_the_pool_in_order() {
+        let fixture = desk_fixture("desk-pool", Some("b"), &["c", "a"]);
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &fixture.pool };
+        assert_eq!(desk.grant(&["b".into()]).expect("grants").slug, "c");
+        assert_eq!(desk.grant(&["b".into(), "c".into()]).expect("grants").slug, "a");
+    }
+
+    #[test]
+    fn with_every_account_limited_the_refusal_says_so() {
+        let fixture = desk_fixture("desk-spent", Some("b"), &["a"]);
+        let ctx = fixture.ctx();
+        let why = Desk { ctx: &ctx, pool: &fixture.pool }
+            .grant(&["b".into(), "a".into()])
+            .expect_err("nothing left");
+        assert!(why.contains("limited"), "{why}");
+    }
+
+    #[test]
+    fn with_nothing_in_use_the_refusal_points_at_the_switch() {
+        let fixture = desk_fixture("desk-none", None, &[]);
+        let ctx = fixture.ctx();
+        let why = Desk { ctx: &ctx, pool: &fixture.pool }.grant(&[]).expect_err("nothing in use");
+        assert!(why.contains("ccs use"), "{why}");
+    }
+
+    #[test]
+    fn with_nothing_in_use_the_pool_still_answers() {
+        let fixture = desk_fixture("desk-pool-only", None, &["c"]);
+        let ctx = fixture.ctx();
+        assert_eq!(Desk { ctx: &ctx, pool: &fixture.pool }.grant(&[]).expect("grants").slug, "c");
+    }
+
+    /// A session refreshing the live credentials leaves the stash behind. A
+    /// rejected token is the moment that shows: the copy a session holds is
+    /// the one to hand out.
+    #[test]
+    fn a_rejected_token_is_replaced_by_the_newer_copy_a_session_holds() {
+        let fixture = desk_fixture("desk-stale", Some("b"), &[]);
+        fixture.creds.write(&CredsFile::new(oauth("r-b-2", LATER + 1))).expect("live");
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &fixture.pool };
+        let old = desk.grant(&[]).expect("grants");
+
+        let renewed = desk.stale(&old).expect("answers").expect("a newer copy");
+        assert_eq!(renewed.token, "access-r-b-2");
+        // ...and the stash was brought up to date while it was at it.
+        assert_eq!(fixture.tokens("b").0, "r-b-2");
+    }
+
+    #[test]
+    fn a_rejected_token_with_no_newer_copy_is_reported_as_such() {
+        let fixture = desk_fixture("desk-fresh", Some("b"), &[]);
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &fixture.pool };
+        let grant = desk.grant(&[]).expect("grants");
+        assert!(desk.stale(&grant).expect("answers").is_none());
     }
 }

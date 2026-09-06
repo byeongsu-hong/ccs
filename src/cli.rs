@@ -29,6 +29,13 @@ USAGE
                              from a pooled account whose session has run
                              high, to the pooled account whose weekly window
                              resets soonest and still has room
+    ccs serve                serve the Anthropic API on 127.0.0.1 as the account
+                             in use, for pi and anything else that speaks it;
+                             runs until killed. Prints the models.json snippet
+                             to paste into pi. With --rotate, a request the
+                             account in use is too limited to answer is sent
+                             again as the next pooled account
+    ccs serve --key          print the key a client presents to the gateway
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
@@ -44,7 +51,9 @@ OPTIONS
         --sso                force the SSO login flow (add)
         --every <seconds>    poll interval (watch; default 300)
         --high <percent>     session percentage that counts as high (watch; default 90)
-        --rotate <a>,<b>,... accounts to rotate between (watch); repeatable
+        --rotate <a>,<b>,... accounts to rotate between (watch) or fall over
+                             to (serve); repeatable
+        --port <n>           port to serve on (serve; default 4141)
     -h, --help               this text
     -V, --version            version
 ";
@@ -60,6 +69,8 @@ pub enum Cmd {
     Status { json: bool },
     Notify { off: bool, kinds: Vec<String>, bypass: bool },
     Watch { every: u64, high: f64, rotate: Vec<String> },
+    Serve { port: u16, rotate: Vec<String> },
+    ServeKey,
     Help,
     Version,
 }
@@ -98,11 +109,21 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
             Ok(Cmd::Watch {
                 every: number("--every", 300.0)? as u64,
                 high: number("--high", 90.0)?,
-                rotate: values(rest, "--rotate")
-                    .flat_map(|v| v.split(',').map(str::trim).map(String::from).collect::<Vec<_>>())
-                    .filter(|v| !v.is_empty())
-                    .collect(),
+                rotate: pool(rest),
             })
+        }
+        "serve" | "gateway" => {
+            let rest = &args[1..];
+            if has(rest, "--key") {
+                return Ok(Cmd::ServeKey);
+            }
+            let port = match value(rest, "--port") {
+                None => 4141,
+                Some(v) => {
+                    v.parse().map_err(|_| anyhow::anyhow!("--port wants a port, not {v:?}"))?
+                }
+            };
+            Ok(Cmd::Serve { port, rotate: pool(rest) })
         }
         "use" | "switch" => {
             let rest = &args[1..];
@@ -135,6 +156,14 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
     }
 }
 
+/// Every account named after a `--rotate`, comma-separated or repeated.
+fn pool(args: &[String]) -> Vec<String> {
+    values(args, "--rotate")
+        .flat_map(|v| v.split(',').map(str::trim).map(String::from).collect::<Vec<_>>())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 /// Split at `--`: what follows belongs to the command being launched rather
 /// than to this one, flags and all.
 fn forwarded(args: &[String]) -> (&[String], Vec<String>) {
@@ -158,7 +187,7 @@ fn values<'a>(args: &'a [String], flag: &'a str) -> impl Iterator<Item = &'a Str
 }
 
 /// Flags that consume the argument after them.
-const VALUE_FLAGS: [&str; 5] = ["--name", "--email", "--every", "--high", "--rotate"];
+const VALUE_FLAGS: [&str; 6] = ["--name", "--email", "--every", "--high", "--rotate", "--port"];
 
 /// The first argument that is neither a flag nor a flag's value.
 fn positional(args: &[String]) -> Option<String> {
@@ -304,6 +333,32 @@ mod tests {
         assert_eq!(rotate, ["a", "b", "c"]);
         assert_eq!(high, 95.0);
         assert!(matches!(parsed(&["watch"]), Cmd::Watch { rotate, .. } if rotate.is_empty()));
+    }
+
+    #[test]
+    fn serve_defaults_its_port_and_takes_a_pool_like_watch() {
+        let Cmd::Serve { port, rotate } = parsed(&["serve"]) else { panic!("not a serve") };
+        assert_eq!((port, rotate.is_empty()), (4141, true));
+
+        let Cmd::Serve { port, rotate } = parsed(&["serve", "--port", "8080", "--rotate", "a,b"])
+        else {
+            panic!("not a serve")
+        };
+        assert_eq!(port, 8080);
+        assert_eq!(rotate, ["a", "b"]);
+    }
+
+    #[test]
+    fn serve_key_only_prints_the_key() {
+        assert!(matches!(parsed(&["serve", "--key"]), Cmd::ServeKey));
+    }
+
+    #[test]
+    fn serve_refuses_a_port_that_is_not_one() {
+        assert!(
+            parse(["serve".to_string(), "--port".to_string(), "lots".to_string()].into_iter())
+                .is_err()
+        );
     }
 
     #[test]

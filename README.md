@@ -51,6 +51,14 @@ use that is not in the pool was chosen by hand and is never touched. Running
 sessions follow the switch like any other, and hear a `switch` notice if they
 asked.
 
+**A gateway for other tools.** `ccs serve` puts the Anthropic Messages API on
+`127.0.0.1:4141`, answering as whichever account is in use. Anything that speaks
+the API — [pi](https://pi.dev) through its `models.json`, say — gets every
+account you have stashed and never logs in itself; `ccs use`, the picker and
+`ccs watch --rotate` move it along with your sessions. With a `--rotate` pool of
+its own, a request the account in use is too limited to answer is quietly sent
+again as the next pooled account. See below.
+
 **Pinning.** One session on one account, every other session left where it is.
 This is the feature that changes how you work — see below.
 
@@ -217,6 +225,48 @@ takes an account's pen away with it.
 If Claude Code ever replaces one of those links with a real file of its own, the
 pen keeps that file from then on rather than clobbering it back to a link.
 
+## Using the accounts from pi
+
+```sh
+ccs serve                         # or: ccs serve --port 4141 --rotate agent,work
+```
+
+It prints the fragment to paste into pi's `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "anthropic": {
+      "baseUrl": "http://127.0.0.1:4141",
+      "apiKey": "!ccs serve --key"
+    }
+  }
+}
+```
+
+That is the whole of it. Overriding only `baseUrl` on the built-in provider keeps
+every Claude model pi already knows about, and the key is fetched by running the
+command, so nothing secret sits in the file. Each request goes out as the account
+in use, with its access token refreshed on the way when it has expired, and the
+answer is streamed back as it arrives.
+
+The key is `sk-ant-oat-ccs-` and 32 random hex digits, minted once into
+`~/.claude/ccs/gateway.key`. The prefix is what pi keys on to treat a key as an
+OAuth token — so pi itself sends the bearer header, the OAuth betas, and the
+Claude Code identity line at the head of the system prompt, and the gateway has
+no reason to read a body. The suffix is what stops another process on the same
+machine from spending your subscription: a request without it gets a `401` and
+never leaves the machine.
+
+A request the API turns away with a `429` is, when `--rotate` names a pool, sent
+again as the first pooled account not yet found limited, before a byte has
+reached the client. Without a pool the `429` is relayed as it is. A `401` on a
+token this tool thought was fresh is taken for a session having refreshed the
+live credentials underneath it; the copies are brought level and the request
+sent once more.
+
+Only `127.0.0.1` is listened on, and only paths under `/v1/` are relayed.
+
 ## How it works
 
 **Switching a live session.** Claude Code checks the mtime of its credentials file
@@ -304,6 +354,10 @@ painted, so only the percentages are as old as the footer says.
 | `ccs add --current` | stash whichever account is logged in right now |
 | `ccs rm <account>` | forget a stashed account |
 | `ccs status` | limits for the account in use, with reset times |
+| `ccs notify [<kind>...]` | have notices delivered into the calling session |
+| `ccs watch` | poll every account and raise notices; `--rotate` switches too |
+| `ccs serve` | serve the API on loopback as the account in use |
+| `ccs serve --key` | print the key a client presents to the gateway |
 
 `<account>` is a slug, an email, an unambiguous prefix of either, or the index from
 `ccs ls`. `ccs pin` without one opens the picker; `ccs use` without one is an
@@ -341,6 +395,7 @@ account did.
 ~/.claude/ccs/pens/<account>/   one pinned session's configuration each
 ~/.claude/ccs/usage/*.json      what each account last had left, and when
 ~/.claude/ccs/state.json        which slug is currently installed
+~/.claude/ccs/gateway.key       what a client presents to `ccs serve`, mode 0600
 ~/.claude/ccs/.login-<pid>/     a login in progress, destroyed when it ends
 ```
 

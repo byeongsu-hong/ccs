@@ -760,7 +760,10 @@ pub fn serve(ctx: &Ctx, port: u16, rotate: &[String]) -> Result<()> {
             .map(|n| stash::resolve(&accounts, n).map(|s| s.slug.clone()))
             .collect::<Result<_>>()?
     };
-    let key = serve::key(ctx.stash.root())?;
+    let keys = serve::Keys {
+        claude: serve::key(ctx.stash.root())?,
+        codex: serve::codex_key(ctx.stash.root())?,
+    };
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("listening on 127.0.0.1:{port}"))?;
 
@@ -771,7 +774,7 @@ pub fn serve(ctx: &Ctx, port: u16, rotate: &[String]) -> Result<()> {
     println!("paste into pi's models.json:\n{}", serve::pi_config(port));
 
     let (asks, inbox) = std::sync::mpsc::channel();
-    serve::listen(listener, key, asks);
+    serve::listen(listener, keys, asks);
     let desk = Desk { ctx, pool: &pool };
     for ask in inbox {
         ask.answer(&desk);
@@ -779,9 +782,13 @@ pub fn serve(ctx: &Ctx, port: u16, rotate: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Print the gateway key, for pi's `"apiKey": "!ccs serve --key"`.
-pub fn serve_key(ctx: &Ctx) -> Result<()> {
-    println!("{}", serve::key(ctx.stash.root())?);
+/// Print a provider's gateway key, for pi's `"apiKey": "!ccs serve --key"`.
+pub fn serve_key(ctx: &Ctx, provider: Provider) -> Result<()> {
+    let key = match provider {
+        Provider::Claude => serve::key(ctx.stash.root())?,
+        Provider::Codex => serve::codex_key(ctx.stash.root())?,
+    };
+    println!("{key}");
     Ok(())
 }
 
@@ -811,11 +818,19 @@ impl Desk<'_> {
         Ok(live)
     }
 
-    /// The account a request goes out as: the one in use, unless it is among
-    /// `avoid`, and then the first pooled account that is not.
-    fn choose(&self, accounts: &[Stashed], live: Option<&str>, avoid: &[String]) -> Result<String> {
+    /// The account of `provider` a request goes out as: the one in use,
+    /// unless it is among `avoid`, and then the first pooled account of that
+    /// provider that is not.
+    fn choose(
+        &self,
+        accounts: &[Stashed],
+        provider: Provider,
+        live: Option<&str>,
+        avoid: &[String],
+    ) -> Result<String> {
         let usable = |slug: &str| {
-            accounts.iter().any(|a| a.slug == slug) && !avoid.iter().any(|a| a == slug)
+            accounts.iter().any(|a| a.slug == slug && a.account.provider == provider)
+                && !avoid.iter().any(|a| a == slug)
         };
         if let Some(slug) = live.filter(|s| usable(s)) {
             return Ok(slug.to_string());
@@ -824,7 +839,7 @@ impl Desk<'_> {
             return Ok(slug.clone());
         }
         match (live, avoid.is_empty()) {
-            (None, true) => bail!("no account is in use; `ccs use` one"),
+            (None, true) => bail!("no {provider} account is in use; `ccs use` one"),
             _ => bail!("every account is limited: {}", avoid.join(", ")),
         }
     }
@@ -863,18 +878,20 @@ impl Desk<'_> {
 
 fn grant_of(entry: &Stashed) -> Grant {
     Grant {
+        provider: entry.account.provider,
         slug: entry.slug.clone(),
         email: entry.account.email.clone(),
         token: entry.account.oauth.access_token.clone(),
+        account_id: entry.account.oauth.account_id().map(String::from),
     }
 }
 
 impl serve::Accounts for Desk<'_> {
-    fn grant(&self, avoid: &[String]) -> Result<Grant, String> {
+    fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String> {
         let granted = || -> Result<Grant> {
             let mut accounts = self.ctx.stash.list()?;
             let live = self.live(&accounts)?;
-            let slug = self.choose(&accounts, live.of(Provider::Claude), avoid)?;
+            let slug = self.choose(&accounts, provider, live.of(provider), avoid)?;
             self.hand_out(&slug, &mut accounts, &live)
         };
         granted().map_err(|e| describe(&e))
@@ -1815,7 +1832,8 @@ mod tests {
     fn a_grant_is_the_account_in_use() {
         let fixture = desk_fixture("desk-active", Some("b"), &[]);
         let ctx = fixture.ctx();
-        let grant = Desk { ctx: &ctx, pool: &fixture.pool }.grant(&[]).expect("grants");
+        let grant =
+            Desk { ctx: &ctx, pool: &fixture.pool }.grant(Provider::Claude, &[]).expect("grants");
         assert_eq!((grant.slug.as_str(), grant.token.as_str()), ("b", "access-r-b"));
         assert_eq!(grant.email, "b@example.com");
     }
@@ -1825,8 +1843,11 @@ mod tests {
         let fixture = desk_fixture("desk-pool", Some("b"), &["c", "a"]);
         let ctx = fixture.ctx();
         let desk = Desk { ctx: &ctx, pool: &fixture.pool };
-        assert_eq!(desk.grant(&["b".into()]).expect("grants").slug, "c");
-        assert_eq!(desk.grant(&["b".into(), "c".into()]).expect("grants").slug, "a");
+        assert_eq!(desk.grant(Provider::Claude, &["b".into()]).expect("grants").slug, "c");
+        assert_eq!(
+            desk.grant(Provider::Claude, &["b".into(), "c".into()]).expect("grants").slug,
+            "a"
+        );
     }
 
     #[test]
@@ -1834,7 +1855,7 @@ mod tests {
         let fixture = desk_fixture("desk-spent", Some("b"), &["a"]);
         let ctx = fixture.ctx();
         let why = Desk { ctx: &ctx, pool: &fixture.pool }
-            .grant(&["b".into(), "a".into()])
+            .grant(Provider::Claude, &["b".into(), "a".into()])
             .expect_err("nothing left");
         assert!(why.contains("limited"), "{why}");
     }
@@ -1843,7 +1864,9 @@ mod tests {
     fn with_nothing_in_use_the_refusal_points_at_the_switch() {
         let fixture = desk_fixture("desk-none", None, &[]);
         let ctx = fixture.ctx();
-        let why = Desk { ctx: &ctx, pool: &fixture.pool }.grant(&[]).expect_err("nothing in use");
+        let why = Desk { ctx: &ctx, pool: &fixture.pool }
+            .grant(Provider::Claude, &[])
+            .expect_err("nothing in use");
         assert!(why.contains("ccs use"), "{why}");
     }
 
@@ -1851,7 +1874,13 @@ mod tests {
     fn with_nothing_in_use_the_pool_still_answers() {
         let fixture = desk_fixture("desk-pool-only", None, &["c"]);
         let ctx = fixture.ctx();
-        assert_eq!(Desk { ctx: &ctx, pool: &fixture.pool }.grant(&[]).expect("grants").slug, "c");
+        assert_eq!(
+            Desk { ctx: &ctx, pool: &fixture.pool }
+                .grant(Provider::Claude, &[])
+                .expect("grants")
+                .slug,
+            "c"
+        );
     }
 
     /// A session refreshing the live credentials leaves the stash behind. A
@@ -1863,7 +1892,7 @@ mod tests {
         fixture.creds.write(&CredsFile::new(oauth("r-b-2", LATER + 1))).expect("live");
         let ctx = fixture.ctx();
         let desk = Desk { ctx: &ctx, pool: &fixture.pool };
-        let old = desk.grant(&[]).expect("grants");
+        let old = desk.grant(Provider::Claude, &[]).expect("grants");
 
         let renewed = desk.stale(&old).expect("answers").expect("a newer copy");
         assert_eq!(renewed.token, "access-r-b-2");
@@ -1882,7 +1911,8 @@ mod tests {
         fixture.creds.write(&CredsFile::new(oauth("r-b-2", LATER))).expect("live");
         let ctx = fixture.ctx();
 
-        let grant = Desk { ctx: &ctx, pool: &fixture.pool }.grant(&[]).expect("grants");
+        let grant =
+            Desk { ctx: &ctx, pool: &fixture.pool }.grant(Provider::Claude, &[]).expect("grants");
 
         assert_eq!(grant.token, "access-r-b-2");
         assert_eq!(fixture.tokens("b").0, "r-b-2");
@@ -1893,7 +1923,7 @@ mod tests {
         let fixture = desk_fixture("desk-fresh", Some("b"), &[]);
         let ctx = fixture.ctx();
         let desk = Desk { ctx: &ctx, pool: &fixture.pool };
-        let grant = desk.grant(&[]).expect("grants");
+        let grant = desk.grant(Provider::Claude, &[]).expect("grants");
         assert!(desk.stale(&grant).expect("answers").is_none());
     }
 }

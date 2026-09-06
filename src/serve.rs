@@ -26,10 +26,19 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::fsx::write_atomic;
+use crate::model::Provider;
 
 /// The key file is a credential in its own right: owner-only.
 const KEY_MODE: u32 = 0o600;
 const KEY_FILE: &str = "gateway.key";
+const CODEX_KEY_FILE: &str = "codex.key";
+
+/// Where the two APIs live, and the prefix a client puts in front of the
+/// Codex one: pi's built-in provider is told `<gateway>/backend-api`, so
+/// its requests arrive under that and are relayed under the real one.
+const CLAUDE_API: &str = "https://api.anthropic.com";
+const CODEX_API: &str = "https://chatgpt.com/backend-api";
+const CODEX_PREFIX: &str = "/backend-api";
 
 /// What pi keys on to treat a key as an OAuth token, plus a mark of its own.
 const KEY_PREFIX: &str = "sk-ant-oat-ccs-";
@@ -44,10 +53,11 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 /// encodings, since the reply is passed on as bytes and has to arrive as such.
 /// `expect` in particular would have the client's `100-continue` waited out
 /// upstream, on a body that has already been read whole here.
-const NOT_FORWARDED: [&str; 14] = [
+const NOT_FORWARDED: [&str; 15] = [
     "host",
     "authorization",
     "x-api-key",
+    "chatgpt-account-id",
     "proxy-authorization",
     "content-length",
     "transfer-encoding",
@@ -86,6 +96,13 @@ impl Request {
             .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
             .map(str::trim);
         bearer == Some(key) || self.header("x-api-key").map(str::trim) == Some(key)
+    }
+
+    /// Whether the client is asking to open a socket rather than send a
+    /// request. Only requests are relayed; a refusal sends pi to its
+    /// event-stream fallback.
+    pub fn wants_websocket(&self) -> bool {
+        self.header("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
     }
 
     /// The headers to send upstream in this request's name.
@@ -260,18 +277,21 @@ fn reason(status: u16) -> &'static str {
 /// An account to send a request as.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Grant {
+    pub provider: Provider,
     pub slug: String,
     pub email: String,
     /// A live access token.
     pub token: String,
+    /// The ChatGPT account id a Codex request names alongside its token.
+    pub account_id: Option<String>,
 }
 
 /// Where grants come from. The connection thread asks; whoever holds the
 /// stash answers.
 pub trait Accounts {
-    /// An account other than those in `avoid`, which have been found limited
-    /// for the request in hand. The error is for the client to read.
-    fn grant(&self, avoid: &[String]) -> Result<Grant, String>;
+    /// An account of `provider` other than those in `avoid`, which have been
+    /// found limited for the request in hand. The error is for the client.
+    fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String>;
 
     /// The server refused `grant`'s token. A newer one for the same account,
     /// when one can be had; `None` when it was as fresh as they come.
@@ -323,12 +343,15 @@ impl Upstream {
         }
     }
 
-    /// Send `request` as `token`.
-    pub fn send(&self, request: &Request, token: &str) -> Result<Reply> {
+    /// Send `request` to `target` under this base, as `grant`.
+    pub fn send(&self, request: &Request, target: &str, grant: &Grant) -> Result<Reply> {
         let mut builder = ureq::http::Request::builder()
             .method(request.method.as_str())
-            .uri(format!("{}{}", self.base, request.target))
-            .header("authorization", format!("Bearer {token}"));
+            .uri(format!("{}{}", self.base, target))
+            .header("authorization", format!("Bearer {}", grant.token));
+        if let Some(account) = &grant.account_id {
+            builder = builder.header("chatgpt-account-id", account);
+        }
         for (name, value) in request.forwarded() {
             builder = builder.header(name, value);
         }
@@ -346,6 +369,29 @@ impl Upstream {
     }
 }
 
+/// The two APIs relayed to.
+pub struct Upstreams<'a> {
+    pub claude: &'a Upstream,
+    pub codex: &'a Upstream,
+}
+
+/// The key each provider's clients present.
+#[derive(Clone)]
+pub struct Keys {
+    pub claude: String,
+    pub codex: String,
+}
+
+/// Where a request is going: which provider answers, at which base, under
+/// which path. Decided by the path alone.
+fn route(target: &str) -> Option<(Provider, &str)> {
+    if target.starts_with("/v1/") {
+        return Some((Provider::Claude, target));
+    }
+    let rest = target.strip_prefix(CODEX_PREFIX)?;
+    rest.starts_with('/').then_some((Provider::Codex, rest))
+}
+
 /// Answer one request: check the key, send it as the account in use, and
 /// relay whatever comes back — unless what comes back is a limit and the pool
 /// has another account to try, or a rejected token that can be renewed.
@@ -354,23 +400,31 @@ impl Upstream {
 /// it invisible.
 pub fn answer(
     request: &Request,
-    key: &str,
-    upstream: &Upstream,
+    keys: &Keys,
+    upstreams: &Upstreams,
     accounts: &dyn Accounts,
     out: &mut impl Write,
 ) -> io::Result<Outcome> {
+    if request.wants_websocket() {
+        write_error(out, 426, "invalid_request_error", "sockets are not relayed; send requests")?;
+        return Ok(Outcome::refused(426));
+    }
+    let Some((provider, target)) = route(&request.target) else {
+        write_error(out, 404, "not_found_error", "only /v1/ and /backend-api/ are relayed")?;
+        return Ok(Outcome::refused(404));
+    };
+    let (key, upstream) = match provider {
+        Provider::Claude => (&keys.claude, upstreams.claude),
+        Provider::Codex => (&keys.codex, upstreams.codex),
+    };
     if !request.presents(key) {
         write_error(out, 401, "authentication_error", "no such gateway key")?;
         return Ok(Outcome::refused(401));
     }
-    if !request.target.starts_with("/v1/") {
-        write_error(out, 404, "not_found_error", "only the API under /v1/ is relayed")?;
-        return Ok(Outcome::refused(404));
-    }
 
     let mut outcome = Outcome::refused(0);
     let mut renewed: Vec<String> = Vec::new();
-    let mut grant = match accounts.grant(&outcome.tried) {
+    let mut grant = match accounts.grant(provider, &outcome.tried) {
         Ok(grant) => grant,
         Err(why) => {
             write_error(out, 503, "api_error", &why)?;
@@ -379,7 +433,7 @@ pub fn answer(
     };
     loop {
         outcome.slug = Some(grant.slug.clone());
-        let mut reply = match upstream.send(request, &grant.token) {
+        let mut reply = match upstream.send(request, target, &grant) {
             Ok(reply) => reply,
             Err(e) => {
                 let why = format!("the API could not be reached: {e:#}");
@@ -391,7 +445,7 @@ pub fn answer(
         match reply.status {
             429 => {
                 outcome.tried.push(grant.slug.clone());
-                match accounts.grant(&outcome.tried) {
+                match accounts.grant(provider, &outcome.tried) {
                     Ok(next) => {
                         grant = next;
                         continue;
@@ -443,11 +497,9 @@ impl Outcome {
 
 // ── connections ─────────────────────────────────────────────────────────────
 
-const API_BASE: &str = "https://api.anthropic.com";
-
 /// A question for whoever holds the stash, with somewhere to put the answer.
 pub enum Ask {
-    Grant { avoid: Vec<String>, reply: Sender<Result<Grant, String>> },
+    Grant { provider: Provider, avoid: Vec<String>, reply: Sender<Result<Grant, String>> },
     Stale { grant: Grant, reply: Sender<Result<Option<Grant>, String>> },
 }
 
@@ -455,7 +507,9 @@ impl Ask {
     pub fn answer(self, accounts: &dyn Accounts) {
         // A connection that gave up waiting is not an error worth anything.
         match self {
-            Self::Grant { avoid, reply } => drop(reply.send(accounts.grant(&avoid))),
+            Self::Grant { provider, avoid, reply } => {
+                drop(reply.send(accounts.grant(provider, &avoid)))
+            }
             Self::Stale { grant, reply } => drop(reply.send(accounts.stale(&grant))),
         }
     }
@@ -468,9 +522,11 @@ struct Line(Sender<Ask>);
 const GONE: &str = "the stash is no longer answering";
 
 impl Accounts for Line {
-    fn grant(&self, avoid: &[String]) -> Result<Grant, String> {
+    fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String> {
         let (reply, answer) = mpsc::channel();
-        self.0.send(Ask::Grant { avoid: avoid.to_vec(), reply }).map_err(|_| GONE.to_string())?;
+        self.0
+            .send(Ask::Grant { provider, avoid: avoid.to_vec(), reply })
+            .map_err(|_| GONE.to_string())?;
         answer.recv().map_err(|_| GONE.to_string())?
     }
 
@@ -483,19 +539,25 @@ impl Accounts for Line {
 
 /// Accept connections for as long as the process runs, each on a thread of
 /// its own, asking `asks` which account to send as. Returns at once.
-pub fn listen(listener: TcpListener, key: String, asks: Sender<Ask>) {
+pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) {
     thread::spawn(move || {
-        let upstream = Arc::new(Upstream::new(API_BASE));
+        let claude = Arc::new(Upstream::new(CLAUDE_API));
+        let codex = Arc::new(Upstream::new(CODEX_API));
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            let (key, line, upstream) = (key.clone(), Line(asks.clone()), Arc::clone(&upstream));
-            thread::spawn(move || connection(stream, &key, &upstream, &line));
+            let keys = keys.clone();
+            let line = Line(asks.clone());
+            let (claude, codex) = (Arc::clone(&claude), Arc::clone(&codex));
+            thread::spawn(move || {
+                let upstreams = Upstreams { claude: &claude, codex: &codex };
+                connection(stream, &keys, &upstreams, &line)
+            });
         }
     });
 }
 
 /// Answer requests on one connection until the client hangs up.
-fn connection(stream: TcpStream, key: &str, upstream: &Upstream, accounts: &dyn Accounts) {
+fn connection(stream: TcpStream, keys: &Keys, upstreams: &Upstreams, accounts: &dyn Accounts) {
     let Ok(read_end) = stream.try_clone() else { return };
     let mut reader = io::BufReader::new(read_end);
     let mut writer = io::BufWriter::new(stream);
@@ -509,7 +571,7 @@ fn connection(stream: TcpStream, key: &str, upstream: &Upstream, accounts: &dyn 
             }
         };
         let started = Instant::now();
-        match answer(&request, key, upstream, accounts, &mut writer) {
+        match answer(&request, keys, upstreams, accounts, &mut writer) {
             Ok(outcome) => println!("{}", logged(&request, &outcome, started.elapsed())),
             // The client went away mid-answer; there is nobody to tell.
             Err(_) => return,
@@ -554,6 +616,44 @@ pub fn key(root: &Path) -> Result<String> {
     Ok(minted)
 }
 
+/// The Codex gateway key: minted once, read back after, replaced when the
+/// file does not hold one.
+///
+/// It is shaped as a token because pi's Codex provider reads the account
+/// id out of the key it is given and sends it as a header: an unsigned JWT
+/// naming account `ccs`, with 32 random hex digits of its own that are the
+/// secret. The gateway checks the whole string and puts the real account id
+/// on the request itself.
+pub fn codex_key(root: &Path) -> Result<String> {
+    let path = root.join(CODEX_KEY_FILE);
+    match fs::read_to_string(&path) {
+        Ok(held) if whole_codex(held.trim()) => return Ok(held.trim().to_string()),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    let minted = generate_codex_key();
+    write_atomic(&path, format!("{minted}\n").as_bytes(), KEY_MODE)?;
+    Ok(minted)
+}
+
+pub fn generate_codex_key() -> String {
+    let secret = &generate_key()[KEY_PREFIX.len()..];
+    let header = crate::codex::base64url(br#"{"alg":"none"}"#);
+    let payload =
+        json!({ "https://api.openai.com/auth": { "chatgpt_account_id": "ccs" }, "ccs": secret });
+    let payload = crate::codex::base64url(payload.to_string().as_bytes());
+    format!("{header}.{payload}.ccs")
+}
+
+fn whole_codex(key: &str) -> bool {
+    let Ok(claims) = crate::codex::claims_of(key) else { return false };
+    claims["https://api.openai.com/auth"]["chatgpt_account_id"] == "ccs"
+        && claims["ccs"]
+            .as_str()
+            .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Whether `key` is one this minted: the prefix and 32 hexadecimal digits.
 fn whole(key: &str) -> bool {
     key.strip_prefix(KEY_PREFIX)
@@ -578,6 +678,10 @@ pub fn pi_config(port: u16) -> String {
             "anthropic": {
                 "baseUrl": format!("http://127.0.0.1:{port}"),
                 "apiKey": "!ccs serve --key"
+            },
+            "openai-codex": {
+                "baseUrl": format!("http://127.0.0.1:{port}{CODEX_PREFIX}"),
+                "apiKey": "!ccs serve --key codex"
             }
         }
     }))
@@ -748,12 +852,19 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const KEY: &str = "sk-ant-oat-ccs-0123";
+    /// A Codex key as minted: a JWT naming account "ccs".
+    const CODEX_KEY: &str = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiY2NzIn0sImNjcyI6IjAxMjMifQ.ccs";
+
+    fn keys() -> Keys {
+        Keys { claude: KEY.into(), codex: CODEX_KEY.into() }
+    }
 
     /// What the fake upstream saw of each request: the bearer it was sent as,
     /// and the headers that reached it.
     #[derive(Debug, Clone)]
     struct Seen {
         bearer: Option<String>,
+        target: Option<String>,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     }
@@ -775,6 +886,7 @@ mod tests {
                         .header("authorization")
                         .and_then(|v| v.strip_prefix("Bearer "))
                         .map(String::from),
+                    target: Some(request.target.clone()),
                     headers: request.headers.clone(),
                     body: request.body.clone(),
                 });
@@ -797,6 +909,7 @@ mod tests {
     struct Pool {
         grants: Vec<Grant>,
         asked_to_avoid: RefCell<Vec<Vec<String>>>,
+        asked_for: RefCell<Vec<Provider>>,
         marked_stale: RefCell<Vec<String>>,
         /// What a stale report on each account is answered with, when anything.
         renewed: Vec<Grant>,
@@ -806,21 +919,28 @@ mod tests {
 
     fn grant(slug: &str) -> Grant {
         Grant {
+            provider: Provider::Claude,
             slug: slug.into(),
             email: format!("{slug}@example.com"),
             token: format!("tok-{slug}"),
+            account_id: None,
         }
     }
 
+    fn codex_grant(slug: &str) -> Grant {
+        Grant { provider: Provider::Codex, account_id: Some(format!("acct-{slug}")), ..grant(slug) }
+    }
+
     impl Accounts for Pool {
-        fn grant(&self, avoid: &[String]) -> Result<Grant, String> {
+        fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String> {
             self.asked_to_avoid.borrow_mut().push(avoid.to_vec());
+            self.asked_for.borrow_mut().push(provider);
             if let (false, Some(why)) = (avoid.is_empty(), &self.broken) {
                 return Err(why.clone());
             }
             self.grants
                 .iter()
-                .find(|g| !avoid.contains(&g.slug))
+                .find(|g| g.provider == provider && !avoid.contains(&g.slug))
                 .cloned()
                 .ok_or_else(|| "every account is spent".to_string())
         }
@@ -836,6 +956,92 @@ mod tests {
             "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\n\
              anthropic-beta: oauth-2025-04-20\r\nContent-Length: 9\r\n\r\n{{\"m\":\"x\"}}"
         ))
+    }
+
+    /// What pi's Codex provider sends: its own account id header, read out
+    /// of the key it was given.
+    fn codex_post(path: &str, key: &str) -> Request {
+        request(&format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\n\
+             chatgpt-account-id: ccs\r\noriginator: pi\r\nContent-Length: 9\r\n\r\n{{\"m\":\"x\"}}"
+        ))
+    }
+
+    // ── the codex route ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_backend_api_request_goes_out_as_the_codex_account_with_its_own_account_id() {
+        let (up, seen) = upstream(vec![(200, r#"{"id":"ok"}"#)]);
+        let pool = Pool { grants: vec![grant("work"), codex_grant("gpt")], ..Default::default() };
+
+        let (status, body) =
+            answered(&codex_post("/backend-api/codex/responses", CODEX_KEY), &up, &pool);
+
+        assert_eq!((status, body.as_str()), (200, r#"{"id":"ok"}"#));
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].bearer.as_deref(), Some("tok-gpt"));
+        assert_eq!(seen[0].target.as_deref(), Some("/codex/responses"));
+        let account = seen[0]
+            .headers
+            .iter()
+            .find(|(n, _)| n == "chatgpt-account-id")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(account, Some("acct-gpt"));
+        assert!(seen[0].headers.contains(&("originator".into(), "pi".into())));
+        assert_eq!(*pool.asked_for.borrow(), vec![Provider::Codex]);
+    }
+
+    #[test]
+    fn each_route_takes_only_its_own_key() {
+        let (up, seen) = upstream(vec![]);
+        let pool = Pool { grants: vec![grant("work"), codex_grant("gpt")], ..Default::default() };
+
+        let (status, _) = answered(&codex_post("/backend-api/codex/responses", KEY), &up, &pool);
+        assert_eq!(status, 401);
+        let (status, _) = answered(&post("/v1/messages", CODEX_KEY), &up, &pool);
+        assert_eq!(status, 401);
+        assert!(seen.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn a_websocket_upgrade_is_refused_so_the_client_falls_back_to_events() {
+        let (up, seen) = upstream(vec![]);
+        let pool = Pool { grants: vec![codex_grant("gpt")], ..Default::default() };
+        let upgrade = request(&format!(
+            "GET /backend-api/codex/responses HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {CODEX_KEY}\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: x\r\n\r\n"
+        ));
+
+        let (status, _) = answered(&upgrade, &up, &pool);
+
+        assert_eq!(status, 426);
+        assert!(seen.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn a_minted_codex_key_is_a_token_pi_reads_an_account_id_from() {
+        let key = generate_codex_key();
+        let parts: Vec<&str> = key.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let payload = crate::codex::claims_of(&key).expect("claims");
+        assert_eq!(payload["https://api.openai.com/auth"]["chatgpt_account_id"], "ccs");
+        assert_eq!(payload["ccs"].as_str().map(str::len), Some(32));
+        assert_ne!(key, generate_codex_key());
+    }
+
+    #[test]
+    fn the_codex_key_is_minted_once_and_a_broken_one_replaced() {
+        let root = std::env::temp_dir().join(format!("ccs-serve-codexkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+
+        let first = codex_key(&root).expect("mints");
+        assert_eq!(codex_key(&root).expect("reads back"), first);
+        std::fs::write(root.join("codex.key"), "garbage\n").expect("write");
+        let again = codex_key(&root).expect("re-mints");
+        assert_ne!(again, "garbage");
+        assert!(crate::codex::claims_of(&again).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Status and unchunked body of a response as written to a client.
@@ -862,13 +1068,16 @@ mod tests {
         (status, body)
     }
 
+    /// Both providers relayed to the one fake, which is what a test of the
+    /// wire needs; which of the two was meant is in the request.
     fn answered_fully(
         request: &Request,
         upstream: &Upstream,
         pool: &Pool,
     ) -> (u16, String, Outcome) {
+        let upstreams = Upstreams { claude: upstream, codex: upstream };
         let mut out = Vec::new();
-        let outcome = answer(request, KEY, upstream, pool, &mut out).expect("answers");
+        let outcome = answer(request, &keys(), &upstreams, pool, &mut out).expect("answers");
         let (status, body) = parse_response(&out);
         (status, body, outcome)
     }
@@ -1010,7 +1219,8 @@ mod tests {
         ));
 
         let mut out = Vec::new();
-        answer(&head, KEY, &up, &pool, &mut out).expect("answers");
+        let upstreams = Upstreams { claude: &up, codex: &up };
+        answer(&head, &keys(), &upstreams, &pool, &mut out).expect("answers");
 
         let text = String::from_utf8(out).expect("ascii");
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
@@ -1024,7 +1234,8 @@ mod tests {
         let pool = Pool { grants: vec![grant("work")], ..Default::default() };
 
         let mut out = Vec::new();
-        answer(&post("/v1/messages", KEY), KEY, &up, &pool, &mut out).expect("answers");
+        let upstreams = Upstreams { claude: &up, codex: &up };
+        answer(&post("/v1/messages", KEY), &keys(), &upstreams, &pool, &mut out).expect("answers");
 
         let text = String::from_utf8(out).expect("ascii");
         assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"), "{text}");
@@ -1069,5 +1280,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&snippet).expect("json");
         assert_eq!(parsed["providers"]["anthropic"]["baseUrl"], "http://127.0.0.1:4141");
         assert_eq!(parsed["providers"]["anthropic"]["apiKey"], "!ccs serve --key");
+        assert_eq!(
+            parsed["providers"]["openai-codex"]["baseUrl"],
+            "http://127.0.0.1:4141/backend-api"
+        );
+        assert_eq!(parsed["providers"]["openai-codex"]["apiKey"], "!ccs serve --key codex");
     }
 }

@@ -90,7 +90,7 @@ fn run() -> Result<()> {
             cmd::watch(&ctx, std::time::Duration::from_secs(every), high, &rotate)
         }
         Cmd::Serve { port, rotate } => cmd::serve(&ctx, port, &rotate),
-        Cmd::ServeKey => cmd::serve_key(&ctx),
+        Cmd::ServeKey { provider } => cmd::serve_key(&ctx, provider),
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
     }
 }

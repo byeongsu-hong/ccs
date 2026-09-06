@@ -224,6 +224,11 @@ fn expiry(token: &str) -> Option<i64> {
     claims(token).ok()?.get("exp")?.as_i64().map(|s| s * 1000)
 }
 
+/// A JWT's payload, unverified, for whoever needs to read a claim.
+pub fn claims_of(token: &str) -> Result<Value> {
+    claims(token)
+}
+
 /// A JWT's payload, unverified: the server that minted it is the one that
 /// checks it, and what is read here is the account's own name for itself.
 fn claims(token: &str) -> Result<Value> {
@@ -232,9 +237,7 @@ fn claims(token: &str) -> Result<Value> {
     serde_json::from_slice(&bytes).context("the token's payload is not JSON")
 }
 
-/// Base64url without padding, as JWTs are spelled. Only tests mint tokens;
-/// the tool itself only ever reads them.
-#[cfg(test)]
+/// Base64url without padding, as JWTs are spelled.
 pub fn base64url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

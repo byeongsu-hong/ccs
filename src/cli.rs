@@ -2,6 +2,8 @@
 
 use anyhow::{Result, bail};
 
+use crate::model::Provider;
+
 pub const HELP: &str = "\
 ccs - Claude Code account switcher
 
@@ -37,7 +39,8 @@ USAGE
                              to paste into pi. With --rotate, a request the
                              account in use is too limited to answer is sent
                              again as the next pooled account
-    ccs serve --key          print the key a client presents to the gateway
+    ccs serve --key [codex]  print the key a client presents to the gateway,
+                             for Claude or for Codex
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
@@ -106,7 +109,9 @@ pub enum Cmd {
         port: u16,
         rotate: Vec<String>,
     },
-    ServeKey,
+    ServeKey {
+        provider: Provider,
+    },
     Help,
     Version,
 }
@@ -153,7 +158,13 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "serve" | "gateway" => {
             let rest = &args[1..];
             if has(rest, "--key") {
-                return Ok(Cmd::ServeKey);
+                let provider = match value(rest, "--key") {
+                    Some(named) if !named.starts_with('-') => {
+                        named.parse().map_err(anyhow::Error::msg)?
+                    }
+                    _ => Provider::Claude,
+                };
+                return Ok(Cmd::ServeKey { provider });
             }
             let port = match value(rest, "--port") {
                 None => 4141,
@@ -397,8 +408,19 @@ mod tests {
     }
 
     #[test]
-    fn serve_key_only_prints_the_key() {
-        assert!(matches!(parsed(&["serve", "--key"]), Cmd::ServeKey));
+    fn serve_key_only_prints_the_key_of_the_provider_named() {
+        assert!(matches!(
+            parsed(&["serve", "--key"]),
+            Cmd::ServeKey { provider: Provider::Claude }
+        ));
+        assert!(matches!(
+            parsed(&["serve", "--key", "codex"]),
+            Cmd::ServeKey { provider: Provider::Codex }
+        ));
+        assert!(
+            parse(["serve".to_string(), "--key".to_string(), "gemini".to_string()].into_iter())
+                .is_err()
+        );
     }
 
     #[test]

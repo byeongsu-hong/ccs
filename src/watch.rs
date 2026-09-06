@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 
-use crate::model::Limit;
+use crate::model::{Limit, Provider};
 use crate::render::{Entry, until};
 
 /// The notices a session can subscribe to. `switch` is raised by `ccs use`;
@@ -126,14 +126,35 @@ fn diff_at(before: &Snapshot, entries: &[Entry], high: f64, now: i64) -> Vec<Eve
 /// A switch is only made to an account `HYSTERESIS` points clear of the mark,
 /// so a rolling window that has just dipped under it does not pull the active
 /// account straight back.
-pub fn rotate<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Option<&'a Entry> {
-    let active = entries.iter().find(|e| e.active)?;
+#[cfg(test)]
+fn rotate<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Option<&'a Entry> {
+    rotate_within(entries, Provider::Claude, pool, high)
+}
+
+/// Every switch worth making: one per provider at most, each decided among
+/// that provider's rows alone, since each has an account in use of its own.
+pub fn rotations<'a>(entries: &'a [Entry], pool: &[String], high: f64) -> Vec<&'a Entry> {
+    Provider::ALL.iter().filter_map(|p| rotate_within(entries, *p, pool, high)).collect()
+}
+
+fn rotate_within<'a>(
+    entries: &'a [Entry],
+    provider: Provider,
+    pool: &[String],
+    high: f64,
+) -> Option<&'a Entry> {
+    let active = entries.iter().find(|e| e.active && e.provider == provider)?;
     if active.limits.is_err() || !pool.contains(&active.slug) || has_room(active, high) {
         return None;
     }
     entries
         .iter()
-        .filter(|e| !e.active && pool.contains(&e.slug) && has_room(e, high - HYSTERESIS))
+        .filter(|e| {
+            e.provider == provider
+                && !e.active
+                && pool.contains(&e.slug)
+                && has_room(e, high - HYSTERESIS)
+        })
         .min_by(|a, b| {
             let key = |e: &Entry| {
                 (
@@ -199,6 +220,7 @@ mod tests {
             scope: None,
         };
         Entry {
+            provider: Provider::Claude,
             slug: slug.into(),
             email: format!("{slug}@x"),
             plan: "max".into(),

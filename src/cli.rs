@@ -14,6 +14,8 @@ USAGE
     ccs add                  log in to another account and stash it, without
                              disturbing the account in use
     ccs add --current        stash the account that is logged in right now
+    ccs add --codex          the same two, for a Codex (ChatGPT) account: log
+                             in to another, or stash the one `codex` is using
     ccs rm <account>         forget a stashed account
     ccs status               limits for the account currently in use
     ccs notify [<kind>...]   from inside a Claude Code session: have notices
@@ -51,6 +53,7 @@ OPTIONS
         --email <address>    pre-fill the login page (add)
         --console            log in with Console billing, not a subscription (add)
         --sso                force the SSO login flow (add)
+        --codex              a Codex account rather than a Claude one (add)
         --every <seconds>    poll interval (watch; default 300)
         --high <percent>     session percentage that counts as high (watch; default 90)
         --rotate <a>,<b>,... accounts to rotate between (watch) or fall over
@@ -63,15 +66,46 @@ OPTIONS
 #[derive(Debug, Clone)]
 pub enum Cmd {
     Pick,
-    List { json: bool, cached: bool },
-    Use { target: String, force: bool },
-    Add { name: Option<String>, current: bool, email: Option<String>, console: bool, sso: bool },
-    Pin { target: Option<String>, args: Vec<String> },
-    Remove { target: String },
-    Status { json: bool },
-    Notify { off: bool, kinds: Vec<String>, bypass: bool },
-    Watch { every: u64, high: f64, rotate: Vec<String> },
-    Serve { port: u16, rotate: Vec<String> },
+    List {
+        json: bool,
+        cached: bool,
+    },
+    Use {
+        target: String,
+        force: bool,
+    },
+    Add {
+        name: Option<String>,
+        current: bool,
+        email: Option<String>,
+        console: bool,
+        sso: bool,
+        codex: bool,
+    },
+    Pin {
+        target: Option<String>,
+        args: Vec<String>,
+    },
+    Remove {
+        target: String,
+    },
+    Status {
+        json: bool,
+    },
+    Notify {
+        off: bool,
+        kinds: Vec<String>,
+        bypass: bool,
+    },
+    Watch {
+        every: u64,
+        high: f64,
+        rotate: Vec<String>,
+    },
+    Serve {
+        port: u16,
+        rotate: Vec<String>,
+    },
     ServeKey,
     Help,
     Version,
@@ -145,6 +179,7 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
                 email: value(rest, "--email"),
                 console: has(rest, "--console"),
                 sso: has(rest, "--sso"),
+                codex: has(rest, "--codex"),
             })
         }
         "pin" | "confine" => {

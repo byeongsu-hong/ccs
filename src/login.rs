@@ -90,6 +90,30 @@ pub fn run(backend: Backend, root: &Path, binary: &str, options: &Options) -> Re
     Ok(file.oauth)
 }
 
+/// Run an interactive Codex login in a throwaway home and hand back what it
+/// minted. Codex keeps everything under `CODEX_HOME`, so the login in use is
+/// never touched.
+pub fn run_codex(root: &Path, binary: &str) -> Result<Oauth> {
+    sweep(Backend::File, root);
+    let scratch = Scratch::new(Backend::File, root)?;
+
+    let status =
+        Command::new(binary).arg("login").env("CODEX_HOME", &scratch.path).status().with_context(
+            || format!("running `{binary} login`; set CCS_CODEX_BINARY if it is not on PATH"),
+        )?;
+    if !status.success() {
+        bail!("`{binary} login` did not complete; nothing was stashed");
+    }
+    let store = crate::codex::Store::at(&scratch.path, Some(&scratch.path));
+    let Some(file) = crate::codex::Creds::read(&store)? else {
+        bail!("the login finished but left no credentials behind; nothing was stashed");
+    };
+    let Some(oauth) = file.oauth() else {
+        bail!("the login was with an API key, not a ChatGPT account; nothing was stashed");
+    };
+    Ok(oauth)
+}
+
 /// Remove throwaway directories belonging to runs that are over. They can hold
 /// credentials, so they do not get to linger.
 fn sweep(backend: Backend, root: &Path) {

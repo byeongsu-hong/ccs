@@ -14,6 +14,7 @@ use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::{Api, refreshed_oauth};
+use crate::codex;
 use crate::creds::{self, Backend, CredStore};
 use crate::lock;
 use crate::login;
@@ -36,10 +37,81 @@ pub struct Ctx<'a> {
     /// Where a poll's findings are left for readers that cannot make one.
     pub usage: &'a usage::Cache,
     pub api: &'a Api,
+    /// Codex's live slot and the client that speaks to its endpoints.
+    pub codex: &'a dyn codex::Creds,
+    pub codex_api: &'a codex::Client,
     /// The real configuration: where the stash lives and what pens are cut
     /// from. The same directory `creds` reads, unless this process is itself
     /// in a pen.
     pub home: &'a pen::Home,
+}
+
+impl Ctx<'_> {
+    fn apis(&self) -> Apis<'_> {
+        Apis { claude: self.api, codex: self.codex_api }
+    }
+}
+
+/// The clients each provider is spoken to with. Copyable so a probe can run
+/// on a thread of its own without the rest of the context going with it.
+#[derive(Clone, Copy)]
+struct Apis<'a> {
+    claude: &'a Api,
+    codex: &'a codex::Client,
+}
+
+/// Which stashed account each provider's live slot holds, when it is known.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Live {
+    claude: Option<String>,
+    codex: Option<String>,
+}
+
+impl Live {
+    fn of(&self, provider: Provider) -> Option<&str> {
+        match provider {
+            Provider::Claude => self.claude.as_deref(),
+            Provider::Codex => self.codex.as_deref(),
+        }
+    }
+
+    fn set(&mut self, provider: Provider, slug: Option<String>) {
+        match provider {
+            Provider::Claude => self.claude = slug,
+            Provider::Codex => self.codex = slug,
+        }
+    }
+
+    /// Whether `entry` is the account installed in its provider's slot.
+    fn holds(&self, entry: &Stashed) -> bool {
+        self.of(entry.account.provider) == Some(entry.slug.as_str())
+    }
+}
+
+/// What each provider's live slot holds right now, read off disk.
+struct Slots {
+    claude: Option<Oauth>,
+    codex: Option<Oauth>,
+}
+
+impl Slots {
+    fn of(&self, provider: Provider) -> Option<&Oauth> {
+        match provider {
+            Provider::Claude => self.claude.as_ref(),
+            Provider::Codex => self.codex.as_ref(),
+        }
+    }
+}
+
+fn slot(ctx: &Ctx, provider: Provider) -> Result<Option<Oauth>> {
+    Ok(match provider {
+        Provider::Claude => ctx.creds.read()?.map(|f| f.oauth),
+        Provider::Codex => ctx.codex.read()?.and_then(|f| f.oauth()),
+    })
+}
+
+fn slots(ctx: &Ctx) -> Result<Slots> {
+    Ok(Slots { claude: slot(ctx, Provider::Claude)?, codex: slot(ctx, Provider::Codex)? })
 }
 
 // ── probing ─────────────────────────────────────────────────────────────────
@@ -56,32 +128,48 @@ struct Probe {
 
 /// Ask one account for its limits, refreshing its access token first if the
 /// token is spent. Network only — persistence is the caller's job.
-fn probe(api: &Api, entry: &Stashed) -> Probe {
+fn probe(apis: Apis, entry: &Stashed) -> Probe {
     let slug = entry.slug.clone();
-    let refreshed = match freshen(api, &entry.account.oauth) {
+    let provider = entry.account.provider;
+    let refreshed = match freshen(apis, provider, &entry.account.oauth) {
         Ok(refreshed) => refreshed,
         Err(e) => return Probe { slug, refreshed: None, limits: Err(describe(&e)) },
     };
     let oauth = refreshed.as_ref().unwrap_or(&entry.account.oauth);
-    let limits = api.usage(&oauth.access_token).map(|u| u.limits).map_err(|e| describe(&e));
+    let limits = read_limits(apis, provider, oauth).map_err(|e| describe(&e));
     Probe { slug, refreshed, limits }
 }
 
-fn probe_all(api: &Api, accounts: &[Stashed]) -> Vec<Probe> {
+/// What an account has left, asked of its provider.
+fn read_limits(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<Vec<Limit>> {
+    match provider {
+        Provider::Claude => Ok(apis.claude.usage(&oauth.access_token)?.limits),
+        Provider::Codex => {
+            let account = oauth.account_id().context("a Codex login that names no account")?;
+            Ok(codex::limits(&apis.codex.usage(&oauth.access_token, account)?))
+        }
+    }
+}
+
+fn probe_all(apis: Apis, accounts: &[Stashed]) -> Vec<Probe> {
     thread::scope(|scope| {
         let running: Vec<_> =
-            accounts.iter().map(|entry| scope.spawn(move || probe(api, entry))).collect();
+            accounts.iter().map(|entry| scope.spawn(move || probe(apis, entry))).collect();
         running.into_iter().map(|h| h.join().expect("probe thread panicked")).collect()
     })
 }
 
 /// Give back a refreshed credential blob when the current one is spent.
-fn freshen(api: &Api, oauth: &Oauth) -> Result<Option<Oauth>> {
+fn freshen(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<Option<Oauth>> {
     if !oauth.needs_refresh() {
         return Ok(None);
     }
-    let next = api.refresh(&oauth.refresh_token, &oauth.scopes)?;
-    Ok(Some(refreshed_oauth(oauth, &next)))
+    Ok(Some(match provider {
+        Provider::Claude => {
+            refreshed_oauth(oauth, &apis.claude.refresh(&oauth.refresh_token, &oauth.scopes)?)
+        }
+        Provider::Codex => codex::refreshed(oauth, &apis.codex.refresh(&oauth.refresh_token)?),
+    }))
 }
 
 // ── credential copies ───────────────────────────────────────────────────────
@@ -96,25 +184,24 @@ fn freshen(api: &Api, oauth: &Oauth) -> Result<Option<Oauth>> {
 
 /// Every copy of one account's credentials there is to read.
 ///
-/// `installed` is the live credentials, and belongs here only when they are
-/// this account's.
-fn copies(ctx: &Ctx, entry: &Stashed, installed: Option<&CredsFile>) -> Result<Vec<Oauth>> {
+/// `installed` is what its provider's live slot holds, and belongs here only
+/// when that is this account. Pens are Claude Code's, so only a Claude
+/// account has one to read.
+fn copies(ctx: &Ctx, entry: &Stashed, installed: Option<&Oauth>) -> Result<Vec<Oauth>> {
     // Only where there is a pen to read: a pen that was never built holds no
     // copy, and asking after one costs a keychain lookup on the machines that
     // keep credentials there.
-    let pen_dir = pen::at(ctx.stash.root(), &entry.slug);
-    let pen = match pen_dir.is_dir() {
-        true => ctx.backend.confined(&pen_dir).read()?,
-        false => None,
+    let pen = match entry.account.provider {
+        Provider::Claude => {
+            let pen_dir = pen::at(ctx.stash.root(), &entry.slug);
+            match pen_dir.is_dir() {
+                true => ctx.backend.confined(&pen_dir).read()?.map(|file| file.oauth),
+                false => None,
+            }
+        }
+        Provider::Codex => None,
     };
-    Ok([
-        Some(entry.account.oauth.clone()),
-        installed.map(|file| file.oauth.clone()),
-        pen.map(|file| file.oauth),
-    ]
-    .into_iter()
-    .flatten()
-    .collect())
+    Ok([Some(entry.account.oauth.clone()), installed.cloned(), pen].into_iter().flatten().collect())
 }
 
 /// The most recently minted of some copies of one account's credentials.
@@ -133,18 +220,38 @@ fn newest(copies: impl IntoIterator<Item = Oauth>) -> Option<Oauth> {
 /// Updating `entry` in place is what stops a later step installing the copy
 /// that was read beforehand. A copy left on a superseded token buys nothing,
 /// and a session holding one is a session that has to log in again.
-fn propagate(ctx: &Ctx, entry: &mut Stashed, oauth: &Oauth, live: Option<&str>) -> Result<()> {
+fn propagate(ctx: &Ctx, entry: &mut Stashed, oauth: &Oauth, live: &Live) -> Result<()> {
     entry.account.oauth = oauth.clone();
     ctx.stash.save(&entry.slug, &entry.account)?;
 
-    if live == Some(entry.slug.as_str()) {
-        install(ctx.creds, oauth)?;
+    if live.holds(entry) {
+        install_live(ctx, entry.account.provider, oauth)?;
     }
-    let pen = pen::at(ctx.stash.root(), &entry.slug);
-    if pen.is_dir() {
-        install(ctx.backend.confined(&pen).as_ref(), oauth)?;
+    if entry.account.provider == Provider::Claude {
+        let pen = pen::at(ctx.stash.root(), &entry.slug);
+        if pen.is_dir() {
+            install(ctx.backend.confined(&pen).as_ref(), oauth)?;
+        }
     }
     Ok(())
+}
+
+/// Install `oauth` into its provider's live slot.
+fn install_live(ctx: &Ctx, provider: Provider, oauth: &Oauth) -> Result<()> {
+    match provider {
+        Provider::Claude => install(ctx.creds, oauth),
+        Provider::Codex => install_codex(ctx.codex, oauth),
+    }
+}
+
+/// Install `oauth` into Codex's login, keeping every other field the file
+/// has, under a lock of this tool's own in the same directory.
+fn install_codex(store: &dyn codex::Creds, oauth: &Oauth) -> Result<()> {
+    std::fs::create_dir_all(store.dir())
+        .with_context(|| format!("creating {}", store.dir().display()))?;
+    let _guard = lock::acquire(store.dir())?;
+    let current = store.read()?.unwrap_or_default();
+    store.write(&current.with(oauth))
 }
 
 /// Bring every copy of every account onto the newest credentials on disk for
@@ -153,10 +260,10 @@ fn propagate(ctx: &Ctx, entry: &mut Stashed, oauth: &Oauth, live: Option<&str>) 
 /// This is the standing repair for the copies this tool does not write: a
 /// session refreshing its own credentials leaves every other copy of that
 /// account behind, and nothing says so until one of them is used.
-fn reconcile(ctx: &Ctx, accounts: &mut [Stashed], live: Option<&str>) -> Result<()> {
-    let installed = ctx.creds.read()?;
+fn reconcile(ctx: &Ctx, accounts: &mut [Stashed], live: &Live) -> Result<()> {
+    let installed = slots(ctx)?;
     for entry in accounts.iter_mut() {
-        let mine = (live == Some(entry.slug.as_str())).then_some(installed.as_ref()).flatten();
+        let mine = live.holds(entry).then(|| installed.of(entry.account.provider)).flatten();
         let held = copies(ctx, entry, mine)?;
         let Some(newest) = newest(held.iter().cloned()) else { continue };
         if held.iter().all(|oauth| oauth.refresh_token == newest.refresh_token) {
@@ -168,12 +275,7 @@ fn reconcile(ctx: &Ctx, accounts: &mut [Stashed], live: Option<&str>) -> Result<
 }
 
 /// Write back every token a probe refreshed.
-fn persist(
-    ctx: &Ctx,
-    accounts: &mut [Stashed],
-    probes: &[Probe],
-    live: Option<&str>,
-) -> Result<()> {
+fn persist(ctx: &Ctx, accounts: &mut [Stashed], probes: &[Probe], live: &Live) -> Result<()> {
     for probe in probes {
         let Some(oauth) = &probe.refreshed else { continue };
         let Some(entry) = accounts.iter_mut().find(|a| a.slug == probe.slug) else { continue };
@@ -195,21 +297,29 @@ fn remember(ctx: &Ctx, probes: &[Probe]) -> Result<()> {
     Ok(())
 }
 
-/// Which stashed account the live credentials belong to.
+/// Which stashed account of `provider` its live slot holds.
 ///
 /// A token match is direct evidence and wins; the recorded pointer is the
 /// fallback for the moment right after a refresh rotated one copy.
-fn identify(ctx: &Ctx, accounts: &[Stashed], live: Option<&CredsFile>) -> Option<String> {
+fn identify(
+    ctx: &Ctx,
+    accounts: &[Stashed],
+    provider: Provider,
+    live: Option<&Oauth>,
+) -> Option<String> {
     let live = live?;
-    let matched = accounts.iter().find(|a| {
-        a.account.oauth.refresh_token == live.oauth.refresh_token
-            || a.account.oauth.access_token == live.oauth.access_token
+    let matched = accounts.iter().filter(|a| a.account.provider == provider).find(|a| {
+        a.account.oauth.refresh_token == live.refresh_token
+            || a.account.oauth.access_token == live.access_token
     });
     if let Some(entry) = matched {
         return Some(entry.slug.clone());
     }
-    let recorded = ctx.stash.active(Provider::Claude)?;
-    accounts.iter().any(|a| a.slug == recorded).then_some(recorded)
+    let recorded = ctx.stash.active(provider)?;
+    accounts
+        .iter()
+        .any(|a| a.slug == recorded && a.account.provider == provider)
+        .then_some(recorded)
 }
 
 /// Put `oauth` into a credentials file, keeping every unrelated field the
@@ -239,12 +349,30 @@ fn in_use(ctx: &Ctx, hint: &str) -> Result<(CredsFile, Oauth)> {
     let Some(file) = ctx.creds.read()? else {
         bail!("no credentials in {}; {hint}", ctx.creds.describe());
     };
-    let Some(oauth) = freshen(ctx.api, &file.oauth)? else {
+    let Some(oauth) = freshen(ctx.apis(), Provider::Claude, &file.oauth)? else {
         let oauth = file.oauth.clone();
         return Ok((file, oauth));
     };
     install(ctx.creds, &oauth)?;
     Ok((file, oauth))
+}
+
+/// Codex's login in use, with its freshest access token; a refresh here is
+/// mirrored back to the file Codex reads.
+fn codex_in_use(ctx: &Ctx, hint: &str) -> Result<Oauth> {
+    let Some(file) = ctx.codex.read()? else {
+        bail!("no Codex login in {}; {hint}", ctx.codex.describe());
+    };
+    let Some(oauth) = file.oauth() else {
+        bail!("the login in {} is an API key, not a ChatGPT account; {hint}", ctx.codex.describe());
+    };
+    match freshen(ctx.apis(), Provider::Codex, &oauth)? {
+        None => Ok(oauth),
+        Some(fresh) => {
+            install_codex(ctx.codex, &fresh)?;
+            Ok(fresh)
+        }
+    }
 }
 
 // ── commands ────────────────────────────────────────────────────────────────
@@ -300,6 +428,7 @@ fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
                 None => (Err("not polled yet; `ccs watch` polls".to_string()), None),
             };
             let entry = Entry {
+                provider: account.account.provider,
                 slug: account.slug.clone(),
                 email: account.account.email.clone(),
                 plan: account.account.plan_label(),
@@ -311,56 +440,106 @@ fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
         .collect()
 }
 
+/// The limits of every account in use: the one in Claude Code's slot, the
+/// one in Codex's, whichever are logged in.
 pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
     let style = Style::detect();
     warn_overridden();
-
-    let (file, oauth) = in_use(ctx, "run `claude` and sign in first")?;
     let accounts = ctx.stash.list()?;
-    let identified = identify(ctx, &accounts, Some(&file));
+    let mut entries = Vec::new();
 
-    let profile = ctx.api.profile(&oauth.access_token)?;
-    let limits = ctx.api.usage(&oauth.access_token)?.limits;
-    // An account nothing in the stash answers for has nowhere to be recorded;
-    // the reading is keyed by slug, and there is no slug to key it under.
-    if let Some(slug) = &identified {
-        ctx.usage.record(slug, &limits)?;
+    if ctx.creds.read()?.is_some() {
+        let (file, oauth) = in_use(ctx, "run `claude` and sign in first")?;
+        let identified = identify(ctx, &accounts, Provider::Claude, Some(&file.oauth));
+        let profile = ctx.api.profile(&oauth.access_token)?;
+        let limits = ctx.api.usage(&oauth.access_token)?.limits;
+        // An account nothing in the stash answers for has nowhere to be
+        // recorded; the reading is keyed by slug, and there is no slug.
+        if let Some(slug) = &identified {
+            ctx.usage.record(slug, &limits)?;
+        }
+        let organization = profile.organization.as_ref();
+        let plan = plan_label(
+            organization.and_then(|o| o.rate_limit_tier.as_deref()),
+            organization.and_then(|o| o.organization_type.as_deref()),
+        );
+        entries.push(Entry {
+            provider: Provider::Claude,
+            slug: identified.unwrap_or_default(),
+            email: profile.account.email,
+            plan,
+            active: true,
+            limits: Ok(limits),
+        });
     }
-    let organization = profile.organization.as_ref();
-    let plan = plan_label(
-        organization.and_then(|o| o.rate_limit_tier.as_deref()),
-        organization.and_then(|o| o.organization_type.as_deref()),
-    );
+    if ctx.codex.read()?.is_some_and(|f| f.oauth().is_some()) {
+        let oauth = codex_in_use(ctx, "run `codex login` first")?;
+        let identified = identify(ctx, &accounts, Provider::Codex, Some(&oauth));
+        let who = codex::identity(oauth.id_token().unwrap_or_default())?;
+        let limits = read_limits(ctx.apis(), Provider::Codex, &oauth)?;
+        if let Some(slug) = &identified {
+            ctx.usage.record(slug, &limits)?;
+        }
+        entries.push(Entry {
+            provider: Provider::Codex,
+            slug: identified.unwrap_or_default(),
+            email: who.email,
+            plan: format!("codex {}", who.plan),
+            active: true,
+            limits: Ok(limits),
+        });
+    }
+    if entries.is_empty() {
+        bail!("no credentials in {}; run `claude` and sign in first", ctx.creds.describe());
+    }
 
-    let entry = Entry {
-        slug: identified.unwrap_or_default(),
-        email: profile.account.email,
-        plan,
-        active: true,
-        limits: Ok(limits),
-    };
     if json {
-        println!("{}", serde_json::to_string_pretty(&view(&entry, None))?);
+        // One login is one object, as it always was; two are a list of them.
+        let views: Vec<View> = entries.iter().map(|e| view(e, None)).collect();
+        match views.as_slice() {
+            [one] => println!("{}", serde_json::to_string_pretty(one)?),
+            many => println!("{}", serde_json::to_string_pretty(many)?),
+        }
         return Ok(());
     }
-    println!("{}  {}", style.bold(&entry.email), style.dim(&entry.plan));
-    for line in render::detail(&entry, style) {
-        println!("{line}");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        println!("{}  {}", style.bold(&entry.email), style.dim(&entry.plan));
+        for line in render::detail(entry, style) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
 
 /// Stash an account. Two ways in: log in to another one without disturbing the
 /// account in use, or capture whichever account is in use right now.
-pub fn add(ctx: &Ctx, name: Option<&str>, current: bool, options: &login::Options) -> Result<()> {
-    let oauth = match current {
-        true => in_use(ctx, "sign in with `claude` before `ccs add --current`")?.1,
-        false => {
+pub fn add(
+    ctx: &Ctx,
+    provider: Provider,
+    name: Option<&str>,
+    current: bool,
+    options: &login::Options,
+) -> Result<()> {
+    let oauth = match (provider, current) {
+        (Provider::Claude, true) => {
+            in_use(ctx, "sign in with `claude` before `ccs add --current`")?.1
+        }
+        (Provider::Claude, false) => {
             println!("logging in to another account; the one in use is not affected");
             login::run(ctx.backend, ctx.stash.root(), &claude_binary(), options)?
         }
+        (Provider::Codex, true) => {
+            codex_in_use(ctx, "sign in with `codex login` before `ccs add --current --codex`")?
+        }
+        (Provider::Codex, false) => {
+            println!("logging in to another Codex account; the one in use is not affected");
+            login::run_codex(ctx.stash.root(), &codex_binary())?
+        }
     };
-    let recorded = record(ctx, oauth, name, Installed::from(current))?;
+    let recorded = record(ctx, provider, oauth, name, Installed::from(current))?;
     let verb = if recorded.replaced { "refreshed" } else { "stashed" };
     let (email, slug) = (&recorded.stashed.account.email, &recorded.stashed.slug);
 
@@ -405,25 +584,66 @@ fn claude_binary() -> String {
     std::env::var("CCS_CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string())
 }
 
+fn codex_binary() -> String {
+    std::env::var("CCS_CODEX_BINARY").unwrap_or_else(|_| "codex".to_string())
+}
+
 /// Ask who some credentials belong to, then write them into the stash.
-fn record(ctx: &Ctx, oauth: Oauth, name: Option<&str>, installed: Installed) -> Result<Recorded> {
-    let profile = ctx.api.profile(&oauth.access_token)?;
-    let slug = name.map(str::to_string).unwrap_or_else(|| stash::slugify(&profile.account.email));
-    let replaced = ctx.stash.list()?.iter().any(|s| s.slug == slug);
-    let organization = profile.organization.as_ref();
+///
+/// Claude is asked over the network; a Codex account names itself in its
+/// identity token. A slug already used by the other provider — the same
+/// email signed up twice — gets the provider's name in front.
+fn record(
+    ctx: &Ctx,
+    provider: Provider,
+    oauth: Oauth,
+    name: Option<&str>,
+    installed: Installed,
+) -> Result<Recorded> {
+    let (email, uuid, plan, rate_limit_tier) = match provider {
+        Provider::Claude => {
+            let profile = ctx.api.profile(&oauth.access_token)?;
+            let organization = profile.organization.as_ref();
+            (
+                profile.account.email.clone(),
+                profile.account.uuid.clone(),
+                organization.and_then(|o| o.organization_type.clone()),
+                organization.and_then(|o| o.rate_limit_tier.clone()),
+            )
+        }
+        Provider::Codex => {
+            let token = oauth.id_token().context("a Codex login without an identity token")?;
+            let who = codex::identity(token)?;
+            (who.email, who.account_id, Some(who.plan), None)
+        }
+    };
+    let held = ctx.stash.list()?;
+    let slug = match name {
+        Some(name) => name.to_string(),
+        None => {
+            let plain = stash::slugify(&email);
+            let taken_by_other =
+                held.iter().any(|s| s.slug == plain && s.account.provider != provider);
+            match taken_by_other {
+                true => format!("{provider}-{plain}"),
+                false => plain,
+            }
+        }
+    };
+    let replaced = held.iter().any(|s| s.slug == slug);
 
     let account = Account {
-        provider: Provider::Claude,
-        email: profile.account.email,
-        uuid: profile.account.uuid,
-        plan: organization.and_then(|o| o.organization_type.clone()),
-        rate_limit_tier: organization.and_then(|o| o.rate_limit_tier.clone()),
+        provider,
+        email,
+        uuid,
+        plan,
+        rate_limit_tier,
         added_at: Timestamp::now().to_string(),
         oauth,
     };
     ctx.stash.save(&slug, &account)?;
     if installed == Installed::Yes {
-        ctx.stash.set_active(account.provider, &slug)?;
+        ctx.stash.set_active(provider, &slug)?;
     }
     Ok(Recorded { stashed: Stashed { slug, account }, replaced })
 }
@@ -452,9 +672,9 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     let slug = stash::resolve(&accounts, needle)?.slug.clone();
 
     let live = identify_live(ctx, &accounts)?;
-    reconcile(ctx, &mut accounts, live.as_deref())?;
-    let probe = probe(ctx.api, stash::resolve(&accounts, &slug)?);
-    persist(ctx, &mut accounts, std::slice::from_ref(&probe), live.as_deref())?;
+    reconcile(ctx, &mut accounts, &live)?;
+    let probe = probe(ctx.apis(), stash::resolve(&accounts, &slug)?);
+    persist(ctx, &mut accounts, std::slice::from_ref(&probe), &live)?;
     remember(ctx, std::slice::from_ref(&probe))?;
 
     // Read after the probe has been folded back in, never before it: the probe
@@ -500,7 +720,7 @@ pub fn watch(ctx: &Ctx, every: Duration, high: f64, rotate: &[String]) -> Result
                     println!("{} {}: {}{}", stamp(), event.kind, event.text, heard(told));
                 }
                 before = watch::snapshot(table.entries());
-                if let Some(next) = watch::rotate(table.entries(), &pool, high) {
+                for next in watch::rotations(table.entries(), &pool, high) {
                     match stash::resolve(&accounts, &next.slug).cloned() {
                         Ok(target) => match switch_to(ctx, &mut accounts, &target) {
                             Ok(told) => println!(
@@ -576,16 +796,19 @@ impl Desk<'_> {
     /// Which stashed account is in use. The recorded pointer is what every
     /// switch writes, and is cheap; the live credentials are read only when
     /// it points nowhere.
-    fn live(&self, accounts: &[Stashed]) -> Result<Option<String>> {
-        let recorded = self
-            .ctx
-            .stash
-            .active(Provider::Claude)
-            .filter(|s| accounts.iter().any(|a| a.slug == *s));
-        match recorded {
-            Some(slug) => Ok(Some(slug)),
-            None => identify_live(self.ctx, accounts),
+    fn live(&self, accounts: &[Stashed]) -> Result<Live> {
+        let mut live = Live::default();
+        for provider in Provider::ALL {
+            let recorded = self.ctx.stash.active(provider).filter(|s| {
+                accounts.iter().any(|a| a.slug == *s && a.account.provider == provider)
+            });
+            let slug = match recorded {
+                Some(slug) => Some(slug),
+                None => identify(self.ctx, accounts, provider, slot(self.ctx, provider)?.as_ref()),
+            };
+            live.set(provider, slug);
         }
+        Ok(live)
     }
 
     /// The account a request goes out as: the one in use, unless it is among
@@ -616,13 +839,14 @@ impl Desk<'_> {
     /// that presented the same refresh token a moment earlier: the copies
     /// are levelled once more, and only a copy that is still spent is a
     /// failure.
-    fn hand_out(&self, slug: &str, accounts: &mut [Stashed], live: Option<&str>) -> Result<Grant> {
+    fn hand_out(&self, slug: &str, accounts: &mut [Stashed], live: &Live) -> Result<Grant> {
         let position = accounts.iter().position(|a| a.slug == slug).context("no such account")?;
         if !accounts[position].account.oauth.needs_refresh() {
             return Ok(grant_of(&accounts[position]));
         }
         reconcile(self.ctx, accounts, live)?;
-        let refreshed = freshen(self.ctx.api, &accounts[position].account.oauth);
+        let provider = accounts[position].account.provider;
+        let refreshed = freshen(self.ctx.apis(), provider, &accounts[position].account.oauth);
         match refreshed {
             Ok(Some(oauth)) => propagate(self.ctx, &mut accounts[position], &oauth, live)?,
             Ok(None) => {}
@@ -650,8 +874,8 @@ impl serve::Accounts for Desk<'_> {
         let granted = || -> Result<Grant> {
             let mut accounts = self.ctx.stash.list()?;
             let live = self.live(&accounts)?;
-            let slug = self.choose(&accounts, live.as_deref(), avoid)?;
-            self.hand_out(&slug, &mut accounts, live.as_deref())
+            let slug = self.choose(&accounts, live.of(Provider::Claude), avoid)?;
+            self.hand_out(&slug, &mut accounts, &live)
         };
         granted().map_err(|e| describe(&e))
     }
@@ -660,7 +884,7 @@ impl serve::Accounts for Desk<'_> {
         let renewed = || -> Result<Option<Grant>> {
             let mut accounts = self.ctx.stash.list()?;
             let live = self.live(&accounts)?;
-            reconcile(self.ctx, &mut accounts, live.as_deref())?;
+            reconcile(self.ctx, &mut accounts, &live)?;
             let entry =
                 accounts.iter().find(|a| a.slug == grant.slug).context("no such account")?;
             Ok((entry.account.oauth.access_token != grant.token).then(|| grant_of(entry)))
@@ -684,7 +908,7 @@ pub fn pick(ctx: &Ctx) -> Result<()> {
 pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
     let mut accounts = stashed(ctx)?;
     let live = identify_live(ctx, &accounts)?;
-    reconcile(ctx, &mut accounts, live.as_deref())?;
+    reconcile(ctx, &mut accounts, &live)?;
 
     // Named outright, the account is taken at its word and the session starts
     // without a round trip; the picker is where usage is shopped for.
@@ -695,8 +919,15 @@ pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
             chosen
         }
     };
+    if target.account.provider != Provider::Claude {
+        bail!(
+            "{} is a {} account; a pin is a Claude Code session",
+            target.account.email,
+            target.account.provider
+        );
+    }
 
-    let pen = pen_for(ctx, &target, live.as_deref())?;
+    let pen = pen_for(ctx, &target, &live)?;
     warn_overridden();
     println!("{} is pinned to this session only", target.account.email);
     pen::launch(&pen, &claude_binary(), args)
@@ -707,12 +938,12 @@ pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
 /// The pen is built before the credentials are settled so that folding them out
 /// finds it, which is what leaves the pen and every other copy of the account on
 /// the one token a refresh here has not spent.
-fn pen_for(ctx: &Ctx, target: &Stashed, live: Option<&str>) -> Result<PathBuf> {
+fn pen_for(ctx: &Ctx, target: &Stashed, live: &Live) -> Result<PathBuf> {
     let pen = pen::prepare(ctx.home, ctx.stash.root(), &target.slug)?;
 
     let mut entry = target.clone();
-    let oauth =
-        freshen(ctx.api, &entry.account.oauth)?.unwrap_or_else(|| entry.account.oauth.clone());
+    let oauth = freshen(ctx.apis(), Provider::Claude, &entry.account.oauth)?
+        .unwrap_or_else(|| entry.account.oauth.clone());
     propagate(ctx, &mut entry, &oauth, live)?;
     Ok(pen)
 }
@@ -767,7 +998,7 @@ impl picker::Accounts for Deck<'_, '_> {
             return Ok(Act::Handed);
         }
         let live = identify_live(self.ctx, self.accounts)?;
-        reconcile(self.ctx, self.accounts, live.as_deref())?;
+        reconcile(self.ctx, self.accounts, &live)?;
 
         let target = stash::resolve(self.accounts, slug)?.clone();
         let told = switch_to(self.ctx, self.accounts, &target)?;
@@ -814,26 +1045,29 @@ fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
 
 /// Probe every account, write back anything that got refreshed, and lay the
 /// results out as a table.
-fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, Option<String>)> {
+fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, Live)> {
     let live = identify_live(ctx, accounts)?;
-    reconcile(ctx, accounts, live.as_deref())?;
-    let probes = probe_all(ctx.api, accounts);
-    persist(ctx, accounts, &probes, live.as_deref())?;
+    reconcile(ctx, accounts, &live)?;
+    let probes = probe_all(ctx.apis(), accounts);
+    persist(ctx, accounts, &probes, &live)?;
     remember(ctx, &probes)?;
 
     let entries = accounts
         .iter()
         .zip(&probes)
-        .map(|(account, probe)| {
-            entry_of(account, probe, live.as_deref() == Some(account.slug.as_str()))
-        })
+        .map(|(account, probe)| entry_of(account, probe, live.holds(account)))
         .collect();
     Ok((Table::build(entries, style), live))
 }
 
-fn identify_live(ctx: &Ctx, accounts: &[Stashed]) -> Result<Option<String>> {
-    let live = ctx.creds.read()?;
-    Ok(identify(ctx, accounts, live.as_ref()))
+/// Which stashed account each provider's live slot holds.
+fn identify_live(ctx: &Ctx, accounts: &[Stashed]) -> Result<Live> {
+    let installed = slots(ctx)?;
+    let mut live = Live::default();
+    for provider in Provider::ALL {
+        live.set(provider, identify(ctx, accounts, provider, installed.of(provider)));
+    }
+    Ok(live)
 }
 
 /// Install `target` as the live credentials.
@@ -843,10 +1077,13 @@ fn identify_live(ctx: &Ctx, accounts: &[Stashed]) -> Result<Option<String>> {
 /// account is used. Capturing it on the way out is what keeps a stashed account
 /// usable without a fresh login.
 fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<usize> {
+    if target.account.provider == Provider::Codex {
+        return switch_codex(ctx, accounts, target);
+    }
     let _guard = lock::acquire(ctx.creds.dir())?;
     let live = ctx.creds.read()?;
     if let Some(live) = &live {
-        capture_outgoing(ctx, accounts, live, &target.slug)?;
+        capture_outgoing(ctx, accounts, Provider::Claude, &live.oauth, &target.slug)?;
     }
     ctx.creds.write(&merged(live, &target.account.oauth))?;
     ctx.stash.set_active(target.account.provider, &target.slug)?;
@@ -882,6 +1119,21 @@ fn heard(told: usize) -> String {
     }
 }
 
+/// Install `target` as Codex's login. Codex CLI reloads the file when it
+/// changes, so running sessions follow; there is no inbox to tell.
+fn switch_codex(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<usize> {
+    std::fs::create_dir_all(ctx.codex.dir())
+        .with_context(|| format!("creating {}", ctx.codex.dir().display()))?;
+    let _guard = lock::acquire(ctx.codex.dir())?;
+    let current = ctx.codex.read()?;
+    if let Some(live) = current.as_ref().and_then(|f| f.oauth()) {
+        capture_outgoing(ctx, accounts, Provider::Codex, &live, &target.slug)?;
+    }
+    ctx.codex.write(&current.unwrap_or_default().with(&target.account.oauth))?;
+    ctx.stash.set_active(Provider::Codex, &target.slug)?;
+    Ok(0)
+}
+
 /// Fold the outgoing account's live credentials into its stash entry.
 ///
 /// The stash is the only copy written here, and that is enough: every copy of
@@ -896,15 +1148,16 @@ fn heard(told: usize) -> String {
 fn capture_outgoing(
     ctx: &Ctx,
     accounts: &mut [Stashed],
-    live: &CredsFile,
+    provider: Provider,
+    live: &Oauth,
     incoming: &str,
 ) -> Result<()> {
-    let Some(slug) = identify(ctx, accounts, Some(live)) else { return Ok(()) };
+    let Some(slug) = identify(ctx, accounts, provider, Some(live)) else { return Ok(()) };
     if slug == incoming {
         return Ok(());
     }
     let Some(entry) = accounts.iter_mut().find(|a| a.slug == slug) else { return Ok(()) };
-    entry.account.oauth = live.oauth.clone();
+    entry.account.oauth = live.clone();
     ctx.stash.save(&slug, &entry.account)
 }
 
@@ -937,6 +1190,7 @@ fn confirm(question: &str) -> Result<bool> {
 
 #[derive(Serialize)]
 struct View<'a> {
+    provider: Provider,
     slug: &'a str,
     email: &'a str,
     plan: &'a str,
@@ -951,6 +1205,7 @@ struct View<'a> {
 
 fn view<'a>(entry: &'a Entry, polled_at: Option<&'a str>) -> View<'a> {
     View {
+        provider: entry.provider,
         slug: &entry.slug,
         email: &entry.email,
         plan: &entry.plan,
@@ -971,6 +1226,7 @@ fn emit_json(table: &Table) -> Result<()> {
 /// mapping happens, so the picker, the table and the switch guard all agree.
 fn entry_of(account: &Stashed, probe: &Probe, active: bool) -> Entry {
     Entry {
+        provider: account.account.provider,
         slug: account.slug.clone(),
         email: account.account.email.clone(),
         plan: account.account.plan_label(),
@@ -1032,11 +1288,66 @@ mod tests {
         }
     }
 
+    /// Codex's login held in memory, as `Recorder` holds Claude's.
+    struct CodexRecorder {
+        dir: PathBuf,
+        held: RefCell<Option<codex::AuthFile>>,
+    }
+
+    impl codex::Creds for CodexRecorder {
+        fn read(&self) -> Result<Option<codex::AuthFile>> {
+            Ok(self.held.borrow().clone())
+        }
+
+        fn write(&self, file: &codex::AuthFile) -> Result<()> {
+            *self.held.borrow_mut() = Some(file.clone());
+            Ok(())
+        }
+
+        fn dir(&self) -> &Path {
+            &self.dir
+        }
+
+        fn describe(&self) -> String {
+            "the codex recorder".into()
+        }
+    }
+
+    /// A Codex account's credentials: the pair, plus the identity token and
+    /// account id every Codex request carries.
+    fn codex_oauth(refresh_token: &str, expires_at: i64, email: &str) -> Oauth {
+        let mut oauth = oauth(refresh_token, expires_at);
+        let claims = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {"chatgpt_account_id": format!("acct-{email}"), "chatgpt_plan_type": "pro"}
+        });
+        let token = format!("h.{}.s", codex::base64url(claims.to_string().as_bytes()));
+        // Codex access tokens are JWTs, and the expiry is read off them.
+        let access = serde_json::json!({"exp": expires_at / 1000, "jti": refresh_token});
+        oauth.access_token = format!("h.{}.s", codex::base64url(access.to_string().as_bytes()));
+        oauth.extra.insert("idToken".into(), serde_json::Value::String(token));
+        oauth.extra.insert("accountId".into(), serde_json::Value::String(format!("acct-{email}")));
+        oauth
+    }
+
+    /// The live slots with a Claude account in the Claude one.
+    fn claude_live(slug: &str) -> Live {
+        Live { claude: Some(slug.to_string()), codex: None }
+    }
+
+    fn codex_stashed(slug: &str, oauth: Oauth) -> Stashed {
+        let mut entry = stashed(slug, oauth);
+        entry.account.provider = Provider::Codex;
+        entry
+    }
+
     /// A configuration directory with a stash in it, private to one test so
     /// concurrently running tests never share a path.
     struct Fixture {
         dir: PathBuf,
         creds: Recorder,
+        codex: CodexRecorder,
+        codex_api: codex::Client,
         stash: Stash,
         usage: usage::Cache,
         api: Api,
@@ -1053,6 +1364,8 @@ mod tests {
             let stash = Stash::open(&dir).expect("stash");
             Self {
                 creds: Recorder { dir: dir.clone(), held: RefCell::new(None) },
+                codex: CodexRecorder { dir: dir.join("codex"), held: RefCell::new(None) },
+                codex_api: codex::Client::new(),
                 usage: usage::Cache::open(stash.root()).expect("usage cache"),
                 stash,
                 api: Api::new(),
@@ -1071,8 +1384,15 @@ mod tests {
                 stash: &self.stash,
                 usage: &self.usage,
                 api: &self.api,
+                codex: &self.codex,
+                codex_api: &self.codex_api,
                 home: &self.home,
             }
+        }
+
+        /// The refresh token in Codex's live slot, if anything is there.
+        fn codex_live(&self) -> Option<String> {
+            self.codex.read().expect("read codex").and_then(|f| f.oauth()).map(|o| o.refresh_token)
         }
 
         /// Put credentials where a session confined to `slug` would keep them.
@@ -1141,7 +1461,7 @@ mod tests {
             refreshed: Some(oauth("rotated", 2)),
             limits: Ok(vec![]),
         }];
-        persist(&fixture.ctx(), &mut accounts, &probes, Some("work")).expect("persist");
+        persist(&fixture.ctx(), &mut accounts, &probes, &claude_live("work")).expect("persist");
 
         assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
         let (stashed, live, pen) = fixture.tokens("work");
@@ -1170,7 +1490,7 @@ mod tests {
         fixture.creds.write(&CredsFile::new(oauth("rotated", 2))).expect("live credentials");
 
         let mut accounts = vec![stashed("work", oauth("superseded", 1))];
-        reconcile(&fixture.ctx(), &mut accounts, Some("work")).expect("reconcile");
+        reconcile(&fixture.ctx(), &mut accounts, &claude_live("work")).expect("reconcile");
 
         assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
         assert_eq!(fixture.tokens("work").0, "rotated", "the stash");
@@ -1185,7 +1505,7 @@ mod tests {
         fixture.creds.write(&CredsFile::new(oauth("elsewhere", 5))).expect("live credentials");
 
         let mut accounts = vec![stashed("work", oauth("superseded", 1))];
-        reconcile(&fixture.ctx(), &mut accounts, Some("other")).expect("reconcile");
+        reconcile(&fixture.ctx(), &mut accounts, &claude_live("other")).expect("reconcile");
 
         assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
         let (stashed, live, _) = fixture.tokens("work");
@@ -1201,7 +1521,7 @@ mod tests {
         fixture.pin("work", &oauth("superseded", 1));
 
         let mut accounts = vec![stashed("work", oauth("rotated", 2))];
-        reconcile(&fixture.ctx(), &mut accounts, Some("work")).expect("reconcile");
+        reconcile(&fixture.ctx(), &mut accounts, &claude_live("work")).expect("reconcile");
 
         let (stashed, live, pen) = fixture.tokens("work");
         assert_eq!(stashed, "rotated", "the stash");
@@ -1215,7 +1535,7 @@ mod tests {
         fixture.pin("work", &oauth("current", 2));
 
         let mut accounts = vec![stashed("work", oauth("current", 2))];
-        reconcile(&fixture.ctx(), &mut accounts, Some("work")).expect("reconcile");
+        reconcile(&fixture.ctx(), &mut accounts, &claude_live("work")).expect("reconcile");
 
         assert!(
             fixture.creds.read().expect("read").is_none(),
@@ -1352,8 +1672,127 @@ mod tests {
         assert!(fixture.reading("gone").is_none());
     }
 
+    // ── a second provider ───────────────────────────────────────────────────
+
+    /// Codex has a live slot of its own; installing a Codex account fills it
+    /// and touches nothing of Claude's, pointers included.
+    #[test]
+    fn switching_to_a_codex_account_fills_codex_own_slot_and_leaves_claude_alone() {
+        let fixture = Fixture::new("codex-switch");
+        fixture.creds.write(&CredsFile::new(oauth("r-a", LATER))).expect("claude live");
+        let claude = stashed("a", oauth("r-a", LATER));
+        let gpt = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        fixture.stash.save("a", &claude.account).expect("save");
+        fixture.stash.save("g", &gpt.account).expect("save");
+        fixture.stash.set_active(Provider::Claude, "a").expect("active");
+        let mut accounts = fixture.stash.list().expect("list");
+
+        switch_to(&fixture.ctx(), &mut accounts, &gpt).expect("switches");
+
+        assert_eq!(fixture.codex_live().as_deref(), Some("r-g"));
+        let file = fixture.codex.read().expect("read").expect("a file");
+        assert_eq!(file.tokens.as_ref().map(|t| t.account_id.as_str()), Some("acct-g@x"));
+        assert_eq!(fixture.tokens("a").1.as_deref(), Some("r-a"));
+        assert_eq!(fixture.stash.active(Provider::Claude).as_deref(), Some("a"));
+        assert_eq!(fixture.stash.active(Provider::Codex).as_deref(), Some("g"));
+    }
+
+    /// Codex CLI refreshes the login it holds; the account being left has
+    /// its stash entry brought up to what the file held on the way out.
+    #[test]
+    fn switching_codex_captures_the_outgoing_login_into_its_stash_entry() {
+        let fixture = Fixture::new("codex-capture");
+        let h = codex_stashed("h", codex_oauth("r-h", LATER, "h@x"));
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        fixture.stash.save("h", &h.account).expect("save");
+        fixture.stash.save("g", &g.account).expect("save");
+        let live = codex::AuthFile::default().with(&codex_oauth("r-h-2", LATER + 1, "h@x"));
+        fixture.codex.write(&live).expect("codex live");
+        fixture.stash.set_active(Provider::Codex, "h").expect("active");
+        let mut accounts = fixture.stash.list().expect("list");
+
+        switch_to(&fixture.ctx(), &mut accounts, &g).expect("switches");
+
+        assert_eq!(fixture.tokens("h").0, "r-h-2");
+        assert_eq!(fixture.codex_live().as_deref(), Some("r-g"));
+    }
+
+    #[test]
+    fn reconciling_levels_a_codex_account_against_its_live_file() {
+        let fixture = Fixture::new("codex-reconcile");
+        let g = codex_stashed("g", codex_oauth("r-g", 1, "g@x"));
+        fixture.stash.save("g", &g.account).expect("save");
+        let live = codex::AuthFile::default().with(&codex_oauth("r-g-2", LATER, "g@x"));
+        fixture.codex.write(&live).expect("codex live");
+        // Every switch writes the pointer; a rotated token is what it is for.
+        fixture.stash.set_active(Provider::Codex, "g").expect("active");
+        let mut accounts = fixture.stash.list().expect("list");
+
+        let ctx = fixture.ctx();
+        let live = identify_live(&ctx, &accounts).expect("identifies");
+        assert_eq!(live.of(Provider::Codex), Some("g"));
+        assert_eq!(live.of(Provider::Claude), None);
+        reconcile(&ctx, &mut accounts, &live).expect("reconciles");
+
+        assert_eq!(fixture.tokens("g").0, "r-g-2");
+        assert_eq!(accounts[0].account.oauth.refresh_token, "r-g-2");
+    }
+
+    #[test]
+    fn a_codex_account_is_recorded_under_the_name_its_token_gives() {
+        let fixture = Fixture::new("codex-record");
+        let recorded = record(
+            &fixture.ctx(),
+            Provider::Codex,
+            codex_oauth("r-g", LATER, "you@x.com"),
+            None,
+            Installed::Yes,
+        )
+        .expect("records");
+
+        assert_eq!(recorded.stashed.slug, "you_at_x.com");
+        assert_eq!(recorded.stashed.account.provider, Provider::Codex);
+        assert_eq!(recorded.stashed.account.email, "you@x.com");
+        assert_eq!(recorded.stashed.account.uuid, "acct-you@x.com");
+        assert_eq!(recorded.stashed.account.plan_label(), "codex pro");
+        assert_eq!(fixture.stash.active(Provider::Codex).as_deref(), Some("you_at_x.com"));
+        assert_eq!(fixture.stash.active(Provider::Claude), None);
+    }
+
+    #[test]
+    fn a_pin_is_a_claude_code_session_and_says_so_for_a_codex_account() {
+        let fixture = Fixture::new("codex-pin");
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        fixture.stash.save("g", &g.account).expect("save");
+        let error = pin(&fixture.ctx(), Some("g"), &[]).unwrap_err().to_string();
+        assert!(error.contains("Claude Code"), "{error}");
+    }
+
+    #[test]
+    fn a_cached_listing_marks_the_account_in_use_of_each_provider() {
+        let fixture = Fixture::new("codex-cached");
+        let a = stashed("a", oauth("r-a", LATER));
+        let g = codex_stashed("g", codex_oauth("r-g", LATER, "g@x"));
+        fixture.stash.save("a", &a.account).expect("save");
+        fixture.stash.save("g", &g.account).expect("save");
+        fixture.stash.set_active(Provider::Claude, "a").expect("active");
+        fixture.stash.set_active(Provider::Codex, "g").expect("active");
+
+        let entries = cached_entries(&fixture.ctx()).expect("lists");
+        assert!(entries.iter().all(|e| e.entry.active));
+        assert_eq!(
+            entries.iter().find(|e| e.entry.slug == "g").map(|e| e.entry.provider),
+            Some(Provider::Codex)
+        );
+        assert_eq!(
+            entries.iter().find(|e| e.entry.slug == "g").map(|e| e.entry.plan.as_str()),
+            Some("codex ?")
+        );
+    }
+
     // ── the gateway's desk ──────────────────────────────────────────────────
 
+    use crate::codex::Creds as _;
     use crate::serve::Accounts as _;
 
     /// Far enough off that nothing here reaches for a refresh.

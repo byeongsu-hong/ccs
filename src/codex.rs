@@ -158,6 +158,7 @@ impl Store {
         Self { path: dir.join("auth.json"), dir }
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -231,6 +232,9 @@ fn claims(token: &str) -> Result<Value> {
     serde_json::from_slice(&bytes).context("the token's payload is not JSON")
 }
 
+/// Base64url without padding, as JWTs are spelled. Only tests mint tokens;
+/// the tool itself only ever reads them.
+#[cfg(test)]
 pub fn base64url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -277,10 +281,6 @@ fn base64url_decode(text: &str) -> Result<Vec<u8>> {
 /// What `wham/usage` reports. Only the parts that become limits are read.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Usage {
-    #[serde(default)]
-    pub email: Option<String>,
-    #[serde(default)]
-    pub plan_type: Option<String>,
     #[serde(default)]
     pub rate_limit: Option<RateLimit>,
     #[serde(default)]

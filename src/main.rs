@@ -10,6 +10,7 @@ mod notify;
 mod pen;
 mod picker;
 mod render;
+mod serve;
 mod sha256;
 mod stash;
 mod usage;
@@ -80,6 +81,8 @@ fn run() -> Result<()> {
         Cmd::Watch { every, high, rotate } => {
             cmd::watch(&ctx, std::time::Duration::from_secs(every), high, &rotate)
         }
+        Cmd::Serve { port, rotate } => cmd::serve(&ctx, port, &rotate),
+        Cmd::ServeKey => cmd::serve_key(&ctx),
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
     }
 }

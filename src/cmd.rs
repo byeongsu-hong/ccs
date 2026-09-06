@@ -417,8 +417,8 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
 }
 
 /// Subscribe (or unsubscribe) the calling Claude Code session to notices.
-pub fn notify(ctx: &Ctx, off: bool, kinds: &[String]) -> Result<()> {
-    notify::subscribe(ctx.stash.root(), !off, kinds)
+pub fn notify(ctx: &Ctx, off: bool, kinds: &[String], bypass: bool) -> Result<()> {
+    notify::subscribe(ctx.stash.root(), !off, kinds, bypass)
 }
 
 /// Poll every account on an interval and raise a notice for whatever changed.

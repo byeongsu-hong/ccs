@@ -40,8 +40,8 @@ its five-hour window), `session-reset` (an account's window came back, and
 whether its weekly resets sooner than the active one's) and `weekly-reset`.
 Name the kinds you want, or none for all of them; `ccs notify off` stops them.
 `ccs watch --every 300 --high 90` are the defaults. A session that bypasses
-permission prompts only accepts notices from its own process tree, so run
-`ccs watch` and `ccs use` from inside that session.
+permission prompts holds a notice for review unless the sender attests the
+same mode: subscribe from such a session with `ccs notify --bypass`.
 
 **Rotation.** `ccs watch --rotate agent,work,robin` also switches for you: when
 the account in use is one of those and its session has run high (or its weekly

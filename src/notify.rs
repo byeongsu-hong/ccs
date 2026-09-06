@@ -9,9 +9,12 @@
 //!
 //! The wire format is Claude Code's own peer messaging: one auth line, one
 //! user-message line, done. It is undocumented, so a mismatch after an upgrade
-//! costs only the notice, never the switch. A session that bypasses permission
-//! prompts holds a notice from a process outside its own tree for review, so
-//! `ccs use` is best run from the session that wants to hear about it.
+//! costs only the notice, never the switch.
+//!
+//! A session that bypasses permission prompts holds a notice for review unless
+//! the sender is in its own process tree or attests the same permission mode.
+//! A subscriber that runs that way says so with `--bypass`, and every notice
+//! to it carries the attestation; then `ccs watch` can run anywhere.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,6 +25,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::fsx::write_atomic;
@@ -31,11 +35,20 @@ const SOCKET_ENV: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
 const FILE: &str = "notify.json";
 const TIMEOUT: Duration = Duration::from_secs(1);
 
-type Subscribers = BTreeMap<String, Vec<String>>;
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Subscription {
+    kinds: Vec<String>,
+    /// The permission-mode class the session runs in, when it said: "bypass"
+    /// or "prompting". Attested on every notice so the inbox accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+}
+
+type Subscribers = BTreeMap<String, Subscription>;
 
 /// Add the calling session to the list, for `kinds` (every kind when empty),
-/// or drop it.
-pub fn subscribe(root: &Path, on: bool, kinds: &[String]) -> Result<()> {
+/// or drop it. `bypass` says the session runs without permission prompts.
+pub fn subscribe(root: &Path, on: bool, kinds: &[String], bypass: bool) -> Result<()> {
     if let Some(bad) = kinds.iter().find(|k| !KINDS.contains(&k.as_str())) {
         bail!("unknown notice kind {bad:?}; the kinds are {}", KINDS.join(", "));
     }
@@ -50,8 +63,9 @@ pub fn subscribe(root: &Path, on: bool, kinds: &[String]) -> Result<()> {
     if on {
         let kinds =
             if kinds.is_empty() { KINDS.map(String::from).to_vec() } else { kinds.to_vec() };
+        let mode = bypass.then(|| "bypass".to_string());
         println!("will notify {sock} of {}", kinds.join(", "));
-        subs.insert(sock, kinds);
+        subs.insert(sock, Subscription { kinds, mode });
     } else {
         println!("will no longer notify {sock}");
     }
@@ -63,18 +77,22 @@ pub fn subscribe(root: &Path, on: bool, kinds: &[String]) -> Result<()> {
 /// forgotten.
 pub fn broadcast(config: &Path, root: &Path, kind: &str, text: &str) -> usize {
     let mut subs = subscribers(root);
-    let wanted: Vec<String> =
-        subs.iter().filter(|(_, k)| k.iter().any(|k| k == kind)).map(|(s, _)| s.clone()).collect();
+    let wanted: Vec<(String, Option<String>)> = subs
+        .iter()
+        .filter(|(_, s)| s.kinds.iter().any(|k| k == kind))
+        .map(|(sock, s)| (sock.clone(), s.mode.clone()))
+        .collect();
     if wanted.is_empty() {
         return 0;
     }
     let sessions = config.join("sessions");
-    let body = format!(
-        "<claude-peer-message from-name=\"ccs\">\nccs {kind}: {text}\n</claude-peer-message>"
-    );
     let mut told = 0;
-    for sock in wanted {
-        if send(&sessions, &sock, &body).is_some() {
+    for (sock, mode) in wanted {
+        let attest = mode.as_deref().map(|m| format!(" from-mode=\"{m}\"")).unwrap_or_default();
+        let body = format!(
+            "<cross-session-message from-name=\"ccs\"{attest}>\nccs {kind}: {text}\n</cross-session-message>"
+        );
+        if send(&sessions, &sock, &body, mode.as_deref()).is_some() {
             told += 1;
         } else {
             subs.remove(&sock);
@@ -108,7 +126,7 @@ fn token(sessions: &Path, sock: &str) -> Option<String> {
     })
 }
 
-fn send(sessions: &Path, sock: &str, body: &str) -> Option<()> {
+fn send(sessions: &Path, sock: &str, body: &str, mode: Option<&str>) -> Option<()> {
     let token = token(sessions, sock)?;
     let mut s = UnixStream::connect(sock).ok()?;
     s.set_write_timeout(Some(TIMEOUT)).ok()?;
@@ -122,6 +140,7 @@ fn send(sessions: &Path, sock: &str, body: &str) -> Option<()> {
             "priority": "next",
             "from": "ccs",
             "msg_id": msg_id,
+            "from_mode": mode,
         })
     );
     s.write_all(lines.as_bytes()).ok()?;

@@ -59,6 +59,13 @@ account you have stashed and never logs in itself; `ccs use`, the picker and
 its own, a request the account in use is too limited to answer is quietly sent
 again as the next pooled account. See below.
 
+**Codex accounts too.** `ccs add --codex` stashes a ChatGPT login for Codex
+CLI the same way, and the table, picker, watcher, menu bar app and gateway
+take it from there: what each Codex account has left, a click to switch
+`~/.codex/auth.json`, rotation among Codex accounts, and pi or Aside's
+`openai-codex` provider served through the gateway. Codex's login and Claude
+Code's are two slots, each with its own account in use.
+
 **Pinning.** One session on one account, every other session left where it is.
 This is the feature that changes how you work — see below.
 
@@ -103,6 +110,26 @@ than a subscription), or `--sso`. Stash under a name of your choosing with
 
 After that you are done logging in. `ccs use` moves between stashed accounts
 directly.
+
+## Codex accounts
+
+```sh
+ccs add --current --codex   # stash the account `codex` is logged in as
+ccs add --codex             # log in to another, in a throwaway CODEX_HOME
+```
+
+A Codex account sits in the same table with `codex` in front of its plan.
+`ccs use` installs it into `~/.codex/auth.json` (or `$CODEX_HOME`'s), which
+Codex CLI reloads on its own, so running sessions follow. Claude Code's slot
+is untouched, and the other way round: `ccs ls` marks one account in use per
+provider, and `ccs status` reports both when both are logged in.
+
+The limits come from the same endpoint Codex's own `/status` reads: the
+five-hour and weekly windows under `session` and `weekly`, and a model with a
+limit of its own — Spark, today — under its name. A Pro account reports a
+single weekly window; that is the endpoint's doing.
+
+Pins are Claude Code sessions and stay Claude-only. So do the notices.
 
 ## Everyday use
 
@@ -269,7 +296,17 @@ token this tool thought was fresh is taken for a session having refreshed the
 live credentials underneath it; the copies are brought level and the request
 sent once more.
 
-Only `127.0.0.1` is listened on, and only paths under `/v1/` are relayed.
+Only `127.0.0.1` is listened on, and only paths under `/v1/` (Anthropic) and
+`/backend-api/` (Codex) are relayed.
+
+The Codex side works the same way with a second key. pi's built-in
+`openai-codex` provider is told `"baseUrl": "http://127.0.0.1:4141/backend-api"`
+and `"apiKey": "!ccs serve --key codex"`; the startup snippet prints both
+providers. That key is shaped as a token, because pi reads the ChatGPT account
+id out of the key it is given and sends it as a header: the gateway checks the
+whole string, then puts the real account's token and id on the request. pi
+opens a socket first for Codex; the gateway refuses the upgrade and pi falls
+back to server-sent events for that session.
 
 ## In the menu bar
 
@@ -382,12 +419,13 @@ painted, so only the percentages are as old as the footer says.
 | `ccs pin [<account>]` | start a session confined to one account |
 | `ccs add` | log in to another account and stash it |
 | `ccs add --current` | stash whichever account is logged in right now |
+| `ccs add [--current] --codex` | the same, for a Codex (ChatGPT) account |
 | `ccs rm <account>` | forget a stashed account |
 | `ccs status` | limits for the account in use, with reset times |
 | `ccs notify [<kind>...]` | have notices delivered into the calling session |
 | `ccs watch` | poll every account and raise notices; `--rotate` switches too |
 | `ccs serve` | serve the API on loopback as the account in use |
-| `ccs serve --key` | print the key a client presents to the gateway |
+| `ccs serve --key [codex]` | print the key a client presents to the gateway |
 
 `<account>` is a slug, an email, an unambiguous prefix of either, or the index from
 `ccs ls`. `ccs pin` without one opens the picker; `ccs use` without one is an
@@ -427,6 +465,8 @@ account did.
 ~/.claude/ccs/usage/*.json      what each account last had left, and when
 ~/.claude/ccs/state.json        which slug is currently installed
 ~/.claude/ccs/gateway.key       what a client presents to `ccs serve`, mode 0600
+~/.claude/ccs/codex.key         the same for the Codex route
+~/.codex/auth.json              the Codex account in use, as Codex CLI reads it
 ~/.claude/ccs/.login-<pid>/     a login in progress, destroyed when it ends
 ```
 
@@ -451,7 +491,8 @@ swept out from under itself.
 lets `ccs` work correctly from inside a pinned session, and on macOS what names the
 keychain item a session reads. `CLAUDE_SECURESTORAGE_CONFIG_DIR` is honoured there
 too, for the same reason. `CCS_CLAUDE_BINARY` points at a `claude` that isn't on
-`PATH`. `NO_COLOR` does what you expect.
+`PATH`, `CCS_CODEX_BINARY` at a `codex`, and `CODEX_HOME` is honoured the way
+Codex honours it. `NO_COLOR` does what you expect.
 
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` take
 precedence over the stored credentials for any session that inherits them — so a

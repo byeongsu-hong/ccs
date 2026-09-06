@@ -271,6 +271,29 @@ sent once more.
 
 Only `127.0.0.1` is listened on, and only paths under `/v1/` are relayed.
 
+## In the menu bar
+
+```sh
+make install-app      # builds app/ into /Applications/ccs.app and opens nothing
+open /Applications/ccs.app
+```
+
+The menu bar shows the active account's session percentage on a gauge that
+fills as it runs high. The popover has every account with its bars and reset
+times; click one to switch, and a spent account asks first. Two switches below
+keep the daemons running for as long as the app is: **Gateway** runs
+`ccs serve` on the port you set, and **Rotate automatically** runs `ccs watch
+--rotate` over the accounts you tick, with **Notifications** turning the
+watcher's `session-high`, `session-reset`, `weekly-reset` and `rotate` lines
+into macOS notifications. **Launch at login** does what it says. Quitting the
+app stops both daemons.
+
+The app is a shell over the `ccs` on `~/.cargo/bin` (or `/usr/local/bin`,
+`/opt/homebrew/bin`, or `CCS_BINARY`): it never reads credentials or the stash
+itself, so a fix to the CLI is a fix to the app. It needs macOS 14 and builds
+with `swift build` alone; `make app` wraps the binary in an ad-hoc-signed
+bundle, and `make test-app` runs its tests.
+
 ## How it works
 
 **Switching a live session.** Claude Code checks the mtime of its credentials file

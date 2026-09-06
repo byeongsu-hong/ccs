@@ -93,8 +93,11 @@ pub fn run(backend: Backend, root: &Path, binary: &str, options: &Options) -> Re
 /// Run an interactive Codex login in a throwaway home and hand back what it
 /// minted. Codex keeps everything under `CODEX_HOME`, so the login in use is
 /// never touched.
-pub fn run_codex(root: &Path, binary: &str) -> Result<Oauth> {
-    sweep(Backend::File, root);
+pub fn run_codex(backend: Backend, root: &Path, binary: &str) -> Result<Oauth> {
+    // The sweep is of every abandoned login here, Claude ones included, and
+    // those hold a keychain item on the machines that keep credentials
+    // there; only the real backend can take that away.
+    sweep(backend, root);
     let scratch = Scratch::new(Backend::File, root)?;
 
     let status =

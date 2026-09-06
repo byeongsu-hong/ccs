@@ -54,7 +54,9 @@ its provider's rows.
 
 - `src/codex.rs` — the Codex side, one file: `AuthFile` (auth.json in and
   out, unknown fields kept), `Store` (read/write at `CODEX_HOME` or
-  `~/.codex`, atomic, 0600, under a `.ccs.lock` directory lock of its own),
+  `~/.codex`, atomic, 0600, under the same directory lock the Claude side
+  takes, which Codex CLI does not know — its own writes can still interleave
+  with a switch, and the levelling on the next read is what repairs that),
   JWT claim reading, `Client` (refresh, usage), and `limits(&Usage)` mapping
   windows to `Limit`s: a window of 18000s is `session`, 604800s is
   `weekly_all`, anything else `<n>s`; each `additional_rate_limits` entry

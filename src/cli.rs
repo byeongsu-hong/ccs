@@ -184,6 +184,13 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         }
         "add" | "capture" => {
             let rest = &args[1..];
+            if has(rest, "--codex") {
+                for flag in ["--email", "--console", "--sso"] {
+                    if has(rest, flag) {
+                        bail!("{flag} steers Claude's login page; a Codex login has none");
+                    }
+                }
+            }
             Ok(Cmd::Add {
                 name: value(rest, "--name"),
                 current: has(rest, "--current"),
@@ -317,6 +324,18 @@ mod tests {
         };
         assert_eq!(name.as_deref(), Some("work"));
         assert!(matches!(parsed(&["add"]), Cmd::Add { name: None, .. }));
+    }
+
+    /// The login-page flags steer Claude's page; a Codex login has none
+    /// to steer, so asking for both is a mistake said out loud.
+    #[test]
+    fn add_refuses_login_page_flags_with_codex() {
+        let words = ["add", "--codex", "--email", "me@x.com"].map(String::from);
+        assert!(parse(words.into_iter()).is_err());
+        assert!(matches!(
+            parsed(&["add", "--codex", "--current"]),
+            Cmd::Add { codex: true, current: true, .. }
+        ));
     }
 
     #[test]

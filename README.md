@@ -432,7 +432,9 @@ painted, so only the percentages are as old as the footer says.
 error rather than a guess.
 
 `-f`/`--force` switches even into an account with nothing left. `--json` on `ls`
-and `status` gives you the same data for scripts. A status line wants
+and `status` gives you the same data for scripts; `status` keeps the shape it
+always had, one object, with the Codex account under `codex` when both are
+logged in. A status line wants
 `ccs ls --cached --json` instead — the last readings `ccs watch` wrote down,
 with a `polled_at` on each, and no poll — because it repaints far more often
 than a poll can be afforded.

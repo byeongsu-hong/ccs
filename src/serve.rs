@@ -970,6 +970,23 @@ mod tests {
     // ── the codex route ─────────────────────────────────────────────────────
 
     #[test]
+    fn a_path_is_routed_by_its_prefix_and_nothing_looser() {
+        assert_eq!(route("/v1/messages"), Some((Provider::Claude, "/v1/messages")));
+        assert_eq!(
+            route("/backend-api/codex/responses"),
+            Some((Provider::Codex, "/codex/responses"))
+        );
+        assert_eq!(
+            route("/backend-api/wham/usage?x=1"),
+            Some((Provider::Codex, "/wham/usage?x=1"))
+        );
+        assert_eq!(route("/backend-apix/codex/responses"), None);
+        assert_eq!(route("/backend-api"), None);
+        assert_eq!(route("/v1"), None);
+        assert_eq!(route("/"), None);
+    }
+
+    #[test]
     fn a_backend_api_request_goes_out_as_the_codex_account_with_its_own_account_id() {
         let (up, seen) = upstream(vec![(200, r#"{"id":"ok"}"#)]);
         let pool = Pool { grants: vec![grant("work"), codex_grant("gpt")], ..Default::default() };

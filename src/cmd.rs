@@ -448,9 +448,17 @@ pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
     let accounts = ctx.stash.list()?;
     let mut entries = Vec::new();
 
-    if ctx.creds.read()?.is_some() {
-        let (file, oauth) = in_use(ctx, "run `claude` and sign in first")?;
-        let identified = identify(ctx, &accounts, Provider::Claude, Some(&file.oauth));
+    // Each slot is read once: on a Mac the Claude read is a keychain call.
+    let slots = slots(ctx)?;
+    if let Some(held) = slots.claude {
+        let oauth = match freshen(ctx.apis(), Provider::Claude, &held)? {
+            None => held.clone(),
+            Some(fresh) => {
+                install(ctx.creds, &fresh)?;
+                fresh
+            }
+        };
+        let identified = identify(ctx, &accounts, Provider::Claude, Some(&held));
         let profile = ctx.api.profile(&oauth.access_token)?;
         let limits = ctx.api.usage(&oauth.access_token)?.limits;
         // An account nothing in the stash answers for has nowhere to be
@@ -472,10 +480,17 @@ pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
             limits: Ok(limits),
         });
     }
-    if ctx.codex.read()?.is_some_and(|f| f.oauth().is_some()) {
-        let oauth = codex_in_use(ctx, "run `codex login` first")?;
-        let identified = identify(ctx, &accounts, Provider::Codex, Some(&oauth));
-        let who = codex::identity(oauth.id_token().unwrap_or_default())?;
+    if let Some(held) = slots.codex {
+        let oauth = match freshen(ctx.apis(), Provider::Codex, &held)? {
+            None => held.clone(),
+            Some(fresh) => {
+                install_codex(ctx.codex, &fresh)?;
+                fresh
+            }
+        };
+        let identified = identify(ctx, &accounts, Provider::Codex, Some(&held));
+        let who = codex::identity(oauth.id_token().unwrap_or_default())
+            .with_context(|| format!("reading the login in {}", ctx.codex.describe()))?;
         let limits = read_limits(ctx.apis(), Provider::Codex, &oauth)?;
         if let Some(slug) = &identified {
             ctx.usage.record(slug, &limits)?;
@@ -490,16 +505,23 @@ pub fn status(ctx: &Ctx, json: bool) -> Result<()> {
         });
     }
     if entries.is_empty() {
-        bail!("no credentials in {}; run `claude` and sign in first", ctx.creds.describe());
+        bail!(
+            "nothing is logged in: no credentials in {} and no login in {}",
+            ctx.creds.describe(),
+            ctx.codex.describe()
+        );
     }
 
     if json {
-        // One login is one object, as it always was; two are a list of them.
-        let views: Vec<View> = entries.iter().map(|e| view(e, None)).collect();
-        match views.as_slice() {
-            [one] => println!("{}", serde_json::to_string_pretty(one)?),
-            many => println!("{}", serde_json::to_string_pretty(many)?),
+        // The shape it always had — the Claude account's fields at the top —
+        // with the Codex account, when there is one, under `codex`. With
+        // only a Codex login, that one is at the top and says so in
+        // `provider`, so nothing reading this ever meets a list.
+        let mut top = serde_json::to_value(view(&entries[0], None))?;
+        if let (Some(codex), serde_json::Value::Object(map)) = (entries.get(1), &mut top) {
+            map.insert("codex".into(), serde_json::to_value(view(codex, None))?);
         }
+        println!("{}", serde_json::to_string_pretty(&top)?);
         return Ok(());
     }
     for (index, entry) in entries.iter().enumerate() {
@@ -536,7 +558,7 @@ pub fn add(
         }
         (Provider::Codex, false) => {
             println!("logging in to another Codex account; the one in use is not affected");
-            login::run_codex(ctx.stash.root(), &codex_binary())?
+            login::run_codex(ctx.backend, ctx.stash.root(), &codex_binary())?
         }
     };
     let recorded = record(ctx, provider, oauth, name, Installed::from(current))?;
@@ -570,6 +592,7 @@ impl From<bool> for Installed {
     }
 }
 
+#[derive(Debug)]
 struct Recorded {
     stashed: Stashed,
     /// The slug already held an account, so this refreshed it in place rather
@@ -619,7 +642,18 @@ fn record(
     };
     let held = ctx.stash.list()?;
     let slug = match name {
-        Some(name) => name.to_string(),
+        Some(name) => {
+            if let Some(other) =
+                held.iter().find(|s| s.slug == name && s.account.provider != provider)
+            {
+                bail!(
+                    "{name} is a {} account, {}; pick another name",
+                    other.account.provider,
+                    other.account.email
+                );
+            }
+            name.to_string()
+        }
         None => {
             let plain = stash::slugify(&email);
             let taken_by_other =
@@ -1145,6 +1179,10 @@ fn switch_codex(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result
     let current = ctx.codex.read()?;
     if let Some(live) = current.as_ref().and_then(|f| f.oauth()) {
         capture_outgoing(ctx, accounts, Provider::Codex, &live, &target.slug)?;
+    } else if current.as_ref().is_some_and(|f| f.is_api_key()) {
+        // An API-key login is not an account the stash can hold, so it is
+        // not captured on the way out; said, so it is not a surprise.
+        eprintln!("ccs: {} held an API-key login; it is replaced", ctx.codex.describe());
     }
     ctx.codex.write(&current.unwrap_or_default().with(&target.account.oauth))?;
     ctx.stash.set_active(Provider::Codex, &target.slug)?;
@@ -1774,6 +1812,65 @@ mod tests {
         assert_eq!(recorded.stashed.account.plan_label(), "codex pro");
         assert_eq!(fixture.stash.active(Provider::Codex).as_deref(), Some("you_at_x.com"));
         assert_eq!(fixture.stash.active(Provider::Claude), None);
+    }
+
+    /// The same email signed up with both providers gets the provider's name
+    /// in front of its slug, and a name given outright never lands on the
+    /// other provider's account — that would spend its refresh token.
+    #[test]
+    fn a_slug_the_other_provider_holds_is_prefixed_or_refused() {
+        let fixture = Fixture::new("codex-collide");
+        let claude = stashed("you_at_x.com", oauth("r-a", LATER));
+        fixture.stash.save("you_at_x.com", &claude.account).expect("save");
+
+        let derived = record(
+            &fixture.ctx(),
+            Provider::Codex,
+            codex_oauth("r-g", LATER, "you@x.com"),
+            None,
+            Installed::No,
+        )
+        .expect("records");
+        assert_eq!(derived.stashed.slug, "codex-you_at_x.com");
+
+        let error = record(
+            &fixture.ctx(),
+            Provider::Codex,
+            codex_oauth("r-g2", LATER, "other@x.com"),
+            Some("you_at_x.com"),
+            Installed::No,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("claude"), "{error}");
+        assert_eq!(fixture.tokens("you_at_x.com").0, "r-a");
+    }
+
+    /// A pool can name accounts of both providers; a Codex request only
+    /// ever falls over to a Codex account.
+    #[test]
+    fn the_desk_keeps_a_mixed_pool_to_the_providers_own_accounts() {
+        let fixture = Fixture::new("desk-mixed");
+        for (slug, provider) in [("a", Provider::Claude), ("b", Provider::Claude)] {
+            let mut entry = stashed(slug, oauth(&format!("r-{slug}"), LATER));
+            entry.account.provider = provider;
+            fixture.stash.save(slug, &entry.account).expect("save");
+        }
+        for slug in ["g", "h"] {
+            let entry =
+                codex_stashed(slug, codex_oauth(&format!("r-{slug}"), LATER, &format!("{slug}@x")));
+            fixture.stash.save(slug, &entry.account).expect("save");
+        }
+        fixture.stash.set_active(Provider::Claude, "a").expect("active");
+        fixture.stash.set_active(Provider::Codex, "g").expect("active");
+        let pool = ["b", "h", "a", "g"].map(String::from).to_vec();
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &pool };
+
+        let codex = desk.grant(Provider::Codex, &[]).expect("grants");
+        assert_eq!((codex.slug.as_str(), codex.account_id.as_deref()), ("g", Some("acct-g@x")));
+        assert_eq!(desk.grant(Provider::Codex, &["g".into()]).expect("falls over").slug, "h");
+        assert_eq!(desk.grant(Provider::Claude, &["a".into()]).expect("falls over").slug, "b");
     }
 
     #[test]

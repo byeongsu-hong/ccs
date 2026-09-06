@@ -76,7 +76,12 @@ impl Stash {
                 .with_context(|| format!("parsing {}", path.display()))?;
             out.push(Stashed { slug: slug.to_string(), account });
         }
-        out.sort_by(|a, b| a.account.email.cmp(&b.account.email));
+        // By email, then provider, so two accounts on one address keep the
+        // same indices run to run, Claude first.
+        out.sort_by(|a, b| {
+            (a.account.email.as_str(), a.account.provider)
+                .cmp(&(b.account.email.as_str(), b.account.provider))
+        });
         Ok(out)
     }
 
@@ -146,10 +151,20 @@ pub fn resolve<'a>(accounts: &'a [Stashed], needle: &str) -> Result<&'a Stashed>
     }
     let lowered = needle.to_lowercase();
 
-    let exact =
-        accounts.iter().find(|s| s.slug == lowered || s.account.email.to_lowercase() == lowered);
-    if let Some(hit) = exact {
+    if let Some(hit) = accounts.iter().find(|s| s.slug == lowered) {
         return Ok(hit);
+    }
+    // One address can be signed up with both providers; the email then names
+    // two accounts, and only a slug tells them apart.
+    let by_email: Vec<&Stashed> =
+        accounts.iter().filter(|s| s.account.email.to_lowercase() == lowered).collect();
+    match by_email.as_slice() {
+        [one] => return Ok(one),
+        [] => {}
+        many => bail!(
+            "{needle:?} is ambiguous between {}; name the slug",
+            many.iter().map(|s| s.slug.as_str()).collect::<Vec<_>>().join(" and ")
+        ),
     }
 
     if let Ok(index) = needle.parse::<usize>() {
@@ -300,6 +315,41 @@ mod tests {
         stash.remove("gpt").expect("remove");
         assert_eq!(stash.active(Provider::Claude).as_deref(), Some("you"));
         assert_eq!(stash.active(Provider::Codex), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same address can be signed up with both providers. Naming it is
+    /// then naming two accounts, which is refused rather than guessed at —
+    /// by slug, not by the email that is the same on both.
+    #[test]
+    fn resolve_refuses_an_email_that_two_providers_share() {
+        let claude = stashed("you_at_x.com", "you@x.com");
+        let mut codex = stashed("codex-you_at_x.com", "you@x.com");
+        codex.account.provider = Provider::Codex;
+        let accounts = vec![claude, codex];
+
+        let error = resolve(&accounts, "you@x.com").unwrap_err().to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains("codex-you_at_x.com"), "{error}");
+        assert_eq!(
+            resolve(&accounts, "codex-you_at_x.com").expect("by slug").slug,
+            "codex-you_at_x.com"
+        );
+    }
+
+    /// Two accounts on one email sort the same way every run, Claude first,
+    /// so the index the table prints stays put.
+    #[test]
+    fn a_listing_orders_a_shared_email_by_provider() {
+        let (dir, stash) = temp_stash("shared-email");
+        let mut codex = stashed("codex-you_at_x.com", "you@x.com");
+        codex.account.provider = Provider::Codex;
+        stash.save("codex-you_at_x.com", &codex.account).expect("save");
+        stash.save("you_at_x.com", &stashed("you_at_x.com", "you@x.com").account).expect("save");
+        stash.save("a_at_x.com", &stashed("a_at_x.com", "a@x.com").account).expect("save");
+
+        let slugs: Vec<String> = stash.list().expect("list").into_iter().map(|s| s.slug).collect();
+        assert_eq!(slugs, ["a_at_x.com", "you_at_x.com", "codex-you_at_x.com"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

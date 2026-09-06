@@ -98,10 +98,18 @@ impl AuthFile {
         let mut extra = Map::new();
         extra.insert("idToken".into(), Value::String(tokens.id_token.clone()));
         extra.insert("accountId".into(), Value::String(tokens.account_id.clone()));
+        // A token whose expiry cannot be read is dated by the file's own
+        // record of when it was minted: it then orders truthfully against
+        // the other copies of the account, and reads as spent. Zero would
+        // make it the oldest copy, and levelling would write over the
+        // login Codex just rotated.
+        let minted = self.last_refresh.as_deref().and_then(|s| s.parse::<Timestamp>().ok());
         Some(Oauth {
             access_token: tokens.access_token.clone(),
             refresh_token: tokens.refresh_token.clone(),
-            expires_at: expiry(&tokens.access_token).unwrap_or(0),
+            expires_at: expiry(&tokens.access_token)
+                .or_else(|| minted.map(|t| t.as_millisecond()))
+                .unwrap_or(0),
             scopes: Vec::new(),
             subscription_type: None,
             extra,
@@ -125,13 +133,26 @@ impl AuthFile {
         if let Some(account) = oauth.account_id() {
             tokens.account_id = account.to_string();
         }
+        // Codex CLI reads this to decide when to refresh on its own, so it
+        // has to say when these tokens were minted, not when they were put
+        // here; the access token's own stamp is that, and what was there
+        // stays when it cannot be read.
+        let minted = issued(&oauth.access_token)
+            .and_then(|s| Timestamp::from_second(s).ok())
+            .map(|t| t.to_string())
+            .or_else(|| self.last_refresh.clone());
         Self {
             auth_mode: chatgpt(),
             openai_api_key: self.openai_api_key.clone(),
             tokens: Some(tokens),
-            last_refresh: Some(Timestamp::now().to_string()),
+            last_refresh: minted,
             extra: self.extra.clone(),
         }
+    }
+
+    /// Whether this file holds an API-key login rather than a ChatGPT one.
+    pub fn is_api_key(&self) -> bool {
+        self.auth_mode != "chatgpt"
     }
 }
 
@@ -222,6 +243,11 @@ pub fn identity(id_token: &str) -> Result<Identity> {
 /// When a JWT expires, in the milliseconds the stash keeps.
 fn expiry(token: &str) -> Option<i64> {
     claims(token).ok()?.get("exp")?.as_i64().map(|s| s * 1000)
+}
+
+/// When a JWT was minted, in seconds.
+fn issued(token: &str) -> Option<i64> {
+    claims(token).ok()?.get("iat")?.as_i64()
 }
 
 /// A JWT's payload, unverified, for whoever needs to read a claim.
@@ -508,10 +534,40 @@ mod tests {
         assert_eq!(file.oauth().expect("tokens").expires_at, 1_900_000_000_000);
     }
 
+    /// An access token whose expiry cannot be read is dated by the file's
+    /// own record of when it was minted, so it orders truthfully against
+    /// the other copies of the account, and reads as spent — one refresh.
     #[test]
-    fn an_access_token_that_is_not_a_jwt_is_taken_for_spent() {
+    fn an_access_token_that_is_not_a_jwt_is_dated_by_the_files_last_refresh() {
         let file: AuthFile = serde_json::from_str(AUTH_FILE).expect("parses");
-        assert!(file.oauth().expect("tokens").needs_refresh());
+        let oauth = file.oauth().expect("tokens");
+        let minted = "2026-09-03T06:55:46.500555Z".parse::<Timestamp>().expect("stamp");
+        assert_eq!(oauth.expires_at, minted.as_millisecond());
+        assert!(oauth.needs_refresh());
+    }
+
+    #[test]
+    fn a_file_with_no_readable_expiry_at_all_is_taken_for_spent_long_ago() {
+        let raw = AUTH_FILE.replace(r#""last_refresh": "2026-09-03T06:55:46.500555Z","#, "");
+        let file: AuthFile = serde_json::from_str(&raw).expect("parses");
+        assert_eq!(file.oauth().expect("tokens").expires_at, 0);
+    }
+
+    /// Codex CLI reads `last_refresh` to decide when to refresh on its own;
+    /// a switch that stamped it now would tell it a stale token is fresh.
+    /// The access token's own minting time is the truthful stamp.
+    #[test]
+    fn installing_credentials_stamps_last_refresh_with_the_tokens_own_minting_time() {
+        let file: AuthFile = serde_json::from_str(AUTH_FILE).expect("parses");
+        let mut oauth = file.oauth().expect("tokens");
+        oauth.access_token = jwt(serde_json::json!({"exp": 1_900_000_000, "iat": 1_899_990_000}));
+        let back = file.with(&oauth);
+        assert_eq!(back.last_refresh.as_deref(), Some("2030-03-17T15:00:00Z"));
+
+        // Nothing to read: the stamp that was there stays.
+        oauth.access_token = "opaque".into();
+        let back = file.with(&oauth);
+        assert_eq!(back.last_refresh.as_deref(), Some("2026-09-03T06:55:46.500555Z"));
     }
 
     #[test]

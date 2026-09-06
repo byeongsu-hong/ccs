@@ -57,6 +57,8 @@ IDs retain their names. Availability is independent of numeric quota windows.
 Spark is hidden from human-facing terminal output and selection warnings; raw
 JSON/cache data retain it. The POOL column appears only when a visible named
 quota pool exists. Missing model availability is unknown, not available.
+The Codex 5H column is always present. A missing shared five-hour window is
+shown as a dash; no quota is fabricated or borrowed from a model-specific pool.
 Two accounts can be `active`, one per provider; marking one active unmarks only
 its provider's rows.
 

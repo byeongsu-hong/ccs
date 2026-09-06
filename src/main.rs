@@ -68,7 +68,7 @@ fn run() -> Result<()> {
 
     match command {
         Cmd::Pick => cmd::pick(&ctx),
-        Cmd::List { json } => cmd::list(&ctx, json),
+        Cmd::List { json, cached } => cmd::list(&ctx, json, cached),
         Cmd::Use { target, force } => cmd::use_account(&ctx, &target, force),
         Cmd::Add { name, current, email, console, sso } => {
             let options = login::Options { email, console, sso };

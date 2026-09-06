@@ -271,6 +271,32 @@ sent once more.
 
 Only `127.0.0.1` is listened on, and only paths under `/v1/` are relayed.
 
+## In the menu bar
+
+```sh
+make install-app      # builds app/ into /Applications/ccs.app and opens nothing
+open /Applications/ccs.app
+```
+
+The menu bar shows the active account's session percentage on a gauge that
+fills as it runs high. The popover has every account with its bars and reset
+times; click one to switch, and a spent account asks first. The app keeps `ccs watch`
+running for as long as it is, as the one thing that polls; **Rotate
+automatically** hands it a pool of the accounts you tick, and **Notifications**
+turns its `session-high`, `session-reset`, `weekly-reset` and `rotate` lines
+into macOS notifications. **Gateway** runs `ccs serve` on the port you set. **Launch at login** does what it says. Quitting the
+app stops both daemons.
+
+The app is a shell over the `ccs` on `~/.cargo/bin` (or `/usr/local/bin`,
+`/opt/homebrew/bin`, or `CCS_BINARY`): it never reads credentials or the stash
+itself, so a fix to the CLI is a fix to the app. Nor does it poll. The watcher
+it keeps running is the one thing that asks the API, and what it writes down
+under `ccs/usage/` is what the app reads back — `ccs ls --cached --json`, the
+same listing without the poll — so opening the popover twenty times costs the
+limits nothing. The footer says when the watcher last looked. It needs macOS 14 and builds
+with `swift build` alone; `make app` wraps the binary in an ad-hoc-signed
+bundle, and `make test-app` runs its tests.
+
 ## How it works
 
 **Switching a live session.** Claude Code checks the mtime of its credentials file
@@ -368,9 +394,10 @@ painted, so only the percentages are as old as the footer says.
 error rather than a guess.
 
 `-f`/`--force` switches even into an account with nothing left. `--json` on `ls`
-and `status` gives you the same data for scripts. A status line wants the cache
-under `ccs/usage/` instead — it repaints far more often than a poll can be
-afforded.
+and `status` gives you the same data for scripts. A status line wants
+`ccs ls --cached --json` instead — the last readings `ccs watch` wrote down,
+with a `polled_at` on each, and no poll — because it repaints far more often
+than a poll can be afforded.
 
 ## Limits
 

@@ -7,6 +7,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use jiff::Timestamp;
@@ -17,11 +18,13 @@ use crate::creds::{self, Backend, CredStore};
 use crate::lock;
 use crate::login;
 use crate::model::{Account, CredsFile, Limit, Oauth, Stashed, plan_label};
+use crate::notify;
 use crate::pen;
 use crate::picker::{self, Act, Outcome};
 use crate::render::{self, Entry, Style, Table, Verb};
 use crate::stash::{self, Stash};
 use crate::usage;
+use crate::watch;
 
 pub struct Ctx<'a> {
     pub creds: &'a dyn CredStore,
@@ -408,9 +411,68 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     // carries the tokens that refresh superseded.
     let target = stash::resolve(&accounts, &slug)?.clone();
     guard_exhausted(&entry_of(&target, &probe, false), force)?;
-    switch_to(ctx, &mut accounts, &target)?;
-    report_switch(&target);
+    let told = switch_to(ctx, &mut accounts, &target)?;
+    report_switch(&target, told);
     Ok(())
+}
+
+/// Subscribe (or unsubscribe) the calling Claude Code session to notices.
+pub fn notify(ctx: &Ctx, off: bool, kinds: &[String], bypass: bool) -> Result<()> {
+    notify::subscribe(ctx.stash.root(), !off, kinds, bypass)
+}
+
+/// Poll every account on an interval and raise a notice for whatever changed.
+/// Runs until killed; each notice is echoed here as well as delivered.
+pub fn watch(ctx: &Ctx, every: Duration, high: f64, rotate: &[String]) -> Result<()> {
+    let pool: Vec<String> = {
+        let accounts = stashed(ctx)?;
+        rotate
+            .iter()
+            .map(|n| stash::resolve(&accounts, n).map(|s| s.slug.clone()))
+            .collect::<Result<_>>()?
+    };
+    if !pool.is_empty() {
+        println!("{} rotating between {}", stamp(), pool.join(", "));
+    }
+    let mut before = watch::Snapshot::new();
+    loop {
+        let mut accounts = stashed(ctx)?;
+        match survey(ctx, &mut accounts, Style::detect()) {
+            Ok((table, _)) => {
+                for event in watch::diff(&before, table.entries(), high) {
+                    let told = notify::broadcast(
+                        ctx.creds.dir(),
+                        ctx.stash.root(),
+                        event.kind,
+                        &event.text,
+                    );
+                    println!("{} {}: {}{}", stamp(), event.kind, event.text, heard(told));
+                }
+                before = watch::snapshot(table.entries());
+                if let Some(next) = watch::rotate(table.entries(), &pool, high) {
+                    match stash::resolve(&accounts, &next.slug).cloned() {
+                        Ok(target) => match switch_to(ctx, &mut accounts, &target) {
+                            Ok(told) => println!(
+                                "{} rotate: switched to {} ({}){}",
+                                stamp(),
+                                target.account.email,
+                                target.slug,
+                                heard(told)
+                            ),
+                            Err(e) => eprintln!("{} rotate failed: {}", stamp(), describe(&e)),
+                        },
+                        Err(e) => eprintln!("{} rotate failed: {}", stamp(), describe(&e)),
+                    }
+                }
+            }
+            Err(e) => eprintln!("{} poll failed: {}", stamp(), describe(&e)),
+        }
+        thread::sleep(every);
+    }
+}
+
+fn stamp() -> String {
+    Timestamp::now().strftime("%H:%M:%S").to_string()
 }
 
 pub fn pick(ctx: &Ctx) -> Result<()> {
@@ -491,7 +553,7 @@ struct Deck<'a, 'b> {
     verb: Verb,
     /// The account most recently installed from inside the picker, so the
     /// terminal the picker was left in still says what happened in it.
-    switched: Option<Stashed>,
+    switched: Option<(Stashed, usize)>,
 }
 
 impl picker::Accounts for Deck<'_, '_> {
@@ -514,15 +576,15 @@ impl picker::Accounts for Deck<'_, '_> {
         reconcile(self.ctx, self.accounts, live.as_deref())?;
 
         let target = stash::resolve(self.accounts, slug)?.clone();
-        switch_to(self.ctx, self.accounts, &target)?;
+        let told = switch_to(self.ctx, self.accounts, &target)?;
 
         let said = match overriding().as_slice() {
-            [] => format!("switched to {}", target.account.email),
+            [] => format!("switched to {}{}", target.account.email, heard(told)),
             set => {
                 format!("switched to {}, but {} overrides it", target.account.email, set.join(", "))
             }
         };
-        self.switched = Some(target);
+        self.switched = Some((target, told));
         Ok(Act::Installed(said))
     }
 }
@@ -538,8 +600,8 @@ fn choose(ctx: &Ctx, accounts: &mut [Stashed], verb: Verb) -> Result<Option<Stas
 
     // Reported after the screen is down, and whether or not the picker itself
     // came back cleanly: the switch already happened on disk either way.
-    if let Some(target) = &switched {
-        report_switch(target);
+    if let Some((target, told)) = &switched {
+        report_switch(target, *told);
     }
     let Outcome::Chose(slug) = outcome? else { return Ok(None) };
     Ok(accounts.iter().find(|a| a.slug == slug).cloned())
@@ -586,23 +648,44 @@ fn identify_live(ctx: &Ctx, accounts: &[Stashed]) -> Result<Option<String>> {
 /// Code refreshes tokens in place, so the stashed copy goes stale the moment an
 /// account is used. Capturing it on the way out is what keeps a stashed account
 /// usable without a fresh login.
-fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<()> {
+fn switch_to(ctx: &Ctx, accounts: &mut [Stashed], target: &Stashed) -> Result<usize> {
     let _guard = lock::acquire(ctx.creds.dir())?;
     let live = ctx.creds.read()?;
     if let Some(live) = &live {
         capture_outgoing(ctx, accounts, live, &target.slug)?;
     }
     ctx.creds.write(&merged(live, &target.account.oauth))?;
-    ctx.stash.set_active(&target.slug)
+    ctx.stash.set_active(&target.slug)?;
+    drop(_guard);
+    let told = notify::broadcast(
+        ctx.creds.dir(),
+        ctx.stash.root(),
+        "switch",
+        &format!(
+            "this session's account is now {} ({}). \
+             The API prompt cache is per account, so the next request re-prefills everything.",
+            target.account.email, target.slug
+        ),
+    );
+    Ok(told)
 }
 
 /// What a switch leaves behind in the terminal it happened in. The picker says
 /// its own piece in the footer while it is up; this is the record that outlives
 /// the screen.
-fn report_switch(target: &Stashed) {
+fn report_switch(target: &Stashed, told: usize) {
     println!("switched to {} ({})", target.account.email, target.slug);
-    println!("running sessions pick this up on their next request");
+    println!("running sessions pick this up on their next request{}", heard(told));
     warn_overridden();
+}
+
+/// How many subscribed sessions heard about it, for the tail of a report.
+fn heard(told: usize) -> String {
+    match told {
+        0 => String::new(),
+        1 => "; told 1 subscribed session".into(),
+        n => format!("; told {n} subscribed sessions"),
+    }
 }
 
 /// Fold the outgoing account's live credentials into its stash entry.
@@ -962,7 +1045,7 @@ mod tests {
         };
 
         assert!(said.contains("b@example.com"), "{said}");
-        assert_eq!(deck.switched.expect("recorded for the terminal").slug, "b");
+        assert_eq!(deck.switched.expect("recorded for the terminal").0.slug, "b");
         assert_eq!(fixture.tokens("b").1.as_deref(), Some("b1"));
         assert_eq!(fixture.stash.active().as_deref(), Some("b"));
     }

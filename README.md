@@ -32,6 +32,25 @@ out. Going back is another switch, not another login.
 without a restart. That is the difference between "I'll switch accounts" being a
 two-second decision and being a five-minute interruption.
 
+**Notices into a session.** A Claude Code session that runs `ccs notify` from
+inside itself gets told things in its own conversation: `switch` (which account
+it is now on, so the model knows its prompt cache just went cold), and — while
+`ccs watch` is running — `session-high` (the account in use has crossed 90% of
+its five-hour window), `session-reset` (an account's window came back, and
+whether its weekly resets sooner than the active one's) and `weekly-reset`.
+Name the kinds you want, or none for all of them; `ccs notify off` stops them.
+`ccs watch --every 300 --high 90` are the defaults. A session that bypasses
+permission prompts holds a notice for review unless the sender attests the
+same mode: subscribe from such a session with `ccs notify --bypass`.
+
+**Rotation.** `ccs watch --rotate agent,work,robin` also switches for you: when
+the account in use is one of those and its session has run high (or its weekly
+is spent), the pooled account whose weekly window resets soonest and still has
+room takes over — quota about to be forfeited is burned first. An account in
+use that is not in the pool was chosen by hand and is never touched. Running
+sessions follow the switch like any other, and hear a `switch` notice if they
+asked.
+
 **Pinning.** One session on one account, every other session left where it is.
 This is the feature that changes how you work — see below.
 

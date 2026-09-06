@@ -16,6 +16,19 @@ USAGE
     ccs add --current        stash the account that is logged in right now
     ccs rm <account>         forget a stashed account
     ccs status               limits for the account currently in use
+    ccs notify [<kind>...]   from inside a Claude Code session: have notices
+                             delivered into that session's chat. Kinds:
+                             switch, session-high, session-reset, weekly-reset;
+                             all of them when none is named. `ccs notify off`
+                             stops them. A session running with permission
+                             prompts bypassed adds --bypass, or it will hold
+                             every notice for review.
+    ccs watch                poll every account and raise session-high,
+                             session-reset and weekly-reset notices; runs
+                             until killed. With --rotate, also switch away
+                             from a pooled account whose session has run
+                             high, to the pooled account whose weekly window
+                             resets soonest and still has room
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
@@ -29,6 +42,9 @@ OPTIONS
         --email <address>    pre-fill the login page (add)
         --console            log in with Console billing, not a subscription (add)
         --sso                force the SSO login flow (add)
+        --every <seconds>    poll interval (watch; default 300)
+        --high <percent>     session percentage that counts as high (watch; default 90)
+        --rotate <a>,<b>,... accounts to rotate between (watch); repeatable
     -h, --help               this text
     -V, --version            version
 ";
@@ -42,6 +58,8 @@ pub enum Cmd {
     Pin { target: Option<String>, args: Vec<String> },
     Remove { target: String },
     Status { json: bool },
+    Notify { off: bool, kinds: Vec<String>, bypass: bool },
+    Watch { every: u64, high: f64, rotate: Vec<String> },
     Help,
     Version,
 }
@@ -55,6 +73,37 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "-V" | "--version" | "version" => Ok(Cmd::Version),
         "ls" | "list" => Ok(Cmd::List { json: has(&args[1..], "--json") }),
         "status" | "st" => Ok(Cmd::Status { json: has(&args[1..], "--json") }),
+        "notify" => {
+            let rest = &args[1..];
+            Ok(Cmd::Notify {
+                off: has(rest, "off"),
+                kinds: rest
+                    .iter()
+                    .filter(|a| *a != "off" && !a.starts_with("--"))
+                    .cloned()
+                    .collect(),
+                bypass: has(rest, "--bypass"),
+            })
+        }
+        "watch" => {
+            let rest = &args[1..];
+            let number = |flag: &str, fallback: f64| -> Result<f64> {
+                match value(rest, flag) {
+                    None => Ok(fallback),
+                    Some(v) => {
+                        v.parse().map_err(|_| anyhow::anyhow!("{flag} wants a number, not {v:?}"))
+                    }
+                }
+            };
+            Ok(Cmd::Watch {
+                every: number("--every", 300.0)? as u64,
+                high: number("--high", 90.0)?,
+                rotate: values(rest, "--rotate")
+                    .flat_map(|v| v.split(',').map(str::trim).map(String::from).collect::<Vec<_>>())
+                    .filter(|v| !v.is_empty())
+                    .collect(),
+            })
+        }
         "use" | "switch" => {
             let rest = &args[1..];
             let Some(target) = positional(rest) else {
@@ -103,8 +152,13 @@ fn value(args: &[String], flag: &str) -> Option<String> {
     args.get(at + 1).cloned()
 }
 
+/// Every value following an occurrence of `flag`.
+fn values<'a>(args: &'a [String], flag: &'a str) -> impl Iterator<Item = &'a String> + 'a {
+    args.windows(2).filter(move |w| w[0] == flag).map(|w| &w[1])
+}
+
 /// Flags that consume the argument after them.
-const VALUE_FLAGS: [&str; 2] = ["--name", "--email"];
+const VALUE_FLAGS: [&str; 5] = ["--name", "--email", "--every", "--high", "--rotate"];
 
 /// The first argument that is neither a flag nor a flag's value.
 fn positional(args: &[String]) -> Option<String> {
@@ -238,6 +292,18 @@ mod tests {
         };
         assert_eq!(target, None);
         assert_eq!(args, ["resume"]);
+    }
+
+    #[test]
+    fn watch_collects_a_rotation_pool_from_commas_and_repeats() {
+        let Cmd::Watch { rotate, high, .. } =
+            parsed(&["watch", "--rotate", "a, b", "--high", "95", "--rotate", "c"])
+        else {
+            panic!("not a watch")
+        };
+        assert_eq!(rotate, ["a", "b", "c"]);
+        assert_eq!(high, 95.0);
+        assert!(matches!(parsed(&["watch"]), Cmd::Watch { rotate, .. } if rotate.is_empty()));
     }
 
     #[test]

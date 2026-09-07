@@ -11,6 +11,14 @@ extern crate::backend
   stream watch(high:f64, pool:[str], notify:bool) -> Poll ! Failure
   gateway(on:bool, port:str, pool:[str]) -> str ! Failure
   shutdown() -> unit
+  launch_at_login(on:bool) -> bool ! Failure
+  sync pref_gateway_on() -> bool
+  sync pref_gateway_port() -> str
+  sync pref_rotation_on() -> bool
+  sync pref_pool() -> [str]
+  sync pref_notifications_on() -> bool
+  sync pref_launch_at_login() -> bool
+  sync save_prefs(gateway_on:bool, gateway_port:str, rotation_on:bool, pool:[str], notifications_on:bool, launch_at_login:bool) -> bool
   sync fixture_accounts() -> [Account]
 
 extern crate::format

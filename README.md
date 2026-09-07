@@ -308,31 +308,35 @@ whole string, then puts the real account's token and id on the request. pi
 opens a socket first for Codex; the gateway refuses the upgrade and pi falls
 back to server-sent events for that session.
 
-## In the menu bar
+## The app
 
 ```sh
-make install-app      # builds app/ into /Applications/ccs.app and opens nothing
+make install-app      # macOS: /Applications/ccs.app; Linux: ~/.local/bin/ccs-app
 open /Applications/ccs.app
 ```
 
-The menu bar shows the active account's session percentage on a gauge that
-fills as it runs high. The popover has every account with its bars and reset
-times; click one to switch, and a spent account asks first. The app keeps `ccs watch`
-running for as long as it is, as the one thing that polls; **Rotate
-automatically** hands it a pool of the accounts you tick, and **Notifications**
-turns its `session-high`, `session-reset`, `weekly-reset` and `rotate` lines
-into macOS notifications. **Gateway** runs `ccs serve` on the port you set. **Launch at login** does what it says. Quitting the
-app stops both daemons.
+One window on every platform: every account with its bars and reset times,
+click one to switch, and a spent account asks first. Below them the two
+switches. **Gateway** serves the API on the port you set. **Rotate
+automatically** hands the watcher a pool of the accounts you tick, and
+**Notifications** turns its `session-high`, `session-reset`, `weekly-reset`
+and `rotate` lines into system notifications. **Launch at login** keeps a
+LaunchAgent on macOS and an autostart entry on Linux. All of it is remembered
+under `ccs/app.json`.
 
-The app is a shell over the `ccs` on `~/.cargo/bin` (or `/usr/local/bin`,
-`/opt/homebrew/bin`, or `CCS_BINARY`): it never reads credentials or the stash
-itself, so a fix to the CLI is a fix to the app. Nor does it poll. The watcher
-it keeps running is the one thing that asks the API, and what it writes down
-under `ccs/usage/` is what the app reads back — `ccs ls --cached --json`, the
-same listing without the poll — so opening the popover twenty times costs the
-limits nothing. The footer says when the watcher last looked. It needs macOS 14 and builds
-with `swift build` alone; `make app` wraps the binary in an ad-hoc-signed
-bundle, and `make test-app` runs its tests.
+On macOS there is a menu bar item too: the active Claude account's session on
+the bar, and a menu with a row per account — the row is the readout, and
+pressing it is the switch — plus the two switches and the window.
+
+The app links `ccs` as a library, so there is one process: the watcher runs on
+a thread of its own and is the one thing that polls, the gateway's listener
+and desk run on threads of the same process, and the window reads what the
+watcher last wrote down. Quitting takes the gateway down with it. It is
+written in [Ice](https://github.com/byeongsu-hong/ducktape-ui), a checked UI
+language for iced, taken as a git dependency at a pinned revision since it is
+not on crates.io; `make app` builds it, `make test-app` runs its tests, and
+`make lint-app` runs the Ice checker (`cargo install --git
+https://github.com/byeongsu-hong/ducktape-ui cargo-ice`).
 
 ## How it works
 

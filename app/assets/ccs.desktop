@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=ccs
+Comment=Switch Claude and Codex accounts
+Exec=ccs-app
+Terminal=false
+Categories=Utility;

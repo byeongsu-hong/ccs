@@ -7,6 +7,7 @@ on mount
     task window open main -> opened
     run every load() -> loaded _ | failed _
     stream replace lane=watch watch(90.0, pool_for(rotation_on, pool), notifications_on) -> polled _ | poll_failed _
+    run every gateway(gateway_on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
 
 on show
   task window open main -> opened
@@ -67,13 +68,16 @@ on poll_failed(cause)
 // watcher with it and, when the gateway is up, the gateway too.
 on toggle_gateway(on)
   gateway_on = on
+  saved = save_prefs(on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
   run every gateway(on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
 
 on flip_gateway
   gateway_on = !gateway_on
+  saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
   run every gateway(gateway_on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
 
 on apply_gateway
+  saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
   return if !gateway_on
   run every gateway(true, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
 
@@ -86,12 +90,14 @@ on gateway_failed(cause)
 
 on toggle_rotation(on)
   rotation_on = on
+  saved = save_prefs(gateway_on, gateway_port, on, pool, notifications_on, launch_at_login_on)
   parallel
     stream replace lane=watch watch(90.0, pool_for(on, pool), notifications_on) -> polled _ | poll_failed _
     run every gateway(gateway_on, gateway_port, pool_for(on, pool)) -> gateway_said _ | gateway_failed _
 
 on flip_rotation
   rotation_on = !rotation_on
+  saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
   parallel
     stream replace lane=watch watch(90.0, pool_for(rotation_on, pool), notifications_on) -> polled _ | poll_failed _
     run every gateway(gateway_on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
@@ -99,13 +105,26 @@ on flip_rotation
 on pool_flipped(slug)
   pool = toggled(pool, slug, !in_pool(pool, slug))
   pool_rows_now = pool_rows(accounts, pool)
+  saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
   parallel
     stream replace lane=watch watch(90.0, pool_for(rotation_on, pool), notifications_on) -> polled _ | poll_failed _
     run every gateway(gateway_on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
 
 on toggle_notifications(on)
   notifications_on = on
+  saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, on, launch_at_login_on)
   stream replace lane=watch watch(90.0, pool_for(rotation_on, pool), on) -> polled _ | poll_failed _
+
+// Starting at login is the platform's to keep; what it kept is what shows.
+on toggle_login(on)
+  run every launch_at_login(on) -> login_set _ | login_failed _
+
+on login_set(on)
+  launch_at_login_on = on
+  saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, on)
+
+on login_failed(cause)
+  error = cause.message
 
 // The tray's slots. A menu row carries no payload, so each slot has a
 // handler of its own that reads its account off the same list the row's

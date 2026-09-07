@@ -268,6 +268,128 @@ pub async fn shutdown() {
     }
 }
 
+/// What the app remembers between launches.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Prefs {
+    #[serde(default)]
+    pub gateway_on: bool,
+    #[serde(default = "default_port")]
+    pub gateway_port: String,
+    #[serde(default)]
+    pub rotation_on: bool,
+    #[serde(default)]
+    pub pool: Vec<String>,
+    #[serde(default = "yes")]
+    pub notifications_on: bool,
+    #[serde(default)]
+    pub launch_at_login: bool,
+}
+
+fn default_port() -> String {
+    "4141".to_string()
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            gateway_on: false,
+            gateway_port: default_port(),
+            rotation_on: false,
+            pool: Vec::new(),
+            notifications_on: true,
+            launch_at_login: false,
+        }
+    }
+}
+
+#[cfg(not(test))]
+const PREFS_FILE: &str = "app.json";
+
+/// Where the preferences live: beside the stash, which is where the app's
+/// state belongs.
+#[cfg(not(test))]
+fn prefs_path() -> Result<std::path::PathBuf, Failure> {
+    Ok(env()?.ctx().stash.root().join(PREFS_FILE))
+}
+
+/// Read the preferences, or the defaults. Missing and broken read the same:
+/// a file this program cannot read is not one it should reason from.
+pub fn read_prefs(path: &std::path::Path) -> Prefs {
+    std::fs::read(path).ok().and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
+}
+
+pub fn write_prefs(path: &std::path::Path, prefs: &Prefs) -> Result<(), Failure> {
+    let body = serde_json::to_vec_pretty(prefs).map_err(|e| Failure::new(e.to_string()))?;
+    ccs::fsx::write_atomic(path, &body, 0o600)?;
+    Ok(())
+}
+
+/// The preferences as the program starts: each state field asks for its
+/// own at initialization.
+pub fn prefs() -> Prefs {
+    #[cfg(test)]
+    return Prefs::default();
+    #[cfg(not(test))]
+    prefs_path().map(|path| read_prefs(&path)).unwrap_or_default()
+}
+
+pub fn pref_gateway_on() -> bool {
+    prefs().gateway_on
+}
+
+pub fn pref_gateway_port() -> String {
+    prefs().gateway_port
+}
+
+pub fn pref_rotation_on() -> bool {
+    prefs().rotation_on
+}
+
+pub fn pref_pool() -> Vec<String> {
+    prefs().pool
+}
+
+pub fn pref_notifications_on() -> bool {
+    prefs().notifications_on
+}
+
+pub fn pref_launch_at_login() -> bool {
+    prefs().launch_at_login
+}
+
+/// Write the preferences down. Every toggle calls this; the answer is
+/// whether it took, for the line under the switch to say.
+pub fn save_prefs(
+    gateway_on: bool,
+    gateway_port: String,
+    rotation_on: bool,
+    pool: Vec<String>,
+    notifications_on: bool,
+    launch_at_login: bool,
+) -> bool {
+    let prefs =
+        Prefs { gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login };
+    #[cfg(test)]
+    {
+        let _ = prefs;
+        true
+    }
+    #[cfg(not(test))]
+    prefs_path().and_then(|path| write_prefs(&path, &prefs)).is_ok()
+}
+
+/// Start at login or stop; what comes back is what is now set.
+pub async fn launch_at_login(on: bool) -> Result<bool, Failure> {
+    #[cfg(test)]
+    return Ok(on);
+    #[cfg(not(test))]
+    crate::platform::launch_at_login(on).map_err(Failure::from)
+}
+
 /// The accounts a first-class test starts from, as a state initializer can
 /// ask for them; empty outside tests, where the real reading comes from
 /// `load`.
@@ -425,6 +547,36 @@ fn ago(rfc3339: &str, now: Timestamp) -> String {
 mod tests {
     use super::*;
     use ccs::model::{Limit as Reading, Provider};
+
+    #[test]
+    fn preferences_round_trip_and_missing_ones_are_the_defaults() {
+        let dir = std::env::temp_dir().join(format!("ccs-app-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("app.json");
+
+        assert_eq!(read_prefs(&path), Prefs::default());
+        let prefs = Prefs { gateway_on: true, pool: vec!["a".into()], ..Prefs::default() };
+        write_prefs(&path, &prefs).expect("writes");
+        assert_eq!(read_prefs(&path), prefs);
+        std::fs::write(&path, "not json").expect("write");
+        assert_eq!(read_prefs(&path), Prefs::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_file_missing_a_field_still_reads() {
+        let dir = std::env::temp_dir().join(format!("ccs-app-prefs-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("app.json");
+        std::fs::write(&path, r#"{"gateway_on": true}"#).expect("write");
+        let prefs = read_prefs(&path);
+        assert!(prefs.gateway_on);
+        assert_eq!(prefs.gateway_port, "4141");
+        assert!(prefs.notifications_on);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use ccs::render::Entry;
 
     fn cached(slug: &str, active: bool, limits: Result<Vec<Reading>, String>) -> Cached {

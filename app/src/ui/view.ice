@@ -60,9 +60,12 @@ view
               toggler "Notifications" #notifications checked=notifications_on -> toggle_notifications _
               text watcher_line #watcher-line @text-muted text-xs
             row w=fill gap=8.0 align=center
-              text polled_line(accounts) #polled @text-muted text-xs
+              toggler "Launch at login" #launch checked=launch_at_login_on -> toggle_login _
               space w=fill
+              text polled_line(accounts) #polled @text-muted text-xs
               button "Quit" #quit @bg-rail text-fg px-12px py-8px rounded-md -> quit
+            if !saved
+              text "the preferences could not be written" @text-danger text-xs
     layer
       col w=320.0 p=16.0 gap=12.0 @bg-surface rounded-lg
         text confirm_question(accounts, confirming) @text-fg

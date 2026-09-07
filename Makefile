@@ -8,14 +8,17 @@
 PREFIX ?= $(or $(CARGO_HOME),$(HOME)/.cargo)
 BIN := ccs
 
-# The menu bar app: a Swift package under app/, wrapped into a bundle here
-# because notifications and launch-at-login want one. Ad-hoc signed, so it
-# runs on the machine that built it; nothing here notarises.
+# The app: a Rust crate under app/, written in Ice. On macOS it is wrapped
+# into a bundle, because notifications and launch-at-login want one, and
+# ad-hoc signed so it runs on the machine that built it; elsewhere it is the
+# binary and a desktop entry.
 APP := build/ccs.app
 APPS ?= /Applications
+BIN_DIR ?= $(HOME)/.local/bin
+UNAME := $(shell uname -s)
 
 .PHONY: all build install uninstall test fmt lint check clean help \
-	app install-app uninstall-app test-app
+	app install-app uninstall-app test-app lint-app
 
 all: build
 
@@ -37,29 +40,44 @@ fmt: ## verify formatting
 lint: ## clippy, with warnings as errors
 	cargo clippy --all-targets -- -D warnings
 
-check: fmt lint test ## fmt, lint and test — everything before a commit
+check: fmt lint test lint-app test-app ## fmt, lint and test — everything before a commit
 
-app: ## build the menu bar app into build/ccs.app
-	swift build -c release --package-path app
-	rm -rf '$(APP)'
-	mkdir -p '$(APP)/Contents/MacOS'
-	cp app/.build/release/ccs-menu '$(APP)/Contents/MacOS/ccs-menu'
-	cp app/Info.plist '$(APP)/Contents/Info.plist'
-	codesign --force --sign - '$(APP)'
-
-install-app: app ## build the app and put it in /Applications (APPS overrides where)
-	rm -rf '$(APPS)/ccs.app'
-	cp -R '$(APP)' '$(APPS)/ccs.app'
-
-uninstall-app: ## remove the installed app
-	rm -rf '$(APPS)/ccs.app'
+lint-app: ## check the app's Ice sources (needs cargo-ice)
+	cd app && cargo ice check
 
 test-app: ## run the app's tests
-	swift test --package-path app
+	cargo test -p ccs-app
+
+app: ## build the app into build/ (a bundle on macOS)
+	cargo build --release -p ccs-app
+	rm -rf build
+ifeq ($(UNAME),Darwin)
+	mkdir -p '$(APP)/Contents/MacOS'
+	cp target/release/ccs-app '$(APP)/Contents/MacOS/ccs-app'
+	cp app/Info.plist '$(APP)/Contents/Info.plist'
+	codesign --force --sign - '$(APP)'
+else
+	mkdir -p build
+	cp target/release/ccs-app build/ccs-app
+	cp app/assets/ccs.desktop build/ccs.desktop
+endif
+
+install-app: app ## install the app (APPS or BIN_DIR overrides where)
+ifeq ($(UNAME),Darwin)
+	rm -rf '$(APPS)/ccs.app'
+	cp -R '$(APP)' '$(APPS)/ccs.app'
+else
+	mkdir -p '$(BIN_DIR)' '$(HOME)/.local/share/applications'
+	cp build/ccs-app '$(BIN_DIR)/ccs-app'
+	sed 's|^Exec=.*|Exec=$(BIN_DIR)/ccs-app|' build/ccs.desktop > '$(HOME)/.local/share/applications/ccs.desktop'
+endif
+
+uninstall-app: ## remove the installed app
+	rm -rf '$(APPS)/ccs.app' '$(BIN_DIR)/ccs-app' '$(HOME)/.local/share/applications/ccs.desktop'
 
 clean: ## remove build artefacts
 	cargo clean
-	rm -rf app/.build build
+	rm -rf build
 
 help: ## list targets
 	@grep -hE '^[a-z][a-z-]*:.*##' $(MAKEFILE_LIST) \

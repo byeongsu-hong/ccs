@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>ccs-menu</string>
+	<string>ccs-app</string>
 	<key>CFBundleIdentifier</key>
 	<string>dev.orthory.ccs</string>
 	<key>CFBundleInfoDictionaryVersion</key>

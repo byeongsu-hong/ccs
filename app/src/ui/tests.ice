@@ -79,3 +79,13 @@ test the_pool_is_ticked_per_account
   expect empty(pool_for(false, pool))
   dispatch pool_flipped("agent")
   expect !in_pool(pool, "agent")
+
+// Starting at login is asked of the platform and what it kept is shown.
+test launch_at_login_follows_the_platforms_answer
+  preset seeded
+  expect !launch_at_login_on
+  dispatch toggle_login(true)
+  expect launch_at_login_on
+  expect saved
+  dispatch toggle_login(false)
+  expect !launch_at_login_on

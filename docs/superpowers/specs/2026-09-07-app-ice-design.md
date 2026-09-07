@@ -93,8 +93,12 @@ the CLI uses. `resets_in` is the CLI's countdown string.
   (`stream replace lane=watch`) whenever the pool changes.
 - `gateway(on:bool, port:str, pool:[str]) -> str ! Failure`: starts or stops
   the listener and desk threads; the string is the log line for the window.
-- `sync prefs() -> Prefs`, `save_prefs(next:Prefs) -> unit`: a JSON file
-  under the stash root, `ccs/app.json`.
+- `sync pref_gateway_on()`, `pref_gateway_port()`, `pref_rotation_on()`,
+  `pref_pool()`, `pref_notifications_on()`, `pref_launch_at_login()`, and
+  `sync save_prefs(...) -> bool` taking every field: a JSON file under the
+  stash root, `ccs/app.json`. One accessor per field because a state
+  initializer cannot project a field off a call, and Ice cannot construct
+  a struct to hand back.
 - `notify(title:str, body:str) -> unit`: `notify-rust`.
 - `launch_at_login(on:bool) -> bool ! Failure`: LaunchAgent plist on macOS,
   XDG autostart entry on Linux; returns what it managed to set.
@@ -114,9 +118,12 @@ spent account's confirmation is up for), `gateway_line`, `watcher_line`,
 the gateway if on. `loaded`/`failed`. `pick(slug)`: switch, or set
 `confirming` when the account is spent. `confirm`/`cancel`. `polled(next)`:
 replace accounts, notify for each notice when notifications are on.
-`toggle_gateway`, `port_changed`, `toggle_rotation`, `pool_toggled(slug,
-on)`, `toggle_notifications`, `toggle_login`: update prefs, save, apply
-(restart the watcher stream with the new pool, start/stop the gateway).
+`toggle_gateway`, `apply_gateway` (the port field's submit),
+`toggle_rotation`, `pool_flipped(slug)` (the tick emits its account and the
+handler flips its place, since a checkbox route that names a lazy row's
+field is generated as two moves), `toggle_notifications`, `toggle_login`:
+update prefs, save, apply (restart the watcher stream with the new pool,
+start/stop the gateway).
 `show`: open the window, or focus it when open. `window closed`: clear
 `window`; the daemon stays. `quit`: stop the gateway, `exit`.
 

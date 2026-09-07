@@ -2,7 +2,7 @@
 //! the accounts. Deterministic, effect-free, and tested here rather than
 //! through a window.
 
-use crate::backend::Account;
+use crate::backend::{Account, PoolEntry};
 
 /// What the menu bar shows: the active Claude account's session, since that
 /// is the window that runs out within a working day.
@@ -35,7 +35,8 @@ pub fn slot(accounts: &[Account], index: i64, provider: String) -> String {
 /// the same row.
 pub fn row(accounts: &[Account], index: i64, provider: String) -> String {
     let Some(account) = nth(accounts, index, &provider) else { return String::new() };
-    let mut parts = vec![format!("{} {}", mark(account.active), account.email), account.plan.clone()];
+    let mut parts =
+        vec![format!("{} {}", mark(account.active), account.email), account.plan.clone()];
     if account.limits.is_empty() {
         if !account.note.is_empty() {
             parts.push(account.note.clone());
@@ -54,10 +55,80 @@ pub fn active_of(accounts: &[Account], slug: String) -> bool {
 }
 
 /// What the confirmation asks before switching into a spent account.
-pub fn confirm_question(accounts: &[Account], slug: String) -> String {
+pub fn confirm_question(accounts: &[Account], slug: &str) -> String {
     match accounts.iter().find(|a| a.slug == slug) {
-        Some(account) => format!("{} has nothing left on one of its limits. Switch anyway?", account.email),
+        Some(account) => {
+            format!("{} has nothing left on one of its limits. Switch anyway?", account.email)
+        }
         None => String::new(),
+    }
+}
+
+/// Whether `slug` is in the rotation pool.
+pub fn in_pool(pool: &[String], slug: String) -> bool {
+    pool.iter().any(|s| *s == slug)
+}
+
+/// The pool with `slug` added or taken out.
+pub fn toggled(pool: &[String], slug: String, on: bool) -> Vec<String> {
+    let mut next: Vec<String> = pool.iter().filter(|s| **s != slug).cloned().collect();
+    if on {
+        next.push(slug);
+    }
+    next
+}
+
+/// Every account with whether it is in the pool.
+pub fn pool_rows(accounts: &[Account], pool: &[String]) -> Vec<PoolEntry> {
+    accounts
+        .iter()
+        .map(|a| PoolEntry {
+            slug: a.slug.clone(),
+            email: a.email.clone(),
+            ticked: pool.contains(&a.slug),
+        })
+        .collect()
+}
+
+/// The pool the daemons are handed: the one ticked, only while rotation is on.
+pub fn pool_for(rotation_on: bool, pool: &[String]) -> Vec<String> {
+    match rotation_on {
+        true => pool.to_vec(),
+        false => Vec::new(),
+    }
+}
+
+/// The tray's gateway row: what it is doing, and what pressing it does.
+pub fn gateway_row(on: bool, port: String) -> String {
+    match on {
+        true => format!("Gateway on :{port} — turn off"),
+        false => format!("Gateway off — serve on :{port}"),
+    }
+}
+
+/// The tray's rotation row.
+pub fn rotation_row(on: bool) -> String {
+    match on {
+        true => "Rotating automatically — stop".to_string(),
+        false => "Not rotating — rotate automatically".to_string(),
+    }
+}
+
+/// When the watcher last looked, from the newest reading on show.
+pub fn polled_line(accounts: &[Account]) -> String {
+    match accounts.iter().map(|a| a.polled.as_str()).find(|p| !p.is_empty()) {
+        Some(polled) => format!("polled {polled}"),
+        None => "not polled yet".to_string(),
+    }
+}
+
+/// What the watcher's last turn came to, in a line under its switch.
+pub fn watcher_said(notices: &[String], rotated: &[String]) -> String {
+    let mut lines: Vec<&str> = notices.iter().map(String::as_str).collect();
+    lines.extend(rotated.iter().map(String::as_str));
+    match lines.is_empty() {
+        true => "polled; nothing to report".to_string(),
+        false => lines.join(" · "),
     }
 }
 
@@ -104,8 +175,11 @@ mod tests {
 
     #[test]
     fn the_bar_shows_the_active_claude_accounts_session() {
-        let accounts =
-            vec![account("codex", "g", true, -1.0), account("claude", "a", false, 5.0), account("claude", "h", true, 52.4)];
+        let accounts = vec![
+            account("codex", "g", true, -1.0),
+            account("claude", "a", false, 5.0),
+            account("claude", "h", true, 52.4),
+        ];
         assert_eq!(bar_label(&accounts), "52%");
     }
 
@@ -117,8 +191,11 @@ mod tests {
 
     #[test]
     fn a_slot_names_the_nth_account_of_its_provider() {
-        let accounts =
-            vec![account("claude", "a", false, 5.0), account("codex", "g", true, -1.0), account("claude", "h", true, 52.0)];
+        let accounts = vec![
+            account("claude", "a", false, 5.0),
+            account("codex", "g", true, -1.0),
+            account("claude", "h", true, 52.0),
+        ];
         assert!(has(&accounts, 0, "claude".into()));
         assert!(has(&accounts, 1, "claude".into()));
         assert!(!has(&accounts, 2, "claude".into()));
@@ -132,8 +209,14 @@ mod tests {
     #[test]
     fn a_row_reads_as_one_line_with_the_mark_and_every_limit() {
         let accounts = vec![account("claude", "h", true, 52.0), account("claude", "a", false, 5.0)];
-        assert_eq!(row(&accounts, 0, "claude".into()), "● h@x.com · max20x · session 52% · weekly 37% · Fable 62%");
-        assert_eq!(row(&accounts, 1, "claude".into()), "○ a@x.com · max20x · session 5% · weekly 37% · Fable 62%");
+        assert_eq!(
+            row(&accounts, 0, "claude".into()),
+            "● h@x.com · max20x · session 52% · weekly 37% · Fable 62%"
+        );
+        assert_eq!(
+            row(&accounts, 1, "claude".into()),
+            "○ a@x.com · max20x · session 5% · weekly 37% · Fable 62%"
+        );
         assert_eq!(row(&accounts, 3, "claude".into()), "");
     }
 
@@ -148,9 +231,50 @@ mod tests {
     #[test]
     fn the_question_names_the_account_and_nobody_when_there_is_none() {
         let accounts = vec![account("claude", "r", false, 100.0)];
-        assert_eq!(confirm_question(&accounts, "r".into()), "r@x.com has nothing left on one of its limits. Switch anyway?");
-        assert_eq!(confirm_question(&accounts, "x".into()), "");
+        assert_eq!(
+            confirm_question(&accounts, "r"),
+            "r@x.com has nothing left on one of its limits. Switch anyway?"
+        );
+        assert_eq!(confirm_question(&accounts, "x"), "");
         assert!(!active_of(&accounts, "r".into()));
+    }
+
+    #[test]
+    fn the_pool_is_ticked_and_unticked_by_slug() {
+        let pool = vec!["a".to_string()];
+        assert!(in_pool(&pool, "a".into()));
+        assert!(!in_pool(&pool, "b".into()));
+        assert_eq!(toggled(&pool, "b".into(), true), ["a", "b"]);
+        assert_eq!(toggled(&pool, "a".into(), false), Vec::<String>::new());
+        assert_eq!(toggled(&pool, "a".into(), true), ["a"]);
+        assert_eq!(pool_for(false, &pool), Vec::<String>::new());
+        assert_eq!(pool_for(true, &pool), ["a"]);
+        let rows = pool_rows(
+            &[account("claude", "a", true, 5.0), account("claude", "b", false, 5.0)],
+            &pool,
+        );
+        assert_eq!(
+            rows.iter().map(|r| (r.slug.as_str(), r.ticked)).collect::<Vec<_>>(),
+            [("a", true), ("b", false)]
+        );
+    }
+
+    #[test]
+    fn the_daemon_rows_say_what_pressing_them_does() {
+        assert_eq!(gateway_row(true, "4141".into()), "Gateway on :4141 — turn off");
+        assert_eq!(gateway_row(false, "4141".into()), "Gateway off — serve on :4141");
+        assert_eq!(rotation_row(false), "Not rotating — rotate automatically");
+        assert_eq!(polled_line(&[account("claude", "a", true, 5.0)]), "polled 2m ago");
+        assert_eq!(polled_line(&[]), "not polled yet");
+    }
+
+    #[test]
+    fn the_watcher_line_is_what_the_turn_did_or_that_it_did_nothing() {
+        assert_eq!(watcher_said(&[], &[]), "polled; nothing to report");
+        assert_eq!(
+            watcher_said(&["session-high: a".into()], &["switched to b".into()]),
+            "session-high: a · switched to b"
+        );
     }
 
     #[test]

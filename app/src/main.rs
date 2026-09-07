@@ -3,6 +3,7 @@
 
 mod backend;
 mod format;
+mod platform;
 
 ui_lang::include_app!("src/ui/app.ice");
 

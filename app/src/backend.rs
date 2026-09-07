@@ -10,6 +10,7 @@ use ccs::cmd::Cached;
 use ccs::env::Env;
 use ccs::model::Health;
 use ccs::render;
+use iced::futures::Stream;
 use jiff::Timestamp;
 
 /// One limit as the view draws it.
@@ -40,6 +41,14 @@ pub struct Account {
     /// Why there is no reading, when there is none.
     pub note: String,
     pub limits: Vec<Limit>,
+}
+
+/// One account's place in the rotation pool, for the row that ticks it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolEntry {
+    pub slug: String,
+    pub email: String,
+    pub ticked: bool,
 }
 
 /// What went wrong, for the window to say. A switch refused because the
@@ -85,7 +94,8 @@ static STASH: Mutex<()> = Mutex::new(());
 
 #[cfg(not(test))]
 fn env() -> Result<Arc<Env>, Failure> {
-    let opened = ENV.get_or_init(|| Env::open().map(Arc::new).map_err(|e| Failure::from(e).message));
+    let opened =
+        ENV.get_or_init(|| Env::open().map(Arc::new).map_err(|e| Failure::from(e).message));
     opened.clone().map_err(Failure::new)
 }
 
@@ -121,6 +131,140 @@ pub async fn switch(slug: String, force: bool) -> Result<Vec<Account>, Failure> 
         }
         ccs::cmd::switch(&ctx, &slug, force)?;
         Ok(accounts_of(&ccs::cmd::readings(&ctx)?, Timestamp::now()))
+    }
+}
+
+/// One turn of the watcher, as the window takes it.
+#[derive(Clone, Debug)]
+pub struct Poll {
+    pub accounts: Vec<Account>,
+    /// The notices raised this turn, one line each.
+    pub notices: Vec<String>,
+    /// The accounts rotated onto, one line each.
+    pub rotated: Vec<String>,
+}
+
+/// The watcher: one poll every five minutes, on a thread of its own, each
+/// turn handed to the window as it happens. The one thing in the process
+/// that asks the API. Notices are shown as notifications here, when asked,
+/// since a handler cannot walk a list. Dropping the stream stops the thread
+/// at its next tick.
+pub fn watch(
+    high: f64,
+    pool: Vec<String>,
+    notify: bool,
+) -> impl Stream<Item = Result<Poll, Failure>> + Send + 'static {
+    #[cfg(test)]
+    {
+        let _ = (high, pool, notify);
+        return fixture::watch();
+    }
+    #[cfg(not(test))]
+    {
+        use iced::futures::SinkExt;
+        let (mut tx, rx) = iced::futures::channel::mpsc::channel::<Result<Poll, Failure>>(4);
+        std::thread::spawn(move || {
+            let mut before = ccs::watch::Snapshot::new();
+            loop {
+                let turn = match env() {
+                    Ok(env) => {
+                        let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let ctx = env.ctx();
+                        let turn = ccs::cmd::poll(&ctx, &mut before, high, &pool);
+                        match turn.failed {
+                            Some(why) => Err(Failure::new(why)),
+                            None => {
+                                let readings = ccs::cmd::readings(&ctx).map_err(Failure::from);
+                                readings.map(|readings| Poll {
+                                    accounts: accounts_of(&readings, Timestamp::now()),
+                                    notices: turn
+                                        .notices
+                                        .iter()
+                                        .map(|(event, _)| format!("{}: {}", event.kind, event.text))
+                                        .collect(),
+                                    rotated: turn
+                                        .rotations
+                                        .iter()
+                                        .map(|r| match r {
+                                            Ok(switched) => format!(
+                                                "switched to {}",
+                                                switched.target.account.email
+                                            ),
+                                            Err(why) => format!("rotate failed: {why}"),
+                                        })
+                                        .collect(),
+                                })
+                            }
+                        }
+                    }
+                    Err(failure) => Err(failure),
+                };
+                if notify {
+                    if let Ok(turn) = &turn {
+                        for line in turn.notices.iter().chain(&turn.rotated) {
+                            crate::platform::notify("ccs", line);
+                        }
+                    }
+                }
+                if iced::futures::executor::block_on(tx.send(turn)).is_err() {
+                    return;
+                }
+                // Sleep in short steps so a dropped stream is noticed soon.
+                for _ in 0..300 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if tx.is_closed() {
+                        return;
+                    }
+                }
+            }
+        });
+        rx
+    }
+}
+
+/// The gateway, up or down. Up, the listener and the desk that answers it
+/// run on threads of this process; `pool` is what a limited request falls
+/// over to. Changing the port or the pool takes it down and up again. The
+/// line that comes back is what the window shows under the switch.
+pub async fn gateway(on: bool, port: String, pool: Vec<String>) -> Result<String, Failure> {
+    #[cfg(test)]
+    {
+        let _ = pool;
+        return Ok(fixture::gateway(on, &port));
+    }
+    #[cfg(not(test))]
+    {
+        let mut running = GATEWAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(up) = running.take() {
+            up.stop();
+        }
+        if !on {
+            return Ok("off".to_string());
+        }
+        let port: u16 =
+            port.trim().parse().map_err(|_| Failure::new(format!("{port:?} is not a port")))?;
+        let env = env()?;
+        let keys = ccs::cmd::gateway_keys(&env.ctx())?;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+            .map_err(|e| Failure::new(format!("listening on 127.0.0.1:{port}: {e}")))?;
+        let (asks, inbox) = std::sync::mpsc::channel();
+        let up = ccs::serve::listen(listener, keys, asks);
+        let desk_env = Arc::clone(&env);
+        std::thread::spawn(move || ccs::cmd::desk(&desk_env.ctx(), &pool, inbox));
+        *running = Some(up);
+        Ok(format!("serving http://127.0.0.1:{port} as the accounts in use"))
+    }
+}
+
+/// The gateway that is up, if one is.
+#[cfg(not(test))]
+static GATEWAY: Mutex<Option<ccs::serve::Listening>> = Mutex::new(None);
+
+/// Take the gateway down, for a quit that should not leave a port held.
+pub async fn shutdown() {
+    #[cfg(not(test))]
+    if let Some(up) = GATEWAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+        up.stop();
     }
 }
 
@@ -184,6 +328,29 @@ pub mod fixture {
         Ok(if held.is_empty() { reset() } else { held })
     }
 
+    /// One turn, then the end: the fixture's accounts with `agent` in use,
+    /// as if the watcher had rotated onto it.
+    pub fn watch() -> impl super::Stream<Item = Result<super::Poll, Failure>> + Send + 'static {
+        let mut accounts = reset();
+        for account in accounts.iter_mut().filter(|a| a.provider == "claude") {
+            account.active = account.slug == "agent";
+        }
+        *ACCOUNTS.lock().expect("fixture") = accounts.clone();
+        let turn = super::Poll {
+            accounts,
+            notices: vec!["session-high: hong@example.com has crossed 90%".into()],
+            rotated: vec!["switched to agent@example.com".into()],
+        };
+        iced::futures::stream::once(async move { Ok(turn) })
+    }
+
+    pub fn gateway(on: bool, port: &str) -> String {
+        match on {
+            true => format!("serving http://127.0.0.1:{port} as the accounts in use"),
+            false => "off".into(),
+        }
+    }
+
     pub fn switch(slug: &str, force: bool) -> Result<Vec<Account>, Failure> {
         if ACCOUNTS.lock().expect("fixture").is_empty() {
             reset();
@@ -214,7 +381,11 @@ pub fn accounts_of(readings: &[Cached], now: Timestamp) -> Vec<Account> {
                 .map(|limit| Limit {
                     column: limit.column(),
                     percent: limit.percent,
-                    resets_in: limit.resets_at.as_deref().and_then(render::until).unwrap_or_default(),
+                    resets_in: limit
+                        .resets_at
+                        .as_deref()
+                        .and_then(render::until)
+                        .unwrap_or_default(),
                     health: match limit.health() {
                         Health::Ok => "ok",
                         Health::Warn => "warn",
@@ -286,14 +457,20 @@ mod tests {
         let rows = vec![cached(
             "h",
             true,
-            Ok(vec![reading("session", 52.0, "2099-01-01T00:00:00Z"), reading("weekly_all", 100.0, "2099-01-01T00:00:00Z")]),
+            Ok(vec![
+                reading("session", 52.0, "2099-01-01T00:00:00Z"),
+                reading("weekly_all", 100.0, "2099-01-01T00:00:00Z"),
+            ]),
         )];
 
         let accounts = accounts_of(&rows, now);
 
         assert_eq!(accounts.len(), 1);
         let account = &accounts[0];
-        assert_eq!((account.provider.as_str(), account.slug.as_str(), account.active), ("claude", "h", true));
+        assert_eq!(
+            (account.provider.as_str(), account.slug.as_str(), account.active),
+            ("claude", "h", true)
+        );
         assert_eq!(account.session_percent, 52.0);
         assert!(account.spent);
         assert_eq!(account.polled, "4m ago");

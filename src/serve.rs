@@ -18,6 +18,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Instant;
@@ -537,13 +538,41 @@ impl Accounts for Line {
     }
 }
 
-/// Accept connections for as long as the process runs, each on a thread of
-/// its own, asking `asks` which account to send as. Returns at once.
-pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) {
+/// A gateway that is up, and the way to take it down.
+pub struct Listening {
+    stop: Arc<AtomicBool>,
+    addr: std::net::SocketAddr,
+}
+
+impl Listening {
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
+    /// Stop accepting. The accept loop is woken with one connection of its
+    /// own, sees the flag, and lets the listener go; connections already
+    /// open finish on their own.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+    }
+}
+
+/// Accept connections until stopped, each on a thread of its own, asking
+/// `asks` which account to send as. Returns at once. The desk that answers
+/// `asks` ends when the last asker is gone: the accept thread's, dropped
+/// when it stops, and each connection's, dropped when it closes.
+pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) -> Listening {
+    let stop = Arc::new(AtomicBool::new(false));
+    let addr = listener.local_addr().expect("a bound listener has an address");
+    let flag = Arc::clone(&stop);
     thread::spawn(move || {
         let claude = Arc::new(Upstream::new(CLAUDE_API));
         let codex = Arc::new(Upstream::new(CODEX_API));
         for stream in listener.incoming() {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
             let Ok(stream) = stream else { continue };
             let keys = keys.clone();
             let line = Line(asks.clone());
@@ -554,6 +583,7 @@ pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) {
             });
         }
     });
+    Listening { stop, addr }
 }
 
 /// Answer requests on one connection until the client hangs up.
@@ -1289,6 +1319,24 @@ mod tests {
 
         assert_eq!(status, 502);
         assert!(body.contains("api_error"), "{body}");
+    }
+
+    /// The gateway can be taken down by the process that put it up: after
+    /// `stop`, nobody answers on the port and the desk's inbox closes.
+    #[test]
+    fn a_stopped_gateway_answers_nobody_and_lets_its_desk_go() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let (asks, inbox) = mpsc::channel();
+        let up = listen(listener, keys(), asks);
+        let addr = up.addr();
+
+        assert!(std::net::TcpStream::connect(addr).is_ok());
+        up.stop();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        // Every asker is gone once the accept thread has dropped its sender
+        // and the connections above have closed.
+        assert!(inbox.recv_timeout(std::time::Duration::from_secs(2)).is_err());
     }
 
     #[test]

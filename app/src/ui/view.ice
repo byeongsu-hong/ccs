@@ -1,20 +1,5 @@
-// One limit as a bar: its name, the bar tinted by its standing, the figure,
-// and when it comes back.
-component LimitBar(limit:Limit)
-  row w=fill gap=8.0 align=center
-    text limit.column w=96.0 @text-muted text-xs
-    match limit.health
-      "spent"
-        progress limit.percent min=0.0 max=100.0 girth=6.0 bar=danger bg=rail
-      "warn"
-        progress limit.percent min=0.0 max=100.0 girth=6.0 bar=warn bg=rail
-      _
-        progress limit.percent min=0.0 max=100.0 girth=6.0 bar=ok bg=rail
-    text percent_label(limit.percent) w=40.0 @text-fg text-xs
-    text limit.resets_in w=56.0 @text-muted text-xs
-
-// One account: who, what plan, whether in use, and every limit it reports.
-// The whole card is the switch.
+// One account: who, what plan, whether in use, and every limit it reports
+// as a bar tinted by its standing. The whole card is the switch.
 component AccountRow(account:Account) -> str
   button #pick -> emit(account.slug)
     with
@@ -30,7 +15,21 @@ component AccountRow(account:Account) -> str
       if account.note != ""
         text account.note @text-muted text-xs
       for limit in account.limits
-        LimitBar limit=limit
+        row w=fill gap=8.0 align=center
+          text limit.column w=96.0 @text-muted text-xs
+          if limit.health == "spent"
+            progress limit.percent min=0.0 max=100.0 girth=6.0 bar=danger bg=rail
+          if limit.health == "warn"
+            progress limit.percent min=0.0 max=100.0 girth=6.0 bar=warn bg=rail
+          if limit.health == "ok"
+            progress limit.percent min=0.0 max=100.0 girth=6.0 bar=ok bg=rail
+          text percent_label(limit.percent) w=40.0 @text-fg text-xs
+          text limit.resets_in w=56.0 @text-muted text-xs
+
+// One account's tick in the rotation pool: the tick emits the account, and
+// the handler flips its place in the pool.
+component PoolRow(slug:str, email:str, ticked:bool) -> str
+  checkbox email #tick checked=ticked -> emit(slug)
 
 view
   overlay #confirm when=(confirming != "") dismiss=cancel
@@ -44,6 +43,26 @@ view
             for account in accounts
               lazy account by account.slug, account.polled, account.active as held
                 AccountRow account=held #account(held.slug) -> pick _
+            col w=fill p=12.0 gap=6.0 @bg-surface rounded-lg
+              row w=fill gap=8.0 align=center
+                toggler "Gateway" #gateway checked=gateway_on -> toggle_gateway _
+                space w=fill
+                text "port" @text-muted text-xs
+                input "port" #port <-> gateway_port w=72.0 submit=apply_gateway
+              text "Serves the Anthropic and Codex APIs on 127.0.0.1 as the accounts in use, for pi and Aside." @text-muted text-xs
+              text gateway_line #gateway-line @text-muted text-xs
+            col w=fill p=12.0 gap=6.0 @bg-surface rounded-lg
+              toggler "Rotate automatically" #rotation checked=rotation_on -> toggle_rotation _
+              text "Switch away from a pooled account whose session runs high, to the one whose weekly resets soonest." @text-muted text-xs
+              for entry in pool_rows_now
+                lazy entry by entry.slug, entry.ticked as held
+                  PoolRow slug=held.slug email=held.email ticked=held.ticked #pool(held.email) -> pool_flipped _
+              toggler "Notifications" #notifications checked=notifications_on -> toggle_notifications _
+              text watcher_line #watcher-line @text-muted text-xs
+            row w=fill gap=8.0 align=center
+              text polled_line(accounts) #polled @text-muted text-xs
+              space w=fill
+              button "Quit" #quit @bg-rail text-fg px-12px py-8px rounded-md -> quit
     layer
       col w=320.0 p=16.0 gap=12.0 @bg-surface rounded-lg
         text confirm_question(accounts, confirming) @text-fg

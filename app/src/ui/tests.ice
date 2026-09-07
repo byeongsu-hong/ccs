@@ -44,3 +44,38 @@ test each_provider_has_its_own_slots
   preset seeded
   expect tray command "● codex-frost@example.com · codex pro · session 0% · weekly 37%"
   expect no tray item "○ codex-frost@example.com"
+
+// The gateway's switch reaches the gateway and its answer reaches the line
+// under the switch; a port typed in is what the next start uses.
+test the_gateway_switch_starts_and_stops_it
+  preset seeded
+  expect gateway_line == "off"
+  dispatch toggle_gateway(true)
+  expect gateway_on
+  expect gateway_line == "serving http://127.0.0.1:4141 as the accounts in use"
+  dispatch toggle_gateway(false)
+  expect gateway_line == "off"
+  expect tray command "Gateway off — serve on :4141"
+
+// A turn of the watcher replaces the list and says what it did, and the
+// notifications switch changes nothing about that.
+test a_turn_of_the_watcher_lands_in_the_list
+  preset seeded
+  expect active_of(accounts, "hong")
+  dispatch toggle_rotation(true)
+  expect rotation_on
+  expect active_of(accounts, "agent")
+  expect watcher_line == "session-high: hong@example.com has crossed 90% · switched to agent@example.com"
+  expect tray item "Rotating automatically — stop"
+
+// Ticking an account puts it in the pool, and only while rotation is on is
+// the pool handed to the daemons.
+test the_pool_is_ticked_per_account
+  preset seeded
+  dispatch pool_flipped("agent")
+  dispatch pool_flipped("robin")
+  expect in_pool(pool, "agent")
+  expect in_pool(pool, "robin")
+  expect empty(pool_for(false, pool))
+  dispatch pool_flipped("agent")
+  expect !in_pool(pool, "agent")

@@ -379,7 +379,7 @@ fn codex_in_use(ctx: &Ctx, hint: &str) -> Result<Oauth> {
 
 pub fn list(ctx: &Ctx, json: bool, cached: bool) -> Result<()> {
     if cached {
-        let readings = cached_entries(ctx)?;
+        let readings = readings(ctx)?;
         if json {
             let views: Vec<View> =
                 readings.iter().map(|r| view(&r.entry, r.polled_at.as_deref())).collect();
@@ -406,9 +406,9 @@ pub fn list(ctx: &Ctx, json: bool, cached: bool) -> Result<()> {
 }
 
 /// An entry as the last poll left it, and when that was.
-struct Cached {
-    entry: Entry,
-    polled_at: Option<String>,
+pub struct Cached {
+    pub entry: Entry,
+    pub polled_at: Option<String>,
 }
 
 /// Every account with what the last poll wrote down for it: no network, no
@@ -416,7 +416,7 @@ struct Cached {
 /// often than a poll can be afforded, with `ccs watch` keeping it current.
 /// The account in use is whichever the stash's pointer names; identifying it
 /// against the live credentials would cost a keychain read per call.
-fn cached_entries(ctx: &Ctx) -> Result<Vec<Cached>> {
+pub fn readings(ctx: &Ctx) -> Result<Vec<Cached>> {
     let accounts = stashed(ctx)?;
     accounts
         .iter()
@@ -702,6 +702,21 @@ pub fn remove(ctx: &Ctx, needle: &str) -> Result<()> {
 }
 
 pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
+    let switched = switch(ctx, needle, force)?;
+    report_switch(&switched.target, switched.told);
+    Ok(())
+}
+
+/// What a switch came to.
+pub struct Switched {
+    pub target: Stashed,
+    /// Sessions that heard about it.
+    pub told: usize,
+}
+
+/// Switch to the account `needle` names, probing it first so a spent one is
+/// refused — or, off a terminal, refused without asking — unless `force`.
+pub fn switch(ctx: &Ctx, needle: &str, force: bool) -> Result<Switched> {
     let mut accounts = ctx.stash.list()?;
     let slug = stash::resolve(&accounts, needle)?.slug.clone();
 
@@ -717,8 +732,7 @@ pub fn use_account(ctx: &Ctx, needle: &str, force: bool) -> Result<()> {
     let target = stash::resolve(&accounts, &slug)?.clone();
     guard_exhausted(&entry_of(&target, &probe, false), force)?;
     let told = switch_to(ctx, &mut accounts, &target)?;
-    report_switch(&target, told);
-    Ok(())
+    Ok(Switched { target, told })
 }
 
 /// Subscribe (or unsubscribe) the calling Claude Code session to notices.
@@ -726,51 +740,88 @@ pub fn notify(ctx: &Ctx, off: bool, kinds: &[String], bypass: bool) -> Result<()
     notify::subscribe(ctx.stash.root(), !off, kinds, bypass)
 }
 
+/// The slugs `names` resolve to, for a pool.
+pub fn resolve_pool(ctx: &Ctx, names: &[String]) -> Result<Vec<String>> {
+    let accounts = stashed(ctx)?;
+    names.iter().map(|n| stash::resolve(&accounts, n).map(|s| s.slug.clone())).collect()
+}
+
+/// What one turn of the watch loop found and did.
+pub struct Poll {
+    /// Every account as the poll read it; empty when the poll itself failed.
+    pub entries: Vec<Entry>,
+    /// The notices raised, delivered to the sessions that asked, with how
+    /// many heard each.
+    pub notices: Vec<(watch::Event, usize)>,
+    /// The accounts rotated onto, or why a rotation failed.
+    pub rotations: Vec<Result<Switched, String>>,
+    /// Why the poll failed, when it did.
+    pub failed: Option<String>,
+}
+
+/// One turn of the watch: poll every account, raise a notice for whatever
+/// changed since `before`, and rotate any pooled account that has run high.
+/// `before` is left holding this turn for the next.
+pub fn poll(ctx: &Ctx, before: &mut watch::Snapshot, high: f64, pool: &[String]) -> Poll {
+    let mut turn =
+        Poll { entries: Vec::new(), notices: Vec::new(), rotations: Vec::new(), failed: None };
+    let mut accounts = match stashed(ctx) {
+        Ok(accounts) => accounts,
+        Err(e) => {
+            turn.failed = Some(describe(&e));
+            return turn;
+        }
+    };
+    let table = match survey(ctx, &mut accounts, Style::detect()) {
+        Ok((table, _)) => table,
+        Err(e) => {
+            turn.failed = Some(describe(&e));
+            return turn;
+        }
+    };
+    for event in watch::diff(before, table.entries(), high) {
+        let told = notify::broadcast(ctx.creds.dir(), ctx.stash.root(), event.kind, &event.text);
+        turn.notices.push((event, told));
+    }
+    *before = watch::snapshot(table.entries());
+    for next in watch::rotations(table.entries(), pool, high) {
+        let rotated = stash::resolve(&accounts, &next.slug).cloned().and_then(|target| {
+            let told = switch_to(ctx, &mut accounts, &target)?;
+            Ok(Switched { target, told })
+        });
+        turn.rotations.push(rotated.map_err(|e| describe(&e)));
+    }
+    turn.entries = table.entries().to_vec();
+    turn
+}
+
 /// Poll every account on an interval and raise a notice for whatever changed.
 /// Runs until killed; each notice is echoed here as well as delivered.
 pub fn watch(ctx: &Ctx, every: Duration, high: f64, rotate: &[String]) -> Result<()> {
-    let pool: Vec<String> = {
-        let accounts = stashed(ctx)?;
-        rotate
-            .iter()
-            .map(|n| stash::resolve(&accounts, n).map(|s| s.slug.clone()))
-            .collect::<Result<_>>()?
-    };
+    let pool = resolve_pool(ctx, rotate)?;
     if !pool.is_empty() {
         println!("{} rotating between {}", stamp(), pool.join(", "));
     }
     let mut before = watch::Snapshot::new();
     loop {
-        let mut accounts = stashed(ctx)?;
-        match survey(ctx, &mut accounts, Style::detect()) {
-            Ok((table, _)) => {
-                for event in watch::diff(&before, table.entries(), high) {
-                    let told = notify::broadcast(
-                        ctx.creds.dir(),
-                        ctx.stash.root(),
-                        event.kind,
-                        &event.text,
-                    );
-                    println!("{} {}: {}{}", stamp(), event.kind, event.text, heard(told));
-                }
-                before = watch::snapshot(table.entries());
-                for next in watch::rotations(table.entries(), &pool, high) {
-                    match stash::resolve(&accounts, &next.slug).cloned() {
-                        Ok(target) => match switch_to(ctx, &mut accounts, &target) {
-                            Ok(told) => println!(
-                                "{} rotate: switched to {} ({}){}",
-                                stamp(),
-                                target.account.email,
-                                target.slug,
-                                heard(told)
-                            ),
-                            Err(e) => eprintln!("{} rotate failed: {}", stamp(), describe(&e)),
-                        },
-                        Err(e) => eprintln!("{} rotate failed: {}", stamp(), describe(&e)),
-                    }
-                }
+        let turn = poll(ctx, &mut before, high, &pool);
+        if let Some(why) = &turn.failed {
+            eprintln!("{} poll failed: {why}", stamp());
+        }
+        for (event, told) in &turn.notices {
+            println!("{} {}: {}{}", stamp(), event.kind, event.text, heard(*told));
+        }
+        for rotated in &turn.rotations {
+            match rotated {
+                Ok(switched) => println!(
+                    "{} rotate: switched to {} ({}){}",
+                    stamp(),
+                    switched.target.account.email,
+                    switched.target.slug,
+                    heard(switched.told)
+                ),
+                Err(why) => eprintln!("{} rotate failed: {why}", stamp()),
             }
-            Err(e) => eprintln!("{} poll failed: {}", stamp(), describe(&e)),
         }
         thread::sleep(every);
     }
@@ -787,17 +838,8 @@ fn stamp() -> String {
 /// The connections are answered on threads of their own; this thread keeps
 /// the stash, and answers their questions about which account to send as.
 pub fn serve(ctx: &Ctx, port: u16, rotate: &[String]) -> Result<()> {
-    let pool: Vec<String> = {
-        let accounts = stashed(ctx)?;
-        rotate
-            .iter()
-            .map(|n| stash::resolve(&accounts, n).map(|s| s.slug.clone()))
-            .collect::<Result<_>>()?
-    };
-    let keys = serve::Keys {
-        claude: serve::key(ctx.stash.root())?,
-        codex: serve::codex_key(ctx.stash.root())?,
-    };
+    let pool = resolve_pool(ctx, rotate)?;
+    let keys = gateway_keys(ctx)?;
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("listening on 127.0.0.1:{port}"))?;
 
@@ -809,11 +851,26 @@ pub fn serve(ctx: &Ctx, port: u16, rotate: &[String]) -> Result<()> {
 
     let (asks, inbox) = std::sync::mpsc::channel();
     serve::listen(listener, keys, asks);
-    let desk = Desk { ctx, pool: &pool };
+    desk(ctx, &pool, inbox);
+    Ok(())
+}
+
+/// Both gateway keys, minted if need be.
+pub fn gateway_keys(ctx: &Ctx) -> Result<serve::Keys> {
+    Ok(serve::Keys {
+        claude: serve::key(ctx.stash.root())?,
+        codex: serve::codex_key(ctx.stash.root())?,
+    })
+}
+
+/// Answer the gateway's questions about which account to send as, until the
+/// listener that asks them is gone. The thread that holds the stash runs
+/// this; the connection threads ask.
+pub fn desk(ctx: &Ctx, pool: &[String], inbox: std::sync::mpsc::Receiver<serve::Ask>) {
+    let desk = Desk { ctx, pool };
     for ask in inbox {
         ask.answer(&desk);
     }
-    Ok(())
 }
 
 /// Print a provider's gateway key, for pi's `"apiKey": "!ccs serve --key"`.
@@ -1299,24 +1356,24 @@ mod tests {
     use super::*;
     use crate::limit;
     use crate::picker::Accounts as _;
-    use std::cell::RefCell;
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
 
     /// Credentials held in memory rather than on disk, so a test can see what
     /// a command installed.
     struct Recorder {
         dir: PathBuf,
-        held: RefCell<Option<CredsFile>>,
+        held: Mutex<Option<CredsFile>>,
     }
 
     impl CredStore for Recorder {
         fn read(&self) -> Result<Option<CredsFile>> {
-            Ok(self.held.borrow().clone())
+            Ok(self.held.lock().expect("recorder").clone())
         }
 
         fn write(&self, creds: &CredsFile) -> Result<()> {
-            *self.held.borrow_mut() = Some(creds.clone());
+            *self.held.lock().expect("recorder") = Some(creds.clone());
             Ok(())
         }
 
@@ -1346,16 +1403,16 @@ mod tests {
     /// Codex's login held in memory, as `Recorder` holds Claude's.
     struct CodexRecorder {
         dir: PathBuf,
-        held: RefCell<Option<codex::AuthFile>>,
+        held: Mutex<Option<codex::AuthFile>>,
     }
 
     impl codex::Creds for CodexRecorder {
         fn read(&self) -> Result<Option<codex::AuthFile>> {
-            Ok(self.held.borrow().clone())
+            Ok(self.held.lock().expect("recorder").clone())
         }
 
         fn write(&self, file: &codex::AuthFile) -> Result<()> {
-            *self.held.borrow_mut() = Some(file.clone());
+            *self.held.lock().expect("recorder") = Some(file.clone());
             Ok(())
         }
 
@@ -1418,8 +1475,8 @@ mod tests {
             fs::create_dir_all(&dir).expect("config directory");
             let stash = Stash::open(&dir).expect("stash");
             Self {
-                creds: Recorder { dir: dir.clone(), held: RefCell::new(None) },
-                codex: CodexRecorder { dir: dir.join("codex"), held: RefCell::new(None) },
+                creds: Recorder { dir: dir.clone(), held: Mutex::new(None) },
+                codex: CodexRecorder { dir: dir.join("codex"), held: Mutex::new(None) },
                 codex_api: codex::Client::new(),
                 usage: usage::Cache::open(stash.root()).expect("usage cache"),
                 stash,
@@ -1704,7 +1761,7 @@ mod tests {
         fixture.stash.set_active(Provider::Claude, "b").expect("active");
         fixture.usage.record("a", &[limit!("session", 42.0)]).expect("records");
 
-        let entries = cached_entries(&fixture.ctx()).expect("lists");
+        let entries = readings(&fixture.ctx()).expect("lists");
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].entry.slug, "a");
@@ -1892,7 +1949,7 @@ mod tests {
         fixture.stash.set_active(Provider::Claude, "a").expect("active");
         fixture.stash.set_active(Provider::Codex, "g").expect("active");
 
-        let entries = cached_entries(&fixture.ctx()).expect("lists");
+        let entries = readings(&fixture.ctx()).expect("lists");
         assert!(entries.iter().all(|e| e.entry.active));
         assert_eq!(
             entries.iter().find(|e| e.entry.slug == "g").map(|e| e.entry.provider),

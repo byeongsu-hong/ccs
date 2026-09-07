@@ -28,6 +28,7 @@ const BOLD: &str = "\x1b[1m";
 
 /// What the table needs to know about one account. Deliberately free of stash
 /// and API types so the table stays a pure formatter.
+#[derive(Clone)]
 pub struct Entry {
     pub provider: Provider,
     pub slug: String,
@@ -124,6 +125,10 @@ impl Table {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub fn entries(&self) -> &[Entry] {

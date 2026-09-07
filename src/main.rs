@@ -1,32 +1,11 @@
-mod api;
-mod cli;
-mod cmd;
-mod codex;
-mod creds;
-mod fsx;
-mod lock;
-mod login;
-mod model;
-mod notify;
-mod pen;
-mod picker;
-mod render;
-mod serve;
-mod sha256;
-mod stash;
-mod usage;
-mod watch;
-
-use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::api::Api;
-use crate::cli::Cmd;
-use crate::creds::Backend;
-use crate::model::Provider;
-use crate::stash::Stash;
+use ccs::cli::{self, Cmd};
+use ccs::env::Env;
+use ccs::model::Provider;
+use ccs::{cmd, login};
 
 fn main() -> ExitCode {
     let Err(error) = run() else { return ExitCode::SUCCESS };
@@ -49,29 +28,8 @@ fn run() -> Result<()> {
         _ => {}
     }
 
-    let config_dir = config_dir()?;
-    // A pen records the configuration it was cut from; anywhere else, this is it.
-    let here = pen::Home { config: config_dir.clone(), global: global_config()? };
-    let home = pen::home_of(&config_dir).unwrap_or(here);
-
-    let backend = Backend::detect();
-    let creds = backend.live(&config_dir);
-    let stash = Stash::open(&home.config)?;
-    let usage = usage::Cache::open(stash.root())?;
-    let api = Api::new();
-    let codex_home = std::env::var_os("CODEX_HOME").filter(|d| !d.is_empty()).map(PathBuf::from);
-    let codex_store = codex::Store::at(&self::home()?, codex_home.as_deref());
-    let codex_api = codex::Client::new();
-    let ctx = cmd::Ctx {
-        creds: creds.as_ref(),
-        backend,
-        stash: &stash,
-        usage: &usage,
-        api: &api,
-        codex: &codex_store,
-        codex_api: &codex_api,
-        home: &home,
-    };
+    let env = Env::open()?;
+    let ctx = env.ctx();
 
     match command {
         Cmd::Pick => cmd::pick(&ctx),
@@ -93,30 +51,4 @@ fn run() -> Result<()> {
         Cmd::ServeKey { provider } => cmd::serve_key(&ctx, provider),
         Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
     }
-}
-
-/// The configuration directory this process acts on: where the credentials a
-/// switch replaces live. Honours the same override Claude Code itself honours,
-/// so a session confined to a pen switches inside that pen rather than out of
-/// it.
-fn config_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    Ok(home()?.join(".claude"))
-}
-
-/// Where Claude Code resolves its global configuration file, which is beside
-/// the home directory rather than inside the configuration directory — until
-/// `CLAUDE_CONFIG_DIR` is set, which moves it in.
-fn global_config() -> Result<PathBuf> {
-    let dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => home()?,
-    };
-    Ok(dir.join(pen::GLOBAL))
-}
-
-fn home() -> Result<PathBuf> {
-    Ok(PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?))
 }

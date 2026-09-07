@@ -27,8 +27,9 @@ pub const OVERRIDING: [&str; 5] = [
     "CLAUDE_CODE_HOST_CREDS_FILE",
 ];
 
-/// Where Claude Code's live credentials live.
-pub trait CredStore {
+/// Where Claude Code's live credentials live. Shareable across threads,
+/// which every store is: a path, a name, nothing that moves.
+pub trait CredStore: Send + Sync {
     /// The live credentials, or `None` when nobody is logged in.
     fn read(&self) -> Result<Option<CredsFile>>;
     /// Replace the live credentials atomically.

@@ -158,8 +158,8 @@ impl AuthFile {
 
 // ── the store ───────────────────────────────────────────────────────────────
 
-/// Where Codex's live login is kept.
-pub trait Creds {
+/// Where Codex's live login is kept. Shareable, like the Claude store.
+pub trait Creds: Send + Sync {
     fn read(&self) -> Result<Option<AuthFile>>;
     fn write(&self, file: &AuthFile) -> Result<()>;
     /// The directory the lock is taken in.

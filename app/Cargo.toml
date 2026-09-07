@@ -1,0 +1,32 @@
+[package]
+name = "ccs-app"
+version = "0.1.0"
+edition = "2024"
+description = "ccs in a window, and on the menu bar where there is one"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "ccs-app"
+path = "src/main.rs"
+
+# ui-lang is not on crates.io; it is taken from its repository at a fixed
+# revision. The three crates and the build helper are one contract and move
+# together.
+[dependencies]
+ccs = { path = ".." }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+iced = { version = "=0.14.0", features = ["smol"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
+
+[build-dependencies]
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
+
+[dev-dependencies]
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e", features = ["test-runtime"] }
+
+[lints.rust]
+unsafe_code = "forbid"

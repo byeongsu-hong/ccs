@@ -14,6 +14,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
 
+# The app beside the binary: one workspace, one lock file, one `target/`.
+[workspace]
+members = ["app"]
+
 [profile.release]
 opt-level = "z"
 lto = true

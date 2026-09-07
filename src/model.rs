@@ -1,6 +1,7 @@
 //! Domain types: the credential blob Claude Code stores on disk, the OAuth
 //! API's responses, and the health verdicts derived from them.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,6 +39,13 @@ pub enum Provider {
 
 impl Provider {
     pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
 }
 
 impl fmt::Display for Provider {
@@ -197,10 +205,49 @@ pub struct ProfileOrg {
     pub rate_limit_tier: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageResponse {
     #[serde(default)]
     pub limits: Vec<Limit>,
+    /// Model availability is independent of percentage-based quota windows.
+    /// Absent in older caches and in responses that do not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_usage: Option<BTreeMap<String, ModelAvailability>>,
+}
+
+impl From<Vec<Limit>> for UsageResponse {
+    fn from(limits: Vec<Limit>) -> Self {
+        Self { limits, model_usage: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAvailability {
+    #[serde(default)]
+    pub available: Option<bool>,
+    #[serde(default)]
+    pub available_at: Option<AvailableAt>,
+    #[serde(default)]
+    pub credits_would_enable: Option<bool>,
+}
+
+/// Keep the backend's timestamp representation in JSON and the cache. Either
+/// an RFC 3339 instant or Unix seconds can provide a countdown; an unreadable
+/// string never turns a blocked model into an available one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AvailableAt {
+    Timestamp(String),
+    Seconds(i64),
+}
+
+impl AvailableAt {
+    pub fn instant(&self) -> Option<jiff::Timestamp> {
+        match self {
+            Self::Timestamp(text) => text.parse().ok(),
+            Self::Seconds(seconds) => jiff::Timestamp::from_second(*seconds).ok(),
+        }
+    }
 }
 
 /// One rate limit as the API reports it. The set is self-describing rather
@@ -247,8 +294,17 @@ impl Limit {
     /// The column this limit belongs under.
     pub fn column(&self) -> String {
         if let Some(model) = self.model_name() {
-            return model.to_string();
+            return match self.kind.as_str() {
+                // Claude's scoped limits have always named their model alone.
+                "weekly_scoped" => model.to_string(),
+                _ => format!("{model} {}", self.window()),
+            };
         }
+        self.window()
+    }
+
+    /// The window independently of any model sharing it.
+    pub fn window(&self) -> String {
         match self.kind.as_str() {
             "session" => "session".to_string(),
             "weekly_all" => "weekly".to_string(),

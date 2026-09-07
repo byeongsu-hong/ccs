@@ -7,6 +7,7 @@
 //! ChatGPT account id alongside. Everything that keeps an account's copies in
 //! step is shared; only what is read and written at the edges lives here.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,9 @@ use serde_json::{Map, Value, json};
 
 use crate::api::Refreshed;
 use crate::fsx::write_atomic;
-use crate::model::{Limit, LimitModel, LimitScope, Oauth, now_ms};
+use crate::model::{
+    Limit, LimitModel, LimitScope, ModelAvailability, Oauth, UsageResponse, now_ms,
+};
 
 /// Codex CLI's own OAuth client, which its refresh tokens were minted for.
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -39,7 +42,7 @@ const FALLBACK_LIFETIME_MS: i64 = 60 * 60 * 1000;
 const SESSION_WINDOW: i64 = 5 * 3600;
 const WEEKLY_WINDOW: i64 = 7 * 86400;
 
-const RELOGIN: &str = "`ccs add --codex` logs this account in again";
+const RELOGIN: &str = "`ccs add` then choose Codex to log this account in again";
 
 // ── auth.json ───────────────────────────────────────────────────────────────
 
@@ -313,7 +316,15 @@ pub struct Usage {
     #[serde(default)]
     pub rate_limit: Option<RateLimit>,
     #[serde(default)]
-    pub additional_rate_limits: Vec<NamedLimit>,
+    pub additional_rate_limits: Option<Vec<NamedLimit>>,
+    #[serde(default)]
+    pub model_usage: Option<BTreeMap<String, ModelAvailability>>,
+}
+
+impl From<Usage> for UsageResponse {
+    fn from(usage: Usage) -> Self {
+        Self { limits: limits(&usage), model_usage: usage.model_usage }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -326,9 +337,7 @@ pub struct RateLimit {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Window {
-    #[serde(default)]
     pub used_percent: f64,
-    #[serde(default)]
     pub limit_window_seconds: i64,
     #[serde(default)]
     pub reset_at: Option<i64>,
@@ -342,8 +351,7 @@ pub struct NamedLimit {
 }
 
 /// The usage as limits the rest of the tool knows: the two windows under the
-/// names their lengths earn, and each named extra limit scoped to its model
-/// on its weekly window, or its only one.
+/// names their lengths earn, and every window of every additional named pool.
 pub fn limits(usage: &Usage) -> Vec<Limit> {
     let mut out = Vec::new();
     if let Some(rate) = &usage.rate_limit {
@@ -351,11 +359,10 @@ pub fn limits(usage: &Usage) -> Vec<Limit> {
             out.push(limit(kind_of(window), window, None));
         }
     }
-    for named in &usage.additional_rate_limits {
+    for named in usage.additional_rate_limits.iter().flatten() {
         let Some(rate) = &named.rate_limit else { continue };
-        let weekly = [&rate.secondary_window, &rate.primary_window].into_iter().flatten().next();
-        if let Some(window) = weekly {
-            out.push(limit("weekly_scoped", window, Some(&named.limit_name)));
+        for window in [&rate.primary_window, &rate.secondary_window].into_iter().flatten() {
+            out.push(limit(kind_of(window), window, Some(&named.limit_name)));
         }
     }
     out
@@ -641,13 +648,86 @@ mod tests {
     }
 
     #[test]
-    fn a_named_extra_limit_becomes_a_limit_scoped_to_that_model_on_its_weekly_window() {
+    fn model_availability_survives_normalization_without_becoming_a_quota() {
+        for available in [true, false] {
+            let mut raw: Value = serde_json::from_str(USAGE).expect("fixture");
+            let gate = json!({"gpt-6-astra": {
+                "available": available, "available_at": null, "credits_would_enable": false
+            }});
+            raw["model_usage"] = gate.clone();
+            let usage: Usage = serde_json::from_value(raw).expect("availability");
+            let normalized = UsageResponse::from(usage);
+            assert_eq!(normalized.limits.len(), 4);
+            assert_eq!(normalized.limits[0].percent, 16.0);
+            assert_eq!(serde_json::to_value(normalized.model_usage).unwrap(), gate);
+        }
+    }
+
+    #[test]
+    fn unreported_model_availability_stays_unknown() {
+        for raw in [json!({}), json!({"model_usage": null})] {
+            let usage: Usage = serde_json::from_value(raw).expect("optional metadata");
+            assert!(UsageResponse::from(usage).model_usage.is_none());
+        }
+        let usage: Usage = serde_json::from_value(json!({
+            "model_usage": {"future-model": {"credits_would_enable": true}}
+        }))
+        .expect("partial metadata");
+        assert_eq!(usage.model_usage.unwrap()["future-model"].available, None);
+    }
+
+    #[test]
+    fn a_named_extra_pool_keeps_both_windows_and_their_distinct_names() {
         let usage: Usage = serde_json::from_str(USAGE).expect("parses");
         let limits = limits(&usage);
-        assert_eq!(limits.len(), 3);
-        assert_eq!(limits[2].kind, "weekly_scoped");
-        assert_eq!(limits[2].percent, 2.0);
+        assert_eq!(limits.len(), 4);
+        assert_eq!(limits[2].kind, "session");
+        assert_eq!(limits[2].percent, 1.0);
         assert_eq!(limits[2].model_name(), Some("GPT-5.3-Codex-Spark"));
+        assert_eq!(limits[3].kind, "weekly_all");
+        assert_eq!(limits[3].percent, 2.0);
+        assert_ne!(limits[2].column(), limits[3].column());
+    }
+
+    #[test]
+    fn any_named_pool_keeps_every_reported_window_without_inventing_missing_ones() {
+        let mut raw: Value = serde_json::from_str(USAGE).expect("fixture");
+        raw["additional_rate_limits"].as_array_mut().unwrap().push(json!({
+            "limit_name": "Another model pool",
+            "rate_limit": {"primary_window": {
+                "used_percent": 37, "limit_window_seconds": 3600, "reset_at": 1788719008_i64
+            }}
+        }));
+        let usage: Usage = serde_json::from_value(raw).expect("parses");
+        let limits = limits(&usage);
+        assert_eq!(limits.len(), 5);
+        let extra = &limits[4];
+        assert_eq!(extra.model_name(), Some("Another model pool"));
+        assert_eq!(extra.kind, "3600s");
+        assert_eq!(extra.percent, 37.0);
+        assert_eq!(extra.column(), "Another model pool 3600s");
+    }
+
+    #[test]
+    fn null_or_absent_extra_pools_do_not_hide_the_shared_quota() {
+        for extra in [json!(null), json!([])] {
+            let mut raw: Value = serde_json::from_str(USAGE).expect("fixture");
+            raw["additional_rate_limits"] = extra;
+            let usage: Usage = serde_json::from_value(raw).expect("nullable pools");
+            let limits = limits(&usage);
+            assert_eq!(limits.len(), 2);
+            assert!(limits.iter().all(|l| l.scope.is_none()));
+        }
+        let usage: Usage = serde_json::from_value(json!({})).expect("no windows");
+        assert!(limits(&usage).is_empty());
+    }
+
+    #[test]
+    fn an_incomplete_window_is_not_reported_as_zero_usage() {
+        for window in [json!({"used_percent": 12}), json!({"limit_window_seconds": 18000})] {
+            let raw = json!({"rate_limit": {"primary_window": window}});
+            assert!(serde_json::from_value::<Usage>(raw).is_err());
+        }
     }
 
     /// A Pro account reports a single weekly window and no five-hour one.

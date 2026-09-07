@@ -550,7 +550,7 @@ pub fn accounts_of(readings: &[Cached], now: Timestamp) -> Vec<Account> {
                 email: entry.email.clone(),
                 plan: entry.plan.clone(),
                 active: entry.active,
-                spent: !entry.exhausted().is_empty(),
+                spent: entry.health() == Health::Critical,
                 session_percent: entry
                     .known()
                     .iter()
@@ -558,7 +558,7 @@ pub fn accounts_of(readings: &[Cached], now: Timestamp) -> Vec<Account> {
                     .map_or(-1.0, |l| l.percent),
                 polled_at: reading.polled_at.clone().unwrap_or_default(),
                 polled: reading.polled_at.as_deref().map(|at| clock(at, now)).unwrap_or_default(),
-                note: entry.limits.as_ref().err().cloned().unwrap_or_default(),
+                note: entry.usage.as_ref().err().cloned().unwrap_or_default(),
                 limits,
             }
         })
@@ -736,7 +736,7 @@ mod tests {
                 email: format!("{slug}@x.com"),
                 plan: "max20x".into(),
                 active,
-                limits,
+                usage: limits.map(Into::into),
             },
             polled_at: Some("2026-09-07T00:00:00Z".into()),
         }

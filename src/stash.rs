@@ -59,7 +59,7 @@ impl Stash {
         &self.root
     }
 
-    /// Every stashed account, ordered by email so the table is stable run to run.
+    /// Every account, ordered by provider then email to match the picker sections.
     pub fn list(&self) -> Result<Vec<Stashed>> {
         let entries = fs::read_dir(&self.accounts)
             .with_context(|| format!("reading {}", self.accounts.display()))?;
@@ -76,11 +76,13 @@ impl Stash {
                 .with_context(|| format!("parsing {}", path.display()))?;
             out.push(Stashed { slug: slug.to_string(), account });
         }
-        // By email, then provider, so two accounts on one address keep the
-        // same indices run to run, Claude first.
+        // Numeric command targets use this same order as the rendered sections.
         out.sort_by(|a, b| {
-            (a.account.email.as_str(), a.account.provider)
-                .cmp(&(b.account.email.as_str(), b.account.provider))
+            (a.account.provider, a.account.email.as_str(), a.slug.as_str()).cmp(&(
+                b.account.provider,
+                b.account.email.as_str(),
+                b.slug.as_str(),
+            ))
         });
         Ok(out)
     }
@@ -350,6 +352,20 @@ mod tests {
 
         let slugs: Vec<String> = stash.list().expect("list").into_iter().map(|s| s.slug).collect();
         assert_eq!(slugs, ["a_at_x.com", "you_at_x.com", "codex-you_at_x.com"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn numeric_targets_follow_provider_sections_even_when_emails_would_interleave() {
+        let (dir, stash) = temp_stash("provider-order");
+        let claude = stashed("z-claude", "z@x");
+        let mut codex = stashed("a-codex", "a@x");
+        codex.account.provider = Provider::Codex;
+        stash.save(&codex.slug, &codex.account).expect("codex");
+        stash.save(&claude.slug, &claude.account).expect("claude");
+        let accounts = stash.list().expect("list");
+        assert_eq!(resolve(&accounts, "1").unwrap().slug, "z-claude");
+        assert_eq!(resolve(&accounts, "2").unwrap().slug, "a-codex");
         let _ = fs::remove_dir_all(&dir);
     }
 

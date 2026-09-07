@@ -9,6 +9,8 @@ extern crate::backend
   load() -> [Account] ! Failure
   switch(slug:str, force:bool) -> [Account] ! Failure
   stream watch(high:f64) -> Poll ! Failure
+  stream tray_clicks() -> unit
+  raise(held:window-id?) -> window-id ! Failure
   sync set_watch(pool:[str], notify:bool) -> bool
   gateway(on:bool, port:str, pool:[str]) -> str ! Failure
   sync shutdown() -> bool
@@ -24,9 +26,7 @@ extern crate::backend
 
 extern crate::format
   pure bar_label(accounts:&[Account]) -> str
-  pure row(accounts:&[Account], index:i64, provider:str) -> str
-  pure has(accounts:&[Account], index:i64, provider:str) -> bool
-  pure slot(accounts:&[Account], index:i64, provider:str) -> str
+  pure is_window(held:window-id?, id:window-id) -> bool
   pure percent_label(percent:f64) -> str
   pure mark(active:bool) -> str
   pure active_of(accounts:&[Account], slug:str) -> bool
@@ -34,8 +34,6 @@ extern crate::format
   pure in_pool(pool:&[str], slug:str) -> bool
   pure toggled(pool:&[str], slug:str, on:bool) -> [str]
   pure pool_for(rotation_on:bool, pool:&[str]) -> [str]
-  pure gateway_row(on:bool, port:str) -> str
-  pure rotation_row(on:bool) -> str
   pure polled_line(accounts:&[Account]) -> str
   pure pool_rows(accounts:&[Account], pool:&[str]) -> [PoolEntry]
   pure watcher_said(notices:&[str], rotated:&[str]) -> str

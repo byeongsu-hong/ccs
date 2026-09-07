@@ -24,6 +24,12 @@ iced = { version = "=0.14.0", features = ["smol"] }
 ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
 ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
 
+# The crate Ice's tray is built on, for the one thing Ice does not forward:
+# a click on the item itself. Same major as the runtime's, so it is the
+# same crate and the same event channel.
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+
 [build-dependencies]
 ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
 

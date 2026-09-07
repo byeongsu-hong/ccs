@@ -337,6 +337,49 @@ fn youngest(accounts: &[Account]) -> Option<std::time::Duration> {
         .map(std::time::Duration::from_secs)
 }
 
+// ── the menu bar item ───────────────────────────────────────────────────────
+
+/// A click on the menu bar item, each as it lands. The item carries no
+/// menu, so the platform hands the click on, and Ice's tray does not
+/// forward it; this reads it from the same `tray_icon` the runtime built
+/// the item with. Nowhere but macOS has the item, so nowhere else does
+/// this ever yield.
+pub fn tray_clicks() -> iced::futures::stream::BoxStream<'static, ()> {
+    use iced::futures::StreamExt;
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        let (tx, rx) = iced::futures::channel::mpsc::unbounded::<()>();
+        tray_icon::TrayIconEvent::set_event_handler(Some(
+            move |event: tray_icon::TrayIconEvent| {
+                if let tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    let _ = tx.unbounded_send(());
+                }
+            },
+        ));
+        rx.boxed()
+    }
+    // A test drains every stream before it judges, so here the clicks end
+    // at once rather than hold the test open.
+    #[cfg(test)]
+    {
+        iced::futures::stream::empty().boxed()
+    }
+    #[cfg(all(not(target_os = "macos"), not(test)))]
+    iced::futures::stream::pending().boxed()
+}
+
+/// The window to bring forward, when one is open; a failure when none is,
+/// which is the route that opens one. An Ice handler has no branch of its
+/// own, so this is where the choice is made.
+pub async fn raise(held: Option<iced::window::Id>) -> Result<iced::window::Id, Failure> {
+    held.ok_or_else(|| Failure::new("no window is open"))
+}
+
 // ── the gateway ─────────────────────────────────────────────────────────────
 
 /// The gateway that is up, if one is.

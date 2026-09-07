@@ -326,8 +326,7 @@ the next login. All of it is remembered
 under `ccs/app.json`.
 
 On macOS there is a menu bar item too: the active Claude account's session on
-the bar, and a menu with a row per account — the row is the readout, and
-pressing it is the switch — plus the two switches and the window.
+the bar, and the window on a click.
 
 The app links `ccs` as a library, so there is one process: the watcher runs on
 a thread of its own and is the one thing that polls, the gateway's listener

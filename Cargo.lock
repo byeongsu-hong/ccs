@@ -625,6 +625,7 @@ dependencies = [
  "notify-rust",
  "serde",
  "serde_json",
+ "tray-icon",
  "ui-lang",
  "ui-lang-build",
  "ui-lang-runtime",

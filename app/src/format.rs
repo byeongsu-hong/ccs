@@ -1,5 +1,5 @@
-//! The `pure` side of the boundary: text the view and the tray compose from
-//! the accounts. Deterministic, effect-free, and tested here rather than
+//! The `pure` side of the boundary: text the view and the menu bar compose
+//! from the accounts. Deterministic, effect-free, and tested here rather than
 //! through a window.
 
 use crate::backend::{Account, PoolEntry};
@@ -14,39 +14,10 @@ pub fn bar_label(accounts: &[Account]) -> String {
         .unwrap_or_else(|| "–".to_string())
 }
 
-/// The `index`th account of `provider`, in listing order.
-fn nth<'a>(accounts: &'a [Account], index: i64, provider: &str) -> Option<&'a Account> {
-    let index = usize::try_from(index).ok()?;
-    accounts.iter().filter(|a| a.provider == provider).nth(index)
-}
-
-/// Whether a tray slot has an account to show.
-pub fn has(accounts: &[Account], index: i64, provider: String) -> bool {
-    nth(accounts, index, &provider).is_some()
-}
-
-/// The slug behind a tray slot, for the handler that switches to it.
-pub fn slot(accounts: &[Account], index: i64, provider: String) -> String {
-    nth(accounts, index, &provider).map(|a| a.slug.clone()).unwrap_or_default()
-}
-
-/// A tray slot's whole text: the mark, who, the plan, and every limit — a
-/// native menu row is one line of text, so the readout and the command are
-/// the same row.
-pub fn row(accounts: &[Account], index: i64, provider: String) -> String {
-    let Some(account) = nth(accounts, index, &provider) else { return String::new() };
-    let mut parts =
-        vec![format!("{} {}", mark(account.active), account.email), account.plan.clone()];
-    if account.limits.is_empty() {
-        if !account.note.is_empty() {
-            parts.push(account.note.clone());
-        }
-    } else {
-        for limit in &account.limits {
-            parts.push(format!("{} {}", limit.column, percent_label(limit.percent)));
-        }
-    }
-    parts.join(" · ")
+/// Whether `id` is the window held, so a closed window is forgotten only
+/// when it is the one.
+pub fn is_window(held: Option<iced::window::Id>, id: iced::window::Id) -> bool {
+    held == Some(id)
 }
 
 /// Whether the account `slug` is the one in use, for tests to ask.
@@ -115,22 +86,6 @@ pub fn pool_for(rotation_on: bool, pool: &[String]) -> Vec<String> {
     match rotation_on {
         true => pool.to_vec(),
         false => Vec::new(),
-    }
-}
-
-/// The tray's gateway row: what it is doing, and what pressing it does.
-pub fn gateway_row(on: bool, port: String) -> String {
-    match on {
-        true => format!("Gateway on :{port} — turn off"),
-        false => format!("Gateway off — serve on :{port}"),
-    }
-}
-
-/// The tray's rotation row.
-pub fn rotation_row(on: bool) -> String {
-    match on {
-        true => "Rotating automatically — stop".to_string(),
-        false => "Not rotating — rotate automatically".to_string(),
     }
 }
 
@@ -215,45 +170,6 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_names_the_nth_account_of_its_provider() {
-        let accounts = vec![
-            account("claude", "a", false, 5.0),
-            account("codex", "g", true, -1.0),
-            account("claude", "h", true, 52.0),
-        ];
-        assert!(has(&accounts, 0, "claude".into()));
-        assert!(has(&accounts, 1, "claude".into()));
-        assert!(!has(&accounts, 2, "claude".into()));
-        assert!(has(&accounts, 0, "codex".into()));
-        assert!(!has(&accounts, 1, "codex".into()));
-        assert_eq!(slot(&accounts, 1, "claude".into()), "h");
-        assert_eq!(slot(&accounts, 0, "codex".into()), "g");
-        assert_eq!(slot(&accounts, 5, "codex".into()), "");
-    }
-
-    #[test]
-    fn a_row_reads_as_one_line_with_the_mark_and_every_limit() {
-        let accounts = vec![account("claude", "h", true, 52.0), account("claude", "a", false, 5.0)];
-        assert_eq!(
-            row(&accounts, 0, "claude".into()),
-            "● h@x.com · max20x · session 52% · weekly 37% · Fable 62%"
-        );
-        assert_eq!(
-            row(&accounts, 1, "claude".into()),
-            "○ a@x.com · max20x · session 5% · weekly 37% · Fable 62%"
-        );
-        assert_eq!(row(&accounts, 3, "claude".into()), "");
-    }
-
-    #[test]
-    fn a_row_says_when_an_account_has_no_reading() {
-        let mut unread = account("claude", "n", false, -1.0);
-        unread.limits.clear();
-        unread.note = "not polled yet".into();
-        assert_eq!(row(&[unread], 0, "claude".into()), "○ n@x.com · max20x · not polled yet");
-    }
-
-    #[test]
     fn the_question_names_the_account_and_nobody_when_there_is_none() {
         let accounts = vec![account("claude", "r", false, 100.0)];
         assert_eq!(
@@ -285,10 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_rows_say_what_pressing_them_does() {
-        assert_eq!(gateway_row(true, "4141".into()), "Gateway on :4141 — turn off");
-        assert_eq!(gateway_row(false, "4141".into()), "Gateway off — serve on :4141");
-        assert_eq!(rotation_row(false), "Not rotating — rotate automatically");
+    fn the_polled_line_and_a_port_read_as_expected() {
         assert_eq!(polled_line(&[account("claude", "a", true, 5.0)]), "polled 09:00");
         assert_eq!(polled_line(&[]), "not polled yet");
         assert!(is_port("4141") && !is_port("0") && !is_port("70000") && !is_port("x"));

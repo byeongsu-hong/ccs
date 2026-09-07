@@ -28,22 +28,16 @@ test a_no_leaves_the_account_where_it_was
   expect confirming == ""
   expect active_of(accounts, "hong")
 
-// The tray's slots reach the same switch through the same fixture, and are
-// laid out in listing order per provider.
-test choosing_a_tray_slot_switches_to_its_account
+// The bar shows the Claude account in use, its session, and follows a
+// switch; it offers no menu, since a click on it is the window.
+test the_bar_shows_the_session_of_the_account_in_use
   preset seeded
   expect tray label "52%"
-  expect tray command "○ agent@example.com · max20x · session 6% · weekly 37%"
-  tray choose "○ agent@example.com · max20x · session 6% · weekly 37%"
+  dispatch pick("agent")
   expect active_of(accounts, "agent")
   expect tray label "6%"
-
-// The Codex slot sits in its own group under the Claude ones, and a slot
-// with no account behind it is guarded out of the menu.
-test each_provider_has_its_own_slots
-  preset seeded
-  expect tray command "● codex-frost@example.com · codex pro · weekly 37%"
-  expect no tray item "○ codex-frost@example.com"
+  dispatch show
+  expect error == ""
 
 // The gateway's switch reaches the gateway and its answer reaches the line
 // under the switch; a port typed in is what the next start uses.
@@ -55,7 +49,6 @@ test the_gateway_switch_starts_and_stops_it
   expect gateway_line == "serving http://127.0.0.1:4141 as the accounts in use"
   dispatch toggle_gateway(false)
   expect gateway_line == "off"
-  expect tray command "Gateway off — serve on :4141"
 
 // Without a preset the program boots as it does for real: the cache is
 // read, the watcher starts once, and the gateway follows what was
@@ -74,7 +67,6 @@ test rotation_is_told_to_the_watcher
   dispatch toggle_rotation(true)
   expect rotation_on
   expect watching
-  expect tray item "Rotating automatically — stop"
   dispatch toggle_notifications(false)
   expect !notifications_on
 

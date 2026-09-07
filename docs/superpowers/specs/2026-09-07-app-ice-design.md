@@ -10,11 +10,10 @@ out to it, and hosts the gateway and the watcher in its own process.
 
 - Ice's tray is a real status item on macOS only; on other targets the
   runtime stubs it. So the window is the whole app on every platform, and the
-  tray is a macOS accessory that shows the Claude session on the bar and
-  offers the switches without opening the window.
-- A tray menu's row count is fixed at compile time. Accounts get fixed slots
-  (8 Claude, 4 Codex) guarded by `when`, each row's text composed by a `pure`
-  extern; the window's list is a `for` and has no such limit.
+  tray is a macOS handle for it: the Claude session on the bar, and the
+  window on a click. It has no menu (the user asked for the window, not a
+  menu); Ice does not forward a click on the item itself, so the app reads
+  it from the `tray_icon` crate the runtime built the item with.
 - `ui-lang` is not on crates.io; the app takes it as a git dependency on
   `byeongsu-hong/ducktape-ui` pinned to a revision.
 - ccs's core is Unix today (file modes, the notice socket, pen symlinks,
@@ -108,9 +107,10 @@ the CLI uses. `resets_in` is the CLI's countdown string.
   `notify-rust`, since a handler cannot walk a list of notices.
 - `launch_at_login(on:bool) -> bool ! Failure`: LaunchAgent plist on macOS,
   XDG autostart entry on Linux; returns what it managed to set.
-- `pure` formatters: `bar_label(accounts)` for the tray label, `row(accounts,
-  index, provider)` and `has(accounts, index, provider)` for the slots,
-  `daemon_line(on, port)`.
+- `stream tray_clicks() -> unit`: a left click on the menu bar item, macOS
+  only; routed to `show`.
+- `pure` formatters: `bar_label(accounts)` for the tray label, and the
+  window's lines.
 
 ### State
 
@@ -152,11 +152,8 @@ confirmation is an `overlay` when `confirming` is set.
 
 ### Tray (macOS)
 
-`label bar_label(accounts)`; menu: 8 Claude slots and 4 Codex slots as
-`row(accounts, i, "claude") -> pick_claude_i when has(accounts, i,
-"claude")`, a separator, `daemon_line(prefs.gateway_on, prefs.gateway_port)
--> toggle_gateway`, the rotation toggle likewise, "Show ccs" -> show,
-separator, "Quit" -> quit. The icon is a template so it reads on both bars.
+`label bar_label(accounts)` and the template icon, no menu. A click on the
+item opens the window (`tray_clicks -> show`).
 
 ## Packaging
 
@@ -167,9 +164,9 @@ with the existing `Info.plist` on macOS, or copies the binary and a
 
 ## Tests
 
-- Ice: choosing a tray slot switches; a stat row is not a command; the window
-  lists every account and the pick of a spent account asks first; toggling
-  the gateway changes the daemon line.
+- Ice: the bar's label follows a switch; the window lists every account and
+  the pick of a spent account asks first; toggling the gateway changes the
+  line under it.
 - Rust: `Env::open` builds against a temp home; formatters; `cmd::poll` over a
   fixture (no network; probes return errors and the events are empty).
 - The daemon is launched by hand on macOS and Linux (a VM or CI runner).

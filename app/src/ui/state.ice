@@ -1,5 +1,8 @@
 state
   accounts:[Account] = []
+  // The window, while one is open: a click on the bar brings it forward
+  // rather than opening another beside it.
+  main_window:window-id? = none
   error = ""
   // The account a switch is waiting on a yes for, or nothing.
   confirming = ""

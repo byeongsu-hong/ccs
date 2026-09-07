@@ -6,17 +6,38 @@
 on mount
   watching = set_watch(pool_for(rotation_on, pool), notifications_on)
   parallel
-    task window open main -> opened
+    task window open main -> opened _
     run every load() -> loaded _ | failed _
     stream every watch(90.0) -> polled _ | poll_failed _
+    stream every tray_clicks() -> show
     run every gateway(gateway_on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
 
-// A window freshly opened starts without a stale complaint on it.
-on opened
+// A window freshly opened is the window, and starts without a stale
+// complaint on it.
+on opened(id)
+  main_window = some(id)
   error = ""
 
+// The window, from the bar's icon or wherever else it is asked for: the
+// one that is open comes forward, and one opens when none is. A handler
+// has no branch, so the choice is an extern's answer.
 on show
-  task window open main -> opened
+  run every raise(main_window) -> raised _ | open_main _
+
+on raised(id)
+  task window focus target=id
+
+on open_main(_none)
+  task window open main -> opened _
+
+// The window closed by hand is forgotten, so the next click opens one; the
+// daemon stays, on the bar.
+on window_gone(id)
+  return if !is_window(main_window, id)
+  main_window = none
+
+subscribe
+  window closed with-id -> window_gone _
 
 on loaded(next)
   accounts = next
@@ -44,7 +65,7 @@ on refused(cause)
   return if !cause.spent
   error = ""
   confirming = cause.slug
-  task window open main -> opened
+  run every raise(main_window) -> raised _ | open_main _
 
 on confirm
   let slug = confirming
@@ -72,11 +93,6 @@ on toggle_gateway(on)
   saved = save_prefs(on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
   run every gateway(on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
 
-on flip_gateway
-  gateway_on = !gateway_on
-  saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
-  run every gateway(gateway_on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
-
 // The port field's submit. The field edits a draft, so a port half typed
 // is never written down or tried by another toggle; one that is not a
 // port is refused here, and the line under the switch says so.
@@ -102,12 +118,6 @@ on toggle_rotation(on)
   watching = set_watch(pool_for(on, pool), notifications_on)
   run every gateway(gateway_on, gateway_port, pool_for(on, pool)) -> gateway_said _ | gateway_failed _
 
-on flip_rotation
-  rotation_on = !rotation_on
-  saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
-  watching = set_watch(pool_for(rotation_on, pool), notifications_on)
-  run every gateway(gateway_on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
-
 on pool_flipped(slug)
   pool = toggled(pool, slug, !in_pool(pool, slug))
   pool_rows_now = pool_rows(accounts, pool)
@@ -130,57 +140,6 @@ on login_set(on)
 
 on login_failed(cause)
   error = cause.message
-
-// The tray's slots. A menu row carries no payload, so each slot has a
-// handler of its own that reads its account off the same list the row's
-// text was composed from.
-on pick_claude_0
-  error = ""
-  run every switch(slot(accounts, 0, "claude"), false) -> switched _ | refused _
-
-on pick_claude_1
-  error = ""
-  run every switch(slot(accounts, 1, "claude"), false) -> switched _ | refused _
-
-on pick_claude_2
-  error = ""
-  run every switch(slot(accounts, 2, "claude"), false) -> switched _ | refused _
-
-on pick_claude_3
-  error = ""
-  run every switch(slot(accounts, 3, "claude"), false) -> switched _ | refused _
-
-on pick_claude_4
-  error = ""
-  run every switch(slot(accounts, 4, "claude"), false) -> switched _ | refused _
-
-on pick_claude_5
-  error = ""
-  run every switch(slot(accounts, 5, "claude"), false) -> switched _ | refused _
-
-on pick_claude_6
-  error = ""
-  run every switch(slot(accounts, 6, "claude"), false) -> switched _ | refused _
-
-on pick_claude_7
-  error = ""
-  run every switch(slot(accounts, 7, "claude"), false) -> switched _ | refused _
-
-on pick_codex_0
-  error = ""
-  run every switch(slot(accounts, 0, "codex"), false) -> switched _ | refused _
-
-on pick_codex_1
-  error = ""
-  run every switch(slot(accounts, 1, "codex"), false) -> switched _ | refused _
-
-on pick_codex_2
-  error = ""
-  run every switch(slot(accounts, 2, "codex"), false) -> switched _ | refused _
-
-on pick_codex_3
-  error = ""
-  run every switch(slot(accounts, 3, "codex"), false) -> switched _ | refused _
 
 // The gateway holds a port; it is let go before the process is.
 on quit

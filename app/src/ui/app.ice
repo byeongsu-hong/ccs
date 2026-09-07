@@ -3,8 +3,9 @@ daemon Ccs
   id "dev.orthory.ccs"
   palette CcsTheme.dark
   window main
-    size 440 680
-    min-size 360 480
+    size 560 680
+    min-size 420 480
+    max-size 1200 820
     position centered
   // The menu bar item is the window's handle: the session on the bar, and
   // the window on a click. It has no menu of its own — a click on the icon

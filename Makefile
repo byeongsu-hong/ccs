@@ -37,8 +37,8 @@ test: ## run the test suite
 fmt: ## verify formatting
 	cargo fmt --check
 
-lint: ## clippy, with warnings as errors
-	cargo clippy --all-targets -- -D warnings
+lint: ## clippy over the workspace, with warnings as errors
+	cargo clippy --workspace --all-targets -- -D warnings
 
 check: fmt lint test lint-app test-app ## fmt, lint and test — everything before a commit
 

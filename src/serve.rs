@@ -1336,7 +1336,10 @@ mod tests {
         assert!(std::net::TcpStream::connect(addr).is_err());
         // Every asker is gone once the accept thread has dropped its sender
         // and the connections above have closed.
-        assert!(inbox.recv_timeout(std::time::Duration::from_secs(2)).is_err());
+        assert!(matches!(
+            inbox.recv_timeout(std::time::Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 
     #[test]

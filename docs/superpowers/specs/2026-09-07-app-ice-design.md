@@ -73,11 +73,13 @@ app/
 extern crate::backend
   Limit(column:str, percent:f64, resets_in:str, health:str)
   Account(provider:str, slug:str, email:str, plan:str, active:bool,
-          spent:bool, session_percent:f64, polled:str, limits:[Limit])
+          spent:bool, session_percent:f64, polled_at:str, polled:str,
+          note:str, limits:[Limit])
   Prefs(gateway_on:bool, gateway_port:str, rotation_on:bool,
         pool:[str], notifications_on:bool, launch_at_login:bool)
-  Poll(accounts:[Account], notices:[str], rotated:bool)
-  Failure(message:str)
+  Poll(accounts:[Account], notices:[str], rotated:[str])
+  PoolEntry(slug:str, email:str, ticked:bool)
+  Failure(message:str, slug:str, spent:bool)
 ```
 
 `health` is `ok`, `warn` or `spent`, decided in Rust by the same thresholds
@@ -88,9 +90,12 @@ the CLI uses. `resets_in` is the CLI's countdown string.
 - `load() -> [Account] ! Failure`: the cache, via `readings`. Never polls.
 - `switch(slug:str, force:bool) -> [Account] ! Failure`: `cmd::switch`, then
   the cache again.
-- `stream watch(high:f64, pool:[str]) -> Poll ! Failure`: a loop of
-  `cmd::poll` every five minutes on a thread, yielding each turn. Replaced
-  (`stream replace lane=watch`) whenever the pool changes.
+- `stream watch(high:f64) -> Poll ! Failure`: one thread for the life of
+  the process, a `cmd::poll` every five minutes, each turn yielded; it
+  reads the pool and whether to notify fresh each turn from what `sync
+  set_watch(pool, notify)` last set, so a toggle never restarts it, wastes
+  a poll, or lets an old turn rotate on a pool that was just changed. A
+  first turn is skipped while the cache is younger than the interval.
 - `gateway(on:bool, port:str, pool:[str]) -> str ! Failure`: starts or stops
   the listener and desk threads; the string is the log line for the window.
 - `sync pref_gateway_on()`, `pref_gateway_port()`, `pref_rotation_on()`,
@@ -99,7 +104,8 @@ the CLI uses. `resets_in` is the CLI's countdown string.
   stash root, `ccs/app.json`. One accessor per field because a state
   initializer cannot project a field off a call, and Ice cannot construct
   a struct to hand back.
-- `notify(title:str, body:str) -> unit`: `notify-rust`.
+- Notifications are shown from the watcher thread itself, through
+  `notify-rust`, since a handler cannot walk a list of notices.
 - `launch_at_login(on:bool) -> bool ! Failure`: LaunchAgent plist on macOS,
   XDG autostart entry on Linux; returns what it managed to set.
 - `pure` formatters: `bar_label(accounts)` for the tray label, `row(accounts,
@@ -108,9 +114,10 @@ the CLI uses. `resets_in` is the CLI's countdown string.
 
 ### State
 
-`accounts:[Account]`, `prefs:Prefs`, `error`, `confirming:str?` (the slug a
-spent account's confirmation is up for), `gateway_line`, `watcher_line`,
-`polled`, `window:window-id?`.
+`accounts:[Account]`, the preference fields one by one, `error`,
+`confirming` (the slug a spent account's confirmation is up for, or empty),
+`gateway_line`, `watcher_line`, `pool_rows_now`, `saved`, `watching`. The
+window's id is the platform's; nothing here reads it.
 
 ### Handlers
 
@@ -124,8 +131,15 @@ handler flips its place, since a checkbox route that names a lazy row's
 field is generated as two moves), `toggle_notifications`, `toggle_login`:
 update prefs, save, apply (restart the watcher stream with the new pool,
 start/stop the gateway).
-`show`: open the window, or focus it when open. `window closed`: clear
-`window`; the daemon stays. `quit`: stop the gateway, `exit`.
+`show`: open the window. `quit`: stop the gateway (a `sync` call: it flips
+a flag and knocks once), `exit`.
+
+Every handler call that blocks — a load, a switch, the gateway going up or
+down, the login entry — runs on a thread of its own and is awaited, so
+iced's one executor thread is never held on a keychain read or a probe.
+`STASH` serialises the whole-stash operations among those threads and the
+watcher; the gateway's desk thread relies on the file lock the CLI already
+shares between `ccs serve` and `ccs watch`.
 
 ### View
 

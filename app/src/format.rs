@@ -66,7 +66,17 @@ pub fn confirm_question(accounts: &[Account], slug: &str) -> String {
 
 /// Whether `slug` is in the rotation pool.
 pub fn in_pool(pool: &[String], slug: String) -> bool {
-    pool.iter().any(|s| *s == slug)
+    pool.contains(&slug)
+}
+
+/// Whether `port` names a port a listener can take.
+pub fn is_port(port: &str) -> bool {
+    port.trim().parse::<u16>().is_ok_and(|p| p > 0)
+}
+
+/// Whether the pool rows show `slug` ticked, for tests to ask.
+pub fn ticked_in(rows: &[PoolEntry], slug: String) -> bool {
+    rows.iter().any(|r| r.slug == slug && r.ticked)
 }
 
 /// The pool with `slug` added or taken out.
@@ -114,10 +124,14 @@ pub fn rotation_row(on: bool) -> String {
     }
 }
 
-/// When the watcher last looked, from the newest reading on show.
+/// When the watcher last looked: the newest reading's clock.
 pub fn polled_line(accounts: &[Account]) -> String {
-    match accounts.iter().map(|a| a.polled.as_str()).find(|p| !p.is_empty()) {
-        Some(polled) => format!("polled {polled}"),
+    let newest = accounts
+        .iter()
+        .filter(|a| !a.polled_at.is_empty())
+        .max_by(|a, b| a.polled_at.cmp(&b.polled_at));
+    match newest {
+        Some(account) => format!("polled {}", account.polled),
         None => "not polled yet".to_string(),
     }
 }
@@ -167,7 +181,8 @@ mod tests {
             active,
             spent: false,
             session_percent: session,
-            polled: "2m ago".into(),
+            polled_at: "2026-09-07T00:00:00Z".into(),
+            polled: "09:00".into(),
             note: String::new(),
             limits: vec![limit("session", session), limit("weekly", 37.0), limit("Fable", 62.0)],
         }
@@ -264,8 +279,9 @@ mod tests {
         assert_eq!(gateway_row(true, "4141".into()), "Gateway on :4141 — turn off");
         assert_eq!(gateway_row(false, "4141".into()), "Gateway off — serve on :4141");
         assert_eq!(rotation_row(false), "Not rotating — rotate automatically");
-        assert_eq!(polled_line(&[account("claude", "a", true, 5.0)]), "polled 2m ago");
+        assert_eq!(polled_line(&[account("claude", "a", true, 5.0)]), "polled 09:00");
         assert_eq!(polled_line(&[]), "not polled yet");
+        assert!(is_port("4141") && !is_port("0") && !is_port("70000") && !is_port("x"));
     }
 
     #[test]

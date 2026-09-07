@@ -41,7 +41,7 @@ view
             if error != ""
               text error @text-danger text-sm
             for account in accounts
-              lazy account by account.slug, account.polled, account.active as held
+              lazy account by account.slug, account.polled_at, account.active as held
                 AccountRow account=held #account(held.slug) -> pick _
             col w=fill p=12.0 gap=6.0 @bg-surface rounded-lg
               row w=fill gap=8.0 align=center
@@ -56,7 +56,7 @@ view
               text "Switch away from a pooled account whose session runs high, to the one whose weekly resets soonest." @text-muted text-xs
               for entry in pool_rows_now
                 lazy entry by entry.slug, entry.ticked as held
-                  PoolRow slug=held.slug email=held.email ticked=held.ticked #pool(held.email) -> pool_flipped _
+                  PoolRow slug=held.slug email=held.email ticked=held.ticked #pool(held.slug) -> pool_flipped _
               toggler "Notifications" #notifications checked=notifications_on -> toggle_notifications _
               text watcher_line #watcher-line @text-muted text-xs
             row w=fill gap=8.0 align=center

@@ -2,15 +2,16 @@
 // the program here reads what it is handed.
 extern crate::backend
   Limit(column:str, percent:f64, resets_in:str, health:str)
-  Account(provider:str, slug:str, email:str, plan:str, active:bool, spent:bool, session_percent:f64, polled:str, note:str, limits:[Limit])
+  Account(provider:str, slug:str, email:str, plan:str, active:bool, spent:bool, session_percent:f64, polled_at:str, polled:str, note:str, limits:[Limit])
   Failure(message:str, slug:str, spent:bool)
   Poll(accounts:[Account], notices:[str], rotated:[str])
   PoolEntry(slug:str, email:str, ticked:bool)
   load() -> [Account] ! Failure
   switch(slug:str, force:bool) -> [Account] ! Failure
-  stream watch(high:f64, pool:[str], notify:bool) -> Poll ! Failure
+  stream watch(high:f64) -> Poll ! Failure
+  sync set_watch(pool:[str], notify:bool) -> bool
   gateway(on:bool, port:str, pool:[str]) -> str ! Failure
-  shutdown() -> unit
+  sync shutdown() -> bool
   launch_at_login(on:bool) -> bool ! Failure
   sync pref_gateway_on() -> bool
   sync pref_gateway_port() -> str
@@ -38,3 +39,5 @@ extern crate::format
   pure polled_line(accounts:&[Account]) -> str
   pure pool_rows(accounts:&[Account], pool:&[str]) -> [PoolEntry]
   pure watcher_said(notices:&[str], rotated:&[str]) -> str
+  pure is_port(port:&str) -> bool
+  pure ticked_in(rows:&[PoolEntry], slug:str) -> bool

@@ -321,7 +321,8 @@ switches. **Gateway** serves the API on the port you set. **Rotate
 automatically** hands the watcher a pool of the accounts you tick, and
 **Notifications** turns its `session-high`, `session-reset`, `weekly-reset`
 and `rotate` lines into system notifications. **Launch at login** keeps a
-LaunchAgent on macOS and an autostart entry on Linux. All of it is remembered
+LaunchAgent on macOS and an autostart entry on Linux, and takes effect from
+the next login. All of it is remembered
 under `ccs/app.json`.
 
 On macOS there is a menu bar item too: the active Claude account's session on

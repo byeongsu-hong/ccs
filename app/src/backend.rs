@@ -1,13 +1,22 @@
 //! The Rust side of the app: what the Ice program calls across its typed
 //! boundary. The stash, the network and the platform live behind it; the
 //! program reads what it is handed.
+//!
+//! Three kinds of thread touch the stash here. The handlers' calls — a
+//! load, a switch, the gateway going up or down — each run on a thread of
+//! their own and hand their answer back, so iced's one executor thread is
+//! never held on a keychain read or a network probe. The watcher is one
+//! thread for the life of the process, polling on its interval and reading
+//! its settings fresh each turn. The gateway's desk answers connection
+//! threads on a thread of its own. `STASH` serialises the whole-stash
+//! operations among the first two; the desk's writes go through the same
+//! file lock that already arbitrates `ccs serve` against `ccs watch` across
+//! processes, which is what keeps it and the watcher from crossing.
 
 #[cfg(not(test))]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use ccs::cmd::Cached;
-#[cfg(not(test))]
-use ccs::env::Env;
 use ccs::model::Health;
 use ccs::render;
 use iced::futures::Stream;
@@ -36,7 +45,10 @@ pub struct Account {
     pub spent: bool,
     /// The five-hour window, or -1 when the account reports none.
     pub session_percent: f64,
-    /// How long ago the watcher last read it, or empty.
+    /// When the watcher last read it, RFC 3339, or empty: the key a row is
+    /// rebuilt on, since every reading writes a new one.
+    pub polled_at: String,
+    /// The same, as a clock time for a person.
     pub polled: String,
     /// Why there is no reading, when there is none.
     pub note: String,
@@ -81,59 +93,6 @@ impl From<anyhow::Error> for Failure {
     }
 }
 
-/// Everything a command borrows, opened once for the life of the process
-/// and shared with every thread that asks.
-#[cfg(not(test))]
-static ENV: OnceLock<Result<Arc<Env>, String>> = OnceLock::new();
-
-/// The stash is one thing however many threads reach for it: the watcher's,
-/// the gateway desk's, and the handlers'. Everything that reads it as a whole
-/// or writes it goes through here.
-#[cfg(not(test))]
-static STASH: Mutex<()> = Mutex::new(());
-
-#[cfg(not(test))]
-fn env() -> Result<Arc<Env>, Failure> {
-    let opened =
-        ENV.get_or_init(|| Env::open().map(Arc::new).map_err(|e| Failure::from(e).message));
-    opened.clone().map_err(Failure::new)
-}
-
-/// The accounts as the watcher last wrote them down. Never polls: opening
-/// the window twenty times costs the limits nothing.
-pub async fn load() -> Result<Vec<Account>, Failure> {
-    #[cfg(test)]
-    return fixture::load();
-    #[cfg(not(test))]
-    {
-        let env = env()?;
-        let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let readings = ccs::cmd::readings(&env.ctx())?;
-        Ok(accounts_of(&readings, Timestamp::now()))
-    }
-}
-
-/// Switch to `slug`. A spent account is refused unless `force`, with a
-/// failure that says so: off a terminal the CLI's guard cannot ask, so the
-/// window asks instead and comes back with `force`. What comes back is the
-/// cache read again.
-pub async fn switch(slug: String, force: bool) -> Result<Vec<Account>, Failure> {
-    #[cfg(test)]
-    return fixture::switch(&slug, force);
-    #[cfg(not(test))]
-    {
-        let env = env()?;
-        let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let ctx = env.ctx();
-        let before = accounts_of(&ccs::cmd::readings(&ctx)?, Timestamp::now());
-        if let Some(account) = before.iter().find(|a| a.slug == slug && a.spent && !force) {
-            return Err(Failure::spent(&account.slug, &account.email));
-        }
-        ccs::cmd::switch(&ctx, &slug, force)?;
-        Ok(accounts_of(&ccs::cmd::readings(&ctx)?, Timestamp::now()))
-    }
-}
-
 /// One turn of the watcher, as the window takes it.
 #[derive(Clone, Debug)]
 pub struct Poll {
@@ -142,130 +101,6 @@ pub struct Poll {
     pub notices: Vec<String>,
     /// The accounts rotated onto, one line each.
     pub rotated: Vec<String>,
-}
-
-/// The watcher: one poll every five minutes, on a thread of its own, each
-/// turn handed to the window as it happens. The one thing in the process
-/// that asks the API. Notices are shown as notifications here, when asked,
-/// since a handler cannot walk a list. Dropping the stream stops the thread
-/// at its next tick.
-pub fn watch(
-    high: f64,
-    pool: Vec<String>,
-    notify: bool,
-) -> impl Stream<Item = Result<Poll, Failure>> + Send + 'static {
-    #[cfg(test)]
-    {
-        let _ = (high, pool, notify);
-        return fixture::watch();
-    }
-    #[cfg(not(test))]
-    {
-        use iced::futures::SinkExt;
-        let (mut tx, rx) = iced::futures::channel::mpsc::channel::<Result<Poll, Failure>>(4);
-        std::thread::spawn(move || {
-            let mut before = ccs::watch::Snapshot::new();
-            loop {
-                let turn = match env() {
-                    Ok(env) => {
-                        let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let ctx = env.ctx();
-                        let turn = ccs::cmd::poll(&ctx, &mut before, high, &pool);
-                        match turn.failed {
-                            Some(why) => Err(Failure::new(why)),
-                            None => {
-                                let readings = ccs::cmd::readings(&ctx).map_err(Failure::from);
-                                readings.map(|readings| Poll {
-                                    accounts: accounts_of(&readings, Timestamp::now()),
-                                    notices: turn
-                                        .notices
-                                        .iter()
-                                        .map(|(event, _)| format!("{}: {}", event.kind, event.text))
-                                        .collect(),
-                                    rotated: turn
-                                        .rotations
-                                        .iter()
-                                        .map(|r| match r {
-                                            Ok(switched) => format!(
-                                                "switched to {}",
-                                                switched.target.account.email
-                                            ),
-                                            Err(why) => format!("rotate failed: {why}"),
-                                        })
-                                        .collect(),
-                                })
-                            }
-                        }
-                    }
-                    Err(failure) => Err(failure),
-                };
-                if notify {
-                    if let Ok(turn) = &turn {
-                        for line in turn.notices.iter().chain(&turn.rotated) {
-                            crate::platform::notify("ccs", line);
-                        }
-                    }
-                }
-                if iced::futures::executor::block_on(tx.send(turn)).is_err() {
-                    return;
-                }
-                // Sleep in short steps so a dropped stream is noticed soon.
-                for _ in 0..300 {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    if tx.is_closed() {
-                        return;
-                    }
-                }
-            }
-        });
-        rx
-    }
-}
-
-/// The gateway, up or down. Up, the listener and the desk that answers it
-/// run on threads of this process; `pool` is what a limited request falls
-/// over to. Changing the port or the pool takes it down and up again. The
-/// line that comes back is what the window shows under the switch.
-pub async fn gateway(on: bool, port: String, pool: Vec<String>) -> Result<String, Failure> {
-    #[cfg(test)]
-    {
-        let _ = pool;
-        return Ok(fixture::gateway(on, &port));
-    }
-    #[cfg(not(test))]
-    {
-        let mut running = GATEWAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(up) = running.take() {
-            up.stop();
-        }
-        if !on {
-            return Ok("off".to_string());
-        }
-        let port: u16 =
-            port.trim().parse().map_err(|_| Failure::new(format!("{port:?} is not a port")))?;
-        let env = env()?;
-        let keys = ccs::cmd::gateway_keys(&env.ctx())?;
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port))
-            .map_err(|e| Failure::new(format!("listening on 127.0.0.1:{port}: {e}")))?;
-        let (asks, inbox) = std::sync::mpsc::channel();
-        let up = ccs::serve::listen(listener, keys, asks);
-        let desk_env = Arc::clone(&env);
-        std::thread::spawn(move || ccs::cmd::desk(&desk_env.ctx(), &pool, inbox));
-        *running = Some(up);
-        Ok(format!("serving http://127.0.0.1:{port} as the accounts in use"))
-    }
-}
-
-/// The gateway that is up, if one is.
-#[cfg(not(test))]
-static GATEWAY: Mutex<Option<ccs::serve::Listening>> = Mutex::new(None);
-
-/// Take the gateway down, for a quit that should not leave a port held.
-pub async fn shutdown() {
-    #[cfg(not(test))]
-    if let Some(up) = GATEWAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
-        up.stop();
-    }
 }
 
 /// What the app remembers between launches.
@@ -306,6 +141,252 @@ impl Default for Prefs {
     }
 }
 
+// ── the process ─────────────────────────────────────────────────────────────
+
+/// Everything a command borrows, opened on first use and shared with every
+/// thread that asks. A failure to open is not kept: what stopped it — a
+/// directory that could not be made, say — may be gone by the next ask.
+#[cfg(not(test))]
+static ENV: Mutex<Option<Arc<ccs::env::Env>>> = Mutex::new(None);
+
+/// The whole-stash operations — a read of every account, a switch, a poll —
+/// happen one at a time. See the module note for what this does not cover.
+#[cfg(not(test))]
+static STASH: Mutex<()> = Mutex::new(());
+
+#[cfg(not(test))]
+fn env() -> Result<Arc<ccs::env::Env>, Failure> {
+    let mut held = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(env) = held.as_ref() {
+        return Ok(Arc::clone(env));
+    }
+    let env = Arc::new(ccs::env::Env::open()?);
+    *held = Some(Arc::clone(&env));
+    Ok(env)
+}
+
+/// Run blocking work on a thread of its own and await its answer, so the
+/// executor's thread stays free for everything else the window does.
+#[cfg(not(test))]
+async fn offload<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.await.expect("the worker thread hands back its answer")
+}
+
+// ── readings ────────────────────────────────────────────────────────────────
+
+/// The accounts as the watcher last wrote them down. Never polls: opening
+/// the window twenty times costs the limits nothing.
+pub async fn load() -> Result<Vec<Account>, Failure> {
+    #[cfg(test)]
+    return fixture::load();
+    #[cfg(not(test))]
+    offload(read_accounts).await
+}
+
+#[cfg(not(test))]
+fn read_accounts() -> Result<Vec<Account>, Failure> {
+    let env = env()?;
+    let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let readings = ccs::cmd::readings(&env.ctx())?;
+    Ok(accounts_of(&readings, Timestamp::now()))
+}
+
+/// Switch to `slug`. A spent account is refused unless `force`, with a
+/// failure that says so: off a terminal the CLI's guard cannot ask, so the
+/// window asks instead and comes back with `force`. What comes back is the
+/// cache read again.
+pub async fn switch(slug: String, force: bool) -> Result<Vec<Account>, Failure> {
+    #[cfg(test)]
+    return fixture::switch(&slug, force);
+    #[cfg(not(test))]
+    offload(move || {
+        let env = env()?;
+        let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ctx = env.ctx();
+        let before = accounts_of(&ccs::cmd::readings(&ctx)?, Timestamp::now());
+        if let Some(account) = before.iter().find(|a| a.slug == slug && a.spent && !force) {
+            return Err(Failure::spent(&account.slug, &account.email));
+        }
+        ccs::cmd::switch(&ctx, &slug, force)?;
+        Ok(accounts_of(&ccs::cmd::readings(&ctx)?, Timestamp::now()))
+    })
+    .await
+}
+
+// ── the watcher ─────────────────────────────────────────────────────────────
+
+/// What the watcher reads before each turn: the pool to rotate among, and
+/// whether to show what it found. Set by the handlers; the thread is never
+/// restarted for a change, so no turn is wasted and no turn acts on a pool
+/// that was just changed.
+#[cfg(not(test))]
+static WATCHING: Mutex<(Vec<String>, bool)> = Mutex::new((Vec::new(), true));
+
+/// Tell the watcher what to rotate among and whether to notify. Immediate,
+/// and always taken.
+pub fn set_watch(pool: Vec<String>, notify: bool) -> bool {
+    #[cfg(test)]
+    {
+        let _ = (pool, notify);
+        true
+    }
+    #[cfg(not(test))]
+    {
+        *WATCHING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = (pool, notify);
+        true
+    }
+}
+
+/// How often the watcher polls; the CLI's default.
+#[cfg(not(test))]
+const INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The watcher: one poll every five minutes, on a thread of its own for the
+/// life of the process, each turn handed to the window as it happens. The
+/// one thing in the process that asks the API. A first turn is not spent
+/// when the cache is younger than the interval: the window shows that
+/// reading and the thread waits out the rest. Notices are shown as
+/// notifications here, when asked, since a handler cannot walk a list.
+pub fn watch(high: f64) -> impl Stream<Item = Result<Poll, Failure>> + Send + 'static {
+    #[cfg(test)]
+    {
+        let _ = high;
+        fixture::watch()
+    }
+    #[cfg(not(test))]
+    {
+        use iced::futures::SinkExt;
+        let (mut tx, rx) = iced::futures::channel::mpsc::channel::<Result<Poll, Failure>>(4);
+        std::thread::spawn(move || {
+            let mut before = ccs::watch::Snapshot::new();
+            // What the cache already holds decides how long the first wait is.
+            let mut wait = read_accounts()
+                .ok()
+                .and_then(|accounts| youngest(&accounts))
+                .map_or(std::time::Duration::ZERO, |age| INTERVAL.saturating_sub(age));
+            loop {
+                for _ in 0..wait.as_secs() {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if tx.is_closed() {
+                        return;
+                    }
+                }
+                let (pool, notify) =
+                    WATCHING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                let turn = turn(&mut before, high, &pool);
+                if let (true, Ok(turn)) = (notify, &turn) {
+                    for line in turn.notices.iter().chain(&turn.rotated) {
+                        crate::platform::notify("ccs", line);
+                    }
+                }
+                if iced::futures::executor::block_on(tx.send(turn)).is_err() {
+                    return;
+                }
+                wait = INTERVAL;
+            }
+        });
+        rx
+    }
+}
+
+/// One turn: poll, level, rotate, and read the cache back.
+#[cfg(not(test))]
+fn turn(before: &mut ccs::watch::Snapshot, high: f64, pool: &[String]) -> Result<Poll, Failure> {
+    let env = env()?;
+    let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let ctx = env.ctx();
+    let turn = ccs::cmd::poll(&ctx, before, high, pool);
+    if let Some(why) = turn.failed {
+        return Err(Failure::new(why));
+    }
+    let readings = ccs::cmd::readings(&ctx)?;
+    Ok(Poll {
+        accounts: accounts_of(&readings, Timestamp::now()),
+        notices: turn
+            .notices
+            .iter()
+            .map(|(event, _)| format!("{}: {}", event.kind, event.text))
+            .collect(),
+        rotated: turn
+            .rotations
+            .iter()
+            .map(|r| match r {
+                Ok(switched) => format!("switched to {}", switched.target.account.email),
+                Err(why) => format!("rotate failed: {why}"),
+            })
+            .collect(),
+    })
+}
+
+/// How old the newest reading is.
+#[cfg(not(test))]
+fn youngest(accounts: &[Account]) -> Option<std::time::Duration> {
+    let now = Timestamp::now();
+    accounts
+        .iter()
+        .filter_map(|a| a.polled_at.parse::<Timestamp>().ok())
+        .map(|at| (now.as_second() - at.as_second()).max(0) as u64)
+        .min()
+        .map(std::time::Duration::from_secs)
+}
+
+// ── the gateway ─────────────────────────────────────────────────────────────
+
+/// The gateway that is up, if one is.
+#[cfg(not(test))]
+static GATEWAY: Mutex<Option<ccs::serve::Listening>> = Mutex::new(None);
+
+/// The gateway, up or down. Up, the listener and the desk that answers it
+/// run on threads of this process; `pool` is what a limited request falls
+/// over to. Changing the port or the pool takes it down and up again. The
+/// line that comes back is what the window shows under the switch.
+pub async fn gateway(on: bool, port: String, pool: Vec<String>) -> Result<String, Failure> {
+    #[cfg(test)]
+    {
+        let _ = pool;
+        Ok(fixture::gateway(on, &port))
+    }
+    #[cfg(not(test))]
+    offload(move || {
+        let mut running = GATEWAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(up) = running.take() {
+            up.stop();
+        }
+        if !on {
+            return Ok("off".to_string());
+        }
+        let port: u16 =
+            port.trim().parse().map_err(|_| Failure::new(format!("{port:?} is not a port")))?;
+        let env = env()?;
+        let keys = ccs::cmd::gateway_keys(&env.ctx())?;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+            .map_err(|e| Failure::new(format!("listening on 127.0.0.1:{port}: {e}")))?;
+        let (asks, inbox) = std::sync::mpsc::channel();
+        let up = ccs::serve::listen(listener, keys, asks);
+        let desk_env = Arc::clone(&env);
+        std::thread::spawn(move || ccs::cmd::desk(&desk_env.ctx(), &pool, inbox));
+        *running = Some(up);
+        Ok(format!("serving http://127.0.0.1:{port} as the accounts in use"))
+    })
+    .await
+}
+
+/// Take the gateway down, for a quit that should not leave a port held.
+/// Immediate: it flips a flag and knocks once.
+pub fn shutdown() -> bool {
+    #[cfg(not(test))]
+    if let Some(up) = GATEWAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+        up.stop();
+    }
+    true
+}
+
+// ── preferences ─────────────────────────────────────────────────────────────
+
 #[cfg(not(test))]
 const PREFS_FILE: &str = "app.json";
 
@@ -330,7 +411,7 @@ pub fn write_prefs(path: &std::path::Path, prefs: &Prefs) -> Result<(), Failure>
 
 /// The preferences as the program starts: each state field asks for its
 /// own at initialization.
-pub fn prefs() -> Prefs {
+fn prefs() -> Prefs {
     #[cfg(test)]
     return Prefs::default();
     #[cfg(not(test))]
@@ -362,7 +443,7 @@ pub fn pref_launch_at_login() -> bool {
 }
 
 /// Write the preferences down. Every toggle calls this; the answer is
-/// whether it took, for the line under the switch to say.
+/// whether it took, for the window to say when it did not.
 pub fn save_prefs(
     gateway_on: bool,
     gateway_port: String,
@@ -387,111 +468,12 @@ pub async fn launch_at_login(on: bool) -> Result<bool, Failure> {
     #[cfg(test)]
     return Ok(on);
     #[cfg(not(test))]
-    crate::platform::launch_at_login(on).map_err(Failure::from)
+    offload(move || crate::platform::launch_at_login(on).map_err(Failure::from)).await
 }
 
-/// The accounts a first-class test starts from, as a state initializer can
-/// ask for them; empty outside tests, where the real reading comes from
-/// `load`.
-pub fn fixture_accounts() -> Vec<Account> {
-    #[cfg(test)]
-    return fixture::reset();
-    #[cfg(not(test))]
-    Vec::new()
-}
+// ── the cache in the view's terms ───────────────────────────────────────────
 
-/// The stash a first-class test sees. Externs are real in those tests, so
-/// the real thing is replaced here, under `cfg(test)`, by one that answers
-/// the way the stash would: a switch marks one account of the provider
-/// active and no other, and refuses a spent one unless forced.
-#[cfg(test)]
-pub mod fixture {
-    use super::{Account, Failure, Limit};
-    use std::sync::Mutex;
-
-    static ACCOUNTS: Mutex<Vec<Account>> = Mutex::new(Vec::new());
-
-    fn limit(column: &str, percent: f64, health: &str) -> Limit {
-        Limit { column: column.into(), percent, resets_in: "3h04m".into(), health: health.into() }
-    }
-
-    fn account(provider: &str, slug: &str, active: bool, session: f64, spent: bool) -> Account {
-        Account {
-            provider: provider.into(),
-            slug: slug.into(),
-            email: format!("{slug}@example.com"),
-            plan: if provider == "codex" { "codex pro".into() } else { "max20x".into() },
-            active,
-            spent,
-            session_percent: session,
-            polled: "2m ago".into(),
-            note: String::new(),
-            limits: vec![
-                limit("session", session.max(0.0), if spent { "spent" } else { "ok" }),
-                limit("weekly", 37.0, "ok"),
-            ],
-        }
-    }
-
-    /// Three Claude accounts, one spent, and one Codex account; `hong` in use.
-    pub fn reset() -> Vec<Account> {
-        let accounts = vec![
-            account("claude", "agent", false, 6.0, false),
-            account("codex", "codex-frost", true, -1.0, false),
-            account("claude", "hong", true, 52.0, false),
-            account("claude", "robin", false, 100.0, true),
-        ];
-        *ACCOUNTS.lock().expect("fixture") = accounts.clone();
-        accounts
-    }
-
-    pub fn load() -> Result<Vec<Account>, Failure> {
-        let held = ACCOUNTS.lock().expect("fixture").clone();
-        Ok(if held.is_empty() { reset() } else { held })
-    }
-
-    /// One turn, then the end: the fixture's accounts with `agent` in use,
-    /// as if the watcher had rotated onto it.
-    pub fn watch() -> impl super::Stream<Item = Result<super::Poll, Failure>> + Send + 'static {
-        let mut accounts = reset();
-        for account in accounts.iter_mut().filter(|a| a.provider == "claude") {
-            account.active = account.slug == "agent";
-        }
-        *ACCOUNTS.lock().expect("fixture") = accounts.clone();
-        let turn = super::Poll {
-            accounts,
-            notices: vec!["session-high: hong@example.com has crossed 90%".into()],
-            rotated: vec!["switched to agent@example.com".into()],
-        };
-        iced::futures::stream::once(async move { Ok(turn) })
-    }
-
-    pub fn gateway(on: bool, port: &str) -> String {
-        match on {
-            true => format!("serving http://127.0.0.1:{port} as the accounts in use"),
-            false => "off".into(),
-        }
-    }
-
-    pub fn switch(slug: &str, force: bool) -> Result<Vec<Account>, Failure> {
-        if ACCOUNTS.lock().expect("fixture").is_empty() {
-            reset();
-        }
-        let mut held = ACCOUNTS.lock().expect("fixture");
-        let Some(target) = held.iter().find(|a| a.slug == slug).cloned() else {
-            return Err(Failure::new(format!("no stashed account matches {slug:?}")));
-        };
-        if target.spent && !force {
-            return Err(Failure::spent(&target.slug, &target.email));
-        }
-        for account in held.iter_mut().filter(|a| a.provider == target.provider) {
-            account.active = account.slug == slug;
-        }
-        Ok(held.clone())
-    }
-}
-
-/// The cache's rows in the view's terms, aged against `now`.
+/// The cache's rows in the view's terms, stamped against `now`.
 pub fn accounts_of(readings: &[Cached], now: Timestamp) -> Vec<Account> {
     readings
         .iter()
@@ -528,7 +510,8 @@ pub fn accounts_of(readings: &[Cached], now: Timestamp) -> Vec<Account> {
                     .iter()
                     .find(|l| l.kind == "session")
                     .map_or(-1.0, |l| l.percent),
-                polled: reading.polled_at.as_deref().map(|at| ago(at, now)).unwrap_or_default(),
+                polled_at: reading.polled_at.clone().unwrap_or_default(),
+                polled: reading.polled_at.as_deref().map(|at| clock(at, now)).unwrap_or_default(),
                 note: entry.limits.as_ref().err().cloned().unwrap_or_default(),
                 limits,
             }
@@ -536,17 +519,135 @@ pub fn accounts_of(readings: &[Cached], now: Timestamp) -> Vec<Account> {
         .collect()
 }
 
-/// How long ago `rfc3339` was, in the CLI's units.
-fn ago(rfc3339: &str, now: Timestamp) -> String {
+/// When `rfc3339` was, as a person reads a clock: the time of day today,
+/// the date before that. Stable however long it is looked at, which "5m
+/// ago" is not.
+fn clock(rfc3339: &str, now: Timestamp) -> String {
     let Ok(then) = rfc3339.parse::<Timestamp>() else { return String::new() };
-    let seconds = (now.as_second() - then.as_second()).max(0);
-    format!("{} ago", render::compact(seconds.max(1)))
+    let zone = jiff::tz::TimeZone::system();
+    let (then, now) = (then.to_zoned(zone.clone()), now.to_zoned(zone));
+    match then.date() == now.date() {
+        true => then.strftime("%H:%M").to_string(),
+        false => then.strftime("%m-%d %H:%M").to_string(),
+    }
+}
+
+/// The accounts a first-class test starts from, as a state initializer can
+/// ask for them; empty outside tests, where the real reading comes from
+/// `load`.
+pub fn fixture_accounts() -> Vec<Account> {
+    #[cfg(test)]
+    return fixture::reset();
+    #[cfg(not(test))]
+    Vec::new()
+}
+
+/// The stash a first-class test sees. Externs are real in those tests, so
+/// the real thing is replaced here, under `cfg(test)`, by one that answers
+/// the way the stash would: a switch marks one account of the provider
+/// active and no other, and refuses a spent one unless forced.
+#[cfg(test)]
+pub mod fixture {
+    use super::{Account, Failure, Limit};
+    use std::sync::Mutex;
+
+    static ACCOUNTS: Mutex<Vec<Account>> = Mutex::new(Vec::new());
+
+    fn limit(column: &str, percent: f64, health: &str) -> Limit {
+        Limit { column: column.into(), percent, resets_in: "3h04m".into(), health: health.into() }
+    }
+
+    fn account(provider: &str, slug: &str, active: bool, session: f64, spent: bool) -> Account {
+        // A Codex account reports no five-hour window at all, as the real
+        // endpoint does for a Pro plan; its row says nothing of a session.
+        let mut limits = Vec::new();
+        if session >= 0.0 {
+            limits.push(limit("session", session, if spent { "spent" } else { "ok" }));
+        }
+        limits.push(limit("weekly", 37.0, "ok"));
+        Account {
+            provider: provider.into(),
+            slug: slug.into(),
+            email: format!("{slug}@example.com"),
+            plan: if provider == "codex" { "codex pro".into() } else { "max20x".into() },
+            active,
+            spent,
+            session_percent: session,
+            polled_at: "2026-09-07T00:00:00Z".into(),
+            polled: "09:00".into(),
+            note: String::new(),
+            limits,
+        }
+    }
+
+    /// Three Claude accounts, one spent, and one Codex account; `hong` in use.
+    pub fn reset() -> Vec<Account> {
+        let accounts = vec![
+            account("claude", "agent", false, 6.0, false),
+            account("codex", "codex-frost", true, -1.0, false),
+            account("claude", "hong", true, 52.0, false),
+            account("claude", "robin", false, 100.0, true),
+        ];
+        *ACCOUNTS.lock().expect("fixture") = accounts.clone();
+        accounts
+    }
+
+    pub fn load() -> Result<Vec<Account>, Failure> {
+        let held = ACCOUNTS.lock().expect("fixture").clone();
+        Ok(if held.is_empty() { reset() } else { held })
+    }
+
+    /// One turn, then the end: the fixture's accounts with `agent` in use
+    /// and a later reading on every row, as if the watcher had polled and
+    /// rotated onto it.
+    pub fn watch() -> impl super::Stream<Item = Result<super::Poll, Failure>> + Send + 'static {
+        let mut accounts = reset();
+        for account in accounts.iter_mut() {
+            account.polled_at = "2026-09-07T00:05:00Z".into();
+            account.polled = "09:05".into();
+            if account.provider == "claude" {
+                account.active = account.slug == "agent";
+            }
+        }
+        *ACCOUNTS.lock().expect("fixture") = accounts.clone();
+        let turn = super::Poll {
+            accounts,
+            notices: vec!["session-high: hong@example.com has crossed 90%".into()],
+            rotated: vec!["switched to agent@example.com".into()],
+        };
+        iced::futures::stream::once(async move { Ok(turn) })
+    }
+
+    pub fn gateway(on: bool, port: &str) -> String {
+        match on {
+            true => format!("serving http://127.0.0.1:{port} as the accounts in use"),
+            false => "off".into(),
+        }
+    }
+
+    pub fn switch(slug: &str, force: bool) -> Result<Vec<Account>, Failure> {
+        if ACCOUNTS.lock().expect("fixture").is_empty() {
+            reset();
+        }
+        let mut held = ACCOUNTS.lock().expect("fixture");
+        let Some(target) = held.iter().find(|a| a.slug == slug).cloned() else {
+            return Err(Failure::new(format!("no stashed account matches {slug:?}")));
+        };
+        if target.spent && !force {
+            return Err(Failure::spent(&target.slug, &target.email));
+        }
+        for account in held.iter_mut().filter(|a| a.provider == target.provider) {
+            account.active = account.slug == slug;
+        }
+        Ok(held.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ccs::model::{Limit as Reading, Provider};
+    use ccs::render::Entry;
 
     #[test]
     fn preferences_round_trip_and_missing_ones_are_the_defaults() {
@@ -577,7 +678,6 @@ mod tests {
         assert!(prefs.notifications_on);
         let _ = std::fs::remove_dir_all(&dir);
     }
-    use ccs::render::Entry;
 
     fn cached(slug: &str, active: bool, limits: Result<Vec<Reading>, String>) -> Cached {
         Cached {
@@ -625,7 +725,8 @@ mod tests {
         );
         assert_eq!(account.session_percent, 52.0);
         assert!(account.spent);
-        assert_eq!(account.polled, "4m ago");
+        assert_eq!(account.polled_at, "2026-09-07T00:00:00Z");
+        assert!(!account.polled.is_empty());
         assert_eq!(account.limits[0].column, "session");
         assert_eq!(account.limits[0].health, "ok");
         assert_eq!(account.limits[1].column, "weekly");
@@ -641,5 +742,18 @@ mod tests {
         assert_eq!(account.session_percent, -1.0);
         assert!(account.limits.is_empty());
         assert!(!account.spent);
+    }
+
+    /// The clock says the time today and the date otherwise, in the zone
+    /// the machine is in; either way the same string however long it is
+    /// looked at.
+    #[test]
+    fn a_reading_is_stamped_with_a_clock_not_an_age() {
+        let now: Timestamp = "2026-09-07T12:00:00Z".parse().expect("stamp");
+        let today = clock("2026-09-07T11:30:00Z", now);
+        assert_eq!(today.len(), 5, "{today}");
+        let earlier = clock("2026-09-01T11:30:00Z", now);
+        assert_eq!(earlier.len(), 11, "{earlier}");
+        assert_eq!(clock("nonsense", now), "");
     }
 }

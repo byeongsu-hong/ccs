@@ -1856,8 +1856,7 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe0acf8b75a3bc914aff5f2329fdffc1b36eeaea29dda0e4bd232f1c62e9cc3d"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui?rev=39377ff1b6553cbbe34bec21e949c7912013978e#39377ff1b6553cbbe34bec21e949c7912013978e"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -1909,8 +1908,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b7dbedc47562d1de3b9707d939f678b88c382004b7ab5a18f7a7dd723162d75"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui?rev=39377ff1b6553cbbe34bec21e949c7912013978e#39377ff1b6553cbbe34bec21e949c7912013978e"
 dependencies = [
  "iced_debug",
  "iced_program",

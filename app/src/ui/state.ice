@@ -13,6 +13,7 @@ state
   launch_at_login_on:bool = pref_launch_at_login()
   watcher_line = ""
   saved = true
+  watching = true
   // Each account with whether it is in the pool, for the rows that tick it:
   // a row under `lazy` sees only itself, so the tick travels with it. Kept
   // in step by every handler that moves the accounts or the pool.

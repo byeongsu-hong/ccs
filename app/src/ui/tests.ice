@@ -42,7 +42,7 @@ test choosing_a_tray_slot_switches_to_its_account
 // with no account behind it is guarded out of the menu.
 test each_provider_has_its_own_slots
   preset seeded
-  expect tray command "● codex-frost@example.com · codex pro · session 0% · weekly 37%"
+  expect tray command "● codex-frost@example.com · codex pro · weekly 37%"
   expect no tray item "○ codex-frost@example.com"
 
 // The gateway's switch reaches the gateway and its answer reaches the line
@@ -57,16 +57,46 @@ test the_gateway_switch_starts_and_stops_it
   expect gateway_line == "off"
   expect tray command "Gateway off — serve on :4141"
 
-// A turn of the watcher replaces the list and says what it did, and the
-// notifications switch changes nothing about that.
-test a_turn_of_the_watcher_lands_in_the_list
-  preset seeded
-  expect active_of(accounts, "hong")
-  dispatch toggle_rotation(true)
-  expect rotation_on
+// Without a preset the program boots as it does for real: the cache is
+// read, the watcher starts once, and the gateway follows what was
+// remembered. A turn of the watcher replaces the list and says what it
+// did, and each row is stamped with its new reading.
+test booting_reads_the_cache_starts_the_watcher_and_asks_the_gateway
+  expect watching
   expect active_of(accounts, "agent")
   expect watcher_line == "session-high: hong@example.com has crossed 90% · switched to agent@example.com"
+  expect gateway_line == "off"
+  expect polled_line(accounts) == "polled 09:05"
+
+// Rotation is a setting the watcher reads, not a restart of it.
+test rotation_is_told_to_the_watcher
+  preset seeded
+  dispatch toggle_rotation(true)
+  expect rotation_on
+  expect watching
   expect tray item "Rotating automatically — stop"
+  dispatch toggle_notifications(false)
+  expect !notifications_on
+
+// A refusal that is not about a spent account is a plain error.
+test a_switch_refused_for_another_reason_is_an_error_not_a_question
+  preset seeded
+  dispatch pick("nobody")
+  expect confirming == ""
+  expect error != ""
+
+// The port field's submit retries the gateway on the port as it stands;
+// a port that is not one is refused before anything is written down.
+test the_port_field_applies_to_a_gateway_that_is_on
+  preset seeded
+  dispatch apply_gateway
+  expect gateway_line == "off"
+  dispatch toggle_gateway(true)
+  dispatch apply_gateway
+  expect gateway_line == "serving http://127.0.0.1:4141 as the accounts in use"
+  expect is_port("4199")
+  expect !is_port("lots")
+  expect !is_port("0")
 
 // Ticking an account puts it in the pool, and only while rotation is on is
 // the pool handed to the daemons.
@@ -77,8 +107,10 @@ test the_pool_is_ticked_per_account
   expect in_pool(pool, "agent")
   expect in_pool(pool, "robin")
   expect empty(pool_for(false, pool))
+  expect ticked_in(pool_rows_now, "robin")
   dispatch pool_flipped("agent")
   expect !in_pool(pool, "agent")
+  expect !ticked_in(pool_rows_now, "agent")
 
 // Starting at login is asked of the platform and what it kept is shown.
 test launch_at_login_follows_the_platforms_answer

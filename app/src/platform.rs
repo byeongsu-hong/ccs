@@ -38,14 +38,6 @@ pub fn launch_at_login(on: bool) -> Result<bool> {
     Ok(on)
 }
 
-/// Whether the login entry is there.
-#[cfg_attr(test, allow(dead_code))]
-pub fn launches_at_login() -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return false };
-    login_entry(&home, &exe).path.exists()
-}
-
 /// A login entry: where it goes and what it says.
 pub struct LoginEntry {
     pub path: PathBuf,

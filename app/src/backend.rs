@@ -2,9 +2,11 @@
 //! boundary. The stash, the network and the platform live behind it; the
 //! program reads what it is handed.
 
+#[cfg(not(test))]
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ccs::cmd::{self, Cached};
+use ccs::cmd::Cached;
+#[cfg(not(test))]
 use ccs::env::Env;
 use ccs::model::Health;
 use ccs::render;
@@ -40,40 +42,164 @@ pub struct Account {
     pub limits: Vec<Limit>,
 }
 
-/// What went wrong, for the window to say.
+/// What went wrong, for the window to say. A switch refused because the
+/// account is spent says so, and names the account, so the window can ask
+/// and come back with `force`.
 #[derive(Clone, Debug)]
 pub struct Failure {
     pub message: String,
+    pub slug: String,
+    pub spent: bool,
+}
+
+impl Failure {
+    fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into(), slug: String::new(), spent: false }
+    }
+
+    fn spent(slug: &str, email: &str) -> Self {
+        Self {
+            message: format!("{email} has nothing left on one of its limits"),
+            slug: slug.to_string(),
+            spent: true,
+        }
+    }
 }
 
 impl From<anyhow::Error> for Failure {
     fn from(error: anyhow::Error) -> Self {
-        let message = error.chain().map(|c| c.to_string()).collect::<Vec<_>>().join(": ");
-        Self { message }
+        Self::new(error.chain().map(|c| c.to_string()).collect::<Vec<_>>().join(": "))
     }
 }
 
 /// Everything a command borrows, opened once for the life of the process
 /// and shared with every thread that asks.
+#[cfg(not(test))]
 static ENV: OnceLock<Result<Arc<Env>, String>> = OnceLock::new();
 
 /// The stash is one thing however many threads reach for it: the watcher's,
 /// the gateway desk's, and the handlers'. Everything that reads it as a whole
 /// or writes it goes through here.
+#[cfg(not(test))]
 static STASH: Mutex<()> = Mutex::new(());
 
+#[cfg(not(test))]
 fn env() -> Result<Arc<Env>, Failure> {
     let opened = ENV.get_or_init(|| Env::open().map(Arc::new).map_err(|e| Failure::from(e).message));
-    opened.clone().map_err(|message| Failure { message })
+    opened.clone().map_err(Failure::new)
 }
 
 /// The accounts as the watcher last wrote them down. Never polls: opening
 /// the window twenty times costs the limits nothing.
 pub async fn load() -> Result<Vec<Account>, Failure> {
-    let env = env()?;
-    let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let readings = cmd::readings(&env.ctx())?;
-    Ok(accounts_of(&readings, Timestamp::now()))
+    #[cfg(test)]
+    return fixture::load();
+    #[cfg(not(test))]
+    {
+        let env = env()?;
+        let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let readings = ccs::cmd::readings(&env.ctx())?;
+        Ok(accounts_of(&readings, Timestamp::now()))
+    }
+}
+
+/// Switch to `slug`. A spent account is refused unless `force`, with a
+/// failure that says so: off a terminal the CLI's guard cannot ask, so the
+/// window asks instead and comes back with `force`. What comes back is the
+/// cache read again.
+pub async fn switch(slug: String, force: bool) -> Result<Vec<Account>, Failure> {
+    #[cfg(test)]
+    return fixture::switch(&slug, force);
+    #[cfg(not(test))]
+    {
+        let env = env()?;
+        let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ctx = env.ctx();
+        let before = accounts_of(&ccs::cmd::readings(&ctx)?, Timestamp::now());
+        if let Some(account) = before.iter().find(|a| a.slug == slug && a.spent && !force) {
+            return Err(Failure::spent(&account.slug, &account.email));
+        }
+        ccs::cmd::switch(&ctx, &slug, force)?;
+        Ok(accounts_of(&ccs::cmd::readings(&ctx)?, Timestamp::now()))
+    }
+}
+
+/// The accounts a first-class test starts from, as a state initializer can
+/// ask for them; empty outside tests, where the real reading comes from
+/// `load`.
+pub fn fixture_accounts() -> Vec<Account> {
+    #[cfg(test)]
+    return fixture::reset();
+    #[cfg(not(test))]
+    Vec::new()
+}
+
+/// The stash a first-class test sees. Externs are real in those tests, so
+/// the real thing is replaced here, under `cfg(test)`, by one that answers
+/// the way the stash would: a switch marks one account of the provider
+/// active and no other, and refuses a spent one unless forced.
+#[cfg(test)]
+pub mod fixture {
+    use super::{Account, Failure, Limit};
+    use std::sync::Mutex;
+
+    static ACCOUNTS: Mutex<Vec<Account>> = Mutex::new(Vec::new());
+
+    fn limit(column: &str, percent: f64, health: &str) -> Limit {
+        Limit { column: column.into(), percent, resets_in: "3h04m".into(), health: health.into() }
+    }
+
+    fn account(provider: &str, slug: &str, active: bool, session: f64, spent: bool) -> Account {
+        Account {
+            provider: provider.into(),
+            slug: slug.into(),
+            email: format!("{slug}@example.com"),
+            plan: if provider == "codex" { "codex pro".into() } else { "max20x".into() },
+            active,
+            spent,
+            session_percent: session,
+            polled: "2m ago".into(),
+            note: String::new(),
+            limits: vec![
+                limit("session", session.max(0.0), if spent { "spent" } else { "ok" }),
+                limit("weekly", 37.0, "ok"),
+            ],
+        }
+    }
+
+    /// Three Claude accounts, one spent, and one Codex account; `hong` in use.
+    pub fn reset() -> Vec<Account> {
+        let accounts = vec![
+            account("claude", "agent", false, 6.0, false),
+            account("codex", "codex-frost", true, -1.0, false),
+            account("claude", "hong", true, 52.0, false),
+            account("claude", "robin", false, 100.0, true),
+        ];
+        *ACCOUNTS.lock().expect("fixture") = accounts.clone();
+        accounts
+    }
+
+    pub fn load() -> Result<Vec<Account>, Failure> {
+        let held = ACCOUNTS.lock().expect("fixture").clone();
+        Ok(if held.is_empty() { reset() } else { held })
+    }
+
+    pub fn switch(slug: &str, force: bool) -> Result<Vec<Account>, Failure> {
+        if ACCOUNTS.lock().expect("fixture").is_empty() {
+            reset();
+        }
+        let mut held = ACCOUNTS.lock().expect("fixture");
+        let Some(target) = held.iter().find(|a| a.slug == slug).cloned() else {
+            return Err(Failure::new(format!("no stashed account matches {slug:?}")));
+        };
+        if target.spent && !force {
+            return Err(Failure::spent(&target.slug, &target.email));
+        }
+        for account in held.iter_mut().filter(|a| a.provider == target.provider) {
+            account.active = account.slug == slug;
+        }
+        Ok(held.clone())
+    }
 }
 
 /// The cache's rows in the view's terms, aged against `now`.

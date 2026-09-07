@@ -48,6 +48,19 @@ pub fn row(accounts: &[Account], index: i64, provider: String) -> String {
     parts.join(" · ")
 }
 
+/// Whether the account `slug` is the one in use, for tests to ask.
+pub fn active_of(accounts: &[Account], slug: String) -> bool {
+    accounts.iter().any(|a| a.slug == slug && a.active)
+}
+
+/// What the confirmation asks before switching into a spent account.
+pub fn confirm_question(accounts: &[Account], slug: String) -> String {
+    match accounts.iter().find(|a| a.slug == slug) {
+        Some(account) => format!("{} has nothing left on one of its limits. Switch anyway?", account.email),
+        None => String::new(),
+    }
+}
+
 /// A percentage as the table prints it; a dash for a window not reported.
 pub fn percent_label(percent: f64) -> String {
     match percent < 0.0 {
@@ -130,6 +143,14 @@ mod tests {
         unread.limits.clear();
         unread.note = "not polled yet".into();
         assert_eq!(row(&[unread], 0, "claude".into()), "○ n@x.com · max20x · not polled yet");
+    }
+
+    #[test]
+    fn the_question_names_the_account_and_nobody_when_there_is_none() {
+        let accounts = vec![account("claude", "r", false, 100.0)];
+        assert_eq!(confirm_question(&accounts, "r".into()), "r@x.com has nothing left on one of its limits. Switch anyway?");
+        assert_eq!(confirm_question(&accounts, "x".into()), "");
+        assert!(!active_of(&accounts, "r".into()));
     }
 
     #[test]

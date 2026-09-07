@@ -2,6 +2,7 @@
 //! item on macOS, and the gateway and the watcher in this very process.
 
 mod backend;
+mod format;
 
 ui_lang::include_app!("src/ui/app.ice");
 

@@ -86,7 +86,7 @@ test a_switch_refused_for_another_reason_is_an_error_not_a_question
   expect error != ""
 
 // The port field's submit retries the gateway on the port as it stands;
-// a port that is not one is refused before anything is written down.
+// a port that is not one is refused there and nothing else sees it.
 test the_port_field_applies_to_a_gateway_that_is_on
   preset seeded
   dispatch apply_gateway
@@ -97,6 +97,25 @@ test the_port_field_applies_to_a_gateway_that_is_on
   expect is_port("4199")
   expect !is_port("lots")
   expect !is_port("0")
+
+// A port over the top, as one comes out when a digit is typed too many.
+test a_port_typed_wrong_stays_in_the_field
+  preset drafting
+  dispatch toggle_gateway(true)
+  expect gateway_port == "4141"
+  expect gateway_line == "serving http://127.0.0.1:4141 as the accounts in use"
+  dispatch apply_gateway
+  expect gateway_port == "4141"
+  expect gateway_line == port_line("414141", true)
+  expect gateway_line == "\"414141\" is not a port; 1 to 65535"
+
+// A turn of the watcher leaves a complaint the person has not read.
+test a_watcher_turn_keeps_an_unread_error
+  preset seeded
+  dispatch pick("nobody")
+  expect error != ""
+  dispatch toggle_rotation(true)
+  expect error != ""
 
 // Ticking an account puts it in the pool, and only while rotation is on is
 // the pool handed to the daemons.

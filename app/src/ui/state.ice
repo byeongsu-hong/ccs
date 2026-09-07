@@ -6,6 +6,7 @@ state
   // The daemons, as the window has them set; remembered between launches.
   gateway_on:bool = pref_gateway_on()
   gateway_port:str = pref_gateway_port()
+  port_draft:str = pref_gateway_port()
   gateway_line = "off"
   rotation_on:bool = pref_rotation_on()
   pool:[str] = pref_pool()
@@ -25,3 +26,10 @@ preset seeded
   state
     accounts = fixture_accounts()
     pool_rows_now = pool_rows(fixture_accounts(), [])
+
+// The same, with a port typed wrong into the field.
+preset drafting
+  state
+    accounts = fixture_accounts()
+    pool_rows_now = pool_rows(fixture_accounts(), [])
+    port_draft = "414141"

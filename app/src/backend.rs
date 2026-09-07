@@ -166,14 +166,17 @@ fn env() -> Result<Arc<ccs::env::Env>, Failure> {
 }
 
 /// Run blocking work on a thread of its own and await its answer, so the
-/// executor's thread stays free for everything else the window does.
+/// executor's thread stays free for everything else the window does. A
+/// worker that dies without answering is a failure, not the window's end.
 #[cfg(not(test))]
-async fn offload<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+async fn offload<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, Failure> + Send + 'static,
+) -> Result<T, Failure> {
     let (tx, rx) = iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let _ = tx.send(work());
     });
-    rx.await.expect("the worker thread hands back its answer")
+    rx.await.unwrap_or_else(|_| Err(Failure::new("the work gave up without an answer")))
 }
 
 // ── readings ────────────────────────────────────────────────────────────────
@@ -523,8 +526,11 @@ pub fn accounts_of(readings: &[Cached], now: Timestamp) -> Vec<Account> {
 /// the date before that. Stable however long it is looked at, which "5m
 /// ago" is not.
 fn clock(rfc3339: &str, now: Timestamp) -> String {
+    clock_in(rfc3339, now, jiff::tz::TimeZone::system())
+}
+
+fn clock_in(rfc3339: &str, now: Timestamp, zone: jiff::tz::TimeZone) -> String {
     let Ok(then) = rfc3339.parse::<Timestamp>() else { return String::new() };
-    let zone = jiff::tz::TimeZone::system();
     let (then, now) = (then.to_zoned(zone.clone()), now.to_zoned(zone));
     match then.date() == now.date() {
         true => then.strftime("%H:%M").to_string(),
@@ -750,10 +756,11 @@ mod tests {
     #[test]
     fn a_reading_is_stamped_with_a_clock_not_an_age() {
         let now: Timestamp = "2026-09-07T12:00:00Z".parse().expect("stamp");
-        let today = clock("2026-09-07T11:30:00Z", now);
-        assert_eq!(today.len(), 5, "{today}");
-        let earlier = clock("2026-09-01T11:30:00Z", now);
-        assert_eq!(earlier.len(), 11, "{earlier}");
-        assert_eq!(clock("nonsense", now), "");
+        let seoul = jiff::tz::TimeZone::get("Asia/Seoul").expect("zone");
+        assert_eq!(clock_in("2026-09-07T11:30:00Z", now, seoul.clone()), "20:30");
+        assert_eq!(clock_in("2026-09-06T16:30:00Z", now, seoul.clone()), "01:30");
+        assert_eq!(clock_in("2026-09-06T14:30:00Z", now, seoul.clone()), "09-06 23:30");
+        assert_eq!(clock_in("nonsense", now, seoul), "");
+        assert!(!clock("2026-09-07T11:30:00Z", now).is_empty());
     }
 }

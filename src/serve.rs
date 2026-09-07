@@ -542,6 +542,10 @@ impl Accounts for Line {
 pub struct Listening {
     stop: Arc<AtomicBool>,
     addr: std::net::SocketAddr,
+    /// The accept thread, joined by `stop` so the port is free by the time
+    /// it returns: a caller binding the same port again would otherwise
+    /// race the listener's drop.
+    accept: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Listening {
@@ -555,6 +559,10 @@ impl Listening {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.addr);
+        let accept = self.accept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        if let Some(accept) = accept {
+            let _ = accept.join();
+        }
     }
 }
 
@@ -566,7 +574,7 @@ pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) -> Listening
     let stop = Arc::new(AtomicBool::new(false));
     let addr = listener.local_addr().expect("a bound listener has an address");
     let flag = Arc::clone(&stop);
-    thread::spawn(move || {
+    let accept = thread::spawn(move || {
         let claude = Arc::new(Upstream::new(CLAUDE_API));
         let codex = Arc::new(Upstream::new(CODEX_API));
         for stream in listener.incoming() {
@@ -583,7 +591,7 @@ pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) -> Listening
             });
         }
     });
-    Listening { stop, addr }
+    Listening { stop, addr, accept: std::sync::Mutex::new(Some(accept)) }
 }
 
 /// Answer requests on one connection until the client hangs up.
@@ -1332,8 +1340,10 @@ mod tests {
 
         assert!(std::net::TcpStream::connect(addr).is_ok());
         up.stop();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Stopped means the port is free now, not soon: a gateway brought
+        // up again on the same port binds it in the same breath.
         assert!(std::net::TcpStream::connect(addr).is_err());
+        assert!(TcpListener::bind(addr).is_ok());
         // Every asker is gone once the accept thread has dropped its sender
         // and the connections above have closed.
         assert!(matches!(

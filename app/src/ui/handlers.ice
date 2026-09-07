@@ -61,7 +61,6 @@ on polled(turn)
   accounts = turn.accounts
   pool_rows_now = pool_rows(turn.accounts, pool)
   watcher_line = watcher_said(turn.notices, turn.rotated)
-  error = ""
 
 on poll_failed(cause)
   watcher_line = cause.message
@@ -78,10 +77,13 @@ on flip_gateway
   saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
   run every gateway(gateway_on, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _
 
-// The port field's submit. A port that is not one is not written down and
-// not tried; the line under the switch says so.
+// The port field's submit. The field edits a draft, so a port half typed
+// is never written down or tried by another toggle; one that is not a
+// port is refused here, and the line under the switch says so.
 on apply_gateway
-  return if !is_port(gateway_port)
+  gateway_line = port_line(port_draft, gateway_on)
+  return if !is_port(port_draft)
+  gateway_port = port_draft
   saved = save_prefs(gateway_on, gateway_port, rotation_on, pool, notifications_on, launch_at_login_on)
   return if !gateway_on
   run every gateway(true, gateway_port, pool_for(rotation_on, pool)) -> gateway_said _ | gateway_failed _

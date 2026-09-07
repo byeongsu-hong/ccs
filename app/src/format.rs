@@ -74,6 +74,16 @@ pub fn is_port(port: &str) -> bool {
     port.trim().parse::<u16>().is_ok_and(|p| p > 0)
 }
 
+/// What the gateway line says as a port is applied: a refusal when it is
+/// not one, "off" when the gateway is, and that it is coming up otherwise.
+pub fn port_line(port: &str, on: bool) -> String {
+    match (is_port(port), on) {
+        (false, _) => format!("{port:?} is not a port; 1 to 65535"),
+        (true, false) => "off".to_string(),
+        (true, true) => format!("starting on {}", port.trim()),
+    }
+}
+
 /// Whether the pool rows show `slug` ticked, for tests to ask.
 pub fn ticked_in(rows: &[PoolEntry], slug: String) -> bool {
     rows.iter().any(|r| r.slug == slug && r.ticked)

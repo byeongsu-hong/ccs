@@ -40,4 +40,5 @@ extern crate::format
   pure pool_rows(accounts:&[Account], pool:&[str]) -> [PoolEntry]
   pure watcher_said(notices:&[str], rotated:&[str]) -> str
   pure is_port(port:&str) -> bool
+  pure port_line(port:&str, on:bool) -> str
   pure ticked_in(rows:&[PoolEntry], slug:str) -> bool

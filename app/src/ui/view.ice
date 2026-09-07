@@ -48,7 +48,7 @@ view
                 toggler "Gateway" #gateway checked=gateway_on -> toggle_gateway _
                 space w=fill
                 text "port" @text-muted text-xs
-                input "port" #port <-> gateway_port w=72.0 submit=apply_gateway
+                input "port" #port <-> port_draft w=72.0 submit=apply_gateway
               text "Serves the Anthropic and Codex APIs on 127.0.0.1 as the accounts in use, for pi and Aside." @text-muted text-xs
               text gateway_line #gateway-line @text-muted text-xs
             col w=fill p=12.0 gap=6.0 @bg-surface rounded-lg

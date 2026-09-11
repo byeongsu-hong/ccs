@@ -101,7 +101,8 @@ ccs add              # ...and another
 
 `ccs add` first opens a provider menu. Arrows or `j`/`k` select Claude Code or
 Codex; Enter continues and Esc or `q` cancels. It then runs `claude auth login`
-or `codex login` against a throwaway config directory, keeps the credentials it
+or `codex login --device-auth` against a throwaway config directory (Codex's
+device-code login works over SSH, where its browser callback would not), keeps the credentials it
 mints, and destroys the directory. The account you are currently
 using is never touched — no logout, no re-login, and sessions running against it
 carry on straight through the login you are doing in the next window.

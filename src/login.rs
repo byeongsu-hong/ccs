@@ -106,6 +106,10 @@ pub fn run(backend: Backend, root: &Path, binary: &str, options: &Options) -> Re
 /// Run an interactive Codex login in a throwaway home and hand back what it
 /// minted. Codex keeps everything under `CODEX_HOME`, so the login in use is
 /// never touched.
+///
+/// The login is by device code: a URL and a code to type in, from any
+/// browser on any machine. Codex's default flow instead waits on a localhost
+/// callback, which a login over SSH or on a headless box never reaches.
 pub fn run_codex(backend: Backend, root: &Path, binary: &str) -> Result<Oauth> {
     // The sweep is of every abandoned login here, Claude ones included, and
     // those hold a keychain item on the machines that keep credentials
@@ -113,12 +117,17 @@ pub fn run_codex(backend: Backend, root: &Path, binary: &str) -> Result<Oauth> {
     sweep(backend, root);
     let scratch = Scratch::new(Backend::File, root)?;
 
-    let status =
-        Command::new(binary).arg("login").env("CODEX_HOME", &scratch.path).status().with_context(
-            || format!("running `{binary} login`; set CCS_CODEX_BINARY if it is not on PATH"),
-        )?;
+    let status = Command::new(binary)
+        .args(["login", "--device-auth"])
+        .env("CODEX_HOME", &scratch.path)
+        .status()
+        .with_context(|| {
+            format!(
+                "running `{binary} login --device-auth`; set CCS_CODEX_BINARY if it is not on PATH"
+            )
+        })?;
     if !status.success() {
-        bail!("`{binary} login` did not complete; nothing was stashed");
+        bail!("`{binary} login --device-auth` did not complete; nothing was stashed");
     }
     let store = crate::codex::Store::at(&scratch.path, Some(&scratch.path));
     let Some(file) = crate::codex::Creds::read(&store)? else {
@@ -228,6 +237,22 @@ mod tests {
             .to_string();
         assert!(error.contains("/nonexistent/claude"), "{error}");
         assert!(error.contains("CCS_CLAUDE_BINARY"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_codex_login_asks_for_a_device_code() {
+        let root = temp_root("device");
+        let fake = root.join("codex");
+        fs::write(&fake, "#!/bin/sh\necho \"$@\" > \"$CODEX_HOME/../args\"\nexit 1\n")
+            .expect("fake");
+        fs::set_permissions(&fake, Permissions::from_mode(0o755)).expect("chmod");
+
+        let error =
+            run_codex(Backend::File, &root, fake.to_str().expect("utf-8")).unwrap_err().to_string();
+        assert!(error.contains("did not complete"), "{error}");
+        let args = fs::read_to_string(root.join("args")).expect("args");
+        assert_eq!(args.trim(), "login --device-auth");
         let _ = fs::remove_dir_all(&root);
     }
 
